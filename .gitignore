@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+
+# Config (contains real infrastructure data)
+config/servers.toml
+
+# Research / internal docs
+docs/research-prep/
+
+# Logs
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Local MCP config (contains local paths)
+.mcp.json
+
+# OS
+.DS_Store

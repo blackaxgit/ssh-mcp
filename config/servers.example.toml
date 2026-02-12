@@ -1,0 +1,59 @@
+# SSH MCP Server Inventory Example
+#
+# Connection details (host, port, user, key) are sourced from ~/.ssh/config automatically.
+# Server names below MUST match SSH config Host entries.
+
+[settings]
+# Path to SSH config file (supports ~ expansion)
+ssh_config_path = "~/.ssh/config"
+
+# Command execution timeout in seconds
+command_timeout = 30
+
+# Maximum output bytes to capture (prevents memory issues)
+max_output_bytes = 51200
+
+# Connection idle timeout in seconds (0 = no timeout)
+connection_idle_timeout = 300
+
+# Verify known_hosts (set to false if managing hosts dynamically)
+known_hosts = false
+
+# =============================================================================
+# GROUP DEFINITIONS
+# =============================================================================
+
+[groups]
+production = { description = "Production servers" }
+staging = { description = "Staging servers" }
+web = { description = "Web application servers" }
+database = { description = "Database servers" }
+monitoring = { description = "Monitoring and observability" }
+
+# =============================================================================
+# SERVER DEFINITIONS
+# =============================================================================
+
+# Basic server (no jump host, no custom user)
+[servers.web-prod-01]
+description = "Production web server: nginx, php-fpm (Ubuntu 22.04)"
+groups = ["production", "web"]
+
+# Server with custom SSH user
+[servers.db-prod-01]
+description = "Production database: PostgreSQL 15 (Ubuntu 22.04)"
+groups = ["production", "database"]
+user = "dbadmin"
+
+# Server accessed via jump host (bastion)
+[servers.web-staging-01]
+description = "Staging web server: nginx, node.js (Ubuntu 22.04)"
+groups = ["staging", "web"]
+jump_host = "bastion"
+
+# Server with multiple groups and custom user
+[servers.monitor-01]
+description = "Monitoring: Prometheus, Grafana, Alertmanager (Ubuntu 22.04)"
+groups = ["production", "monitoring"]
+user = "monitor"
+jump_host = "bastion"
