@@ -62,7 +62,7 @@ def _get_config_path() -> str:
     """
     # 1. Explicit override via environment variable
     if "SSH_MCP_CONFIG" in os.environ:
-        return os.environ["SSH_MCP_CONFIG"]
+        return os.path.expanduser(os.environ["SSH_MCP_CONFIG"])
 
     # 2. XDG standard user config directory
     user_config = Path.home() / ".config" / "ssh-mcp" / "servers.toml"

@@ -38,7 +38,7 @@ class ServerRegistry:
             FileNotFoundError: If config file doesn't exist
             ValueError: If TOML is malformed or validation fails
         """
-        self._config_path = Path(config_path)
+        self._config_path = Path(os.path.expanduser(config_path))
         self._servers: dict[str, ServerConfig] = {}
         self._groups: dict[str, GroupConfig] = {}
         self._settings = Settings()
