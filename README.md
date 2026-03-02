@@ -80,8 +80,28 @@ Restart Claude Desktop after editing the config.
 
 ### Add to Claude Code
 
+If you use [Claude Code](https://docs.anthropic.com/en/docs/claude-code) instead of Claude Desktop, you can set everything up from the terminal:
+
 ```bash
+# 1. Add the MCP server
 claude mcp add ssh-mcp -- uvx ssh-mcp
+
+# 2. Create the config directory and copy the example
+mkdir -p ~/.config/ssh-mcp
+curl -sL https://raw.githubusercontent.com/blackaxgit/ssh-mcp/main/config/servers.example.toml \
+  > ~/.config/ssh-mcp/servers.toml
+
+# 3. Edit with your servers (server names must match ~/.ssh/config Host entries)
+${EDITOR:-nano} ~/.config/ssh-mcp/servers.toml
+
+# 4. Restrict permissions
+chmod 600 ~/.config/ssh-mcp/servers.toml
+```
+
+To use a custom config path:
+
+```bash
+claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx ssh-mcp
 ```
 
 ## Configuration
