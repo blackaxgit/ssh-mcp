@@ -4,7 +4,7 @@ SSH MCP server that lets AI assistants execute commands on remote servers.
 
 [![PyPI version](https://img.shields.io/pypi/v/ssh-mcp)](https://pypi.org/project/ssh-mcp/)
 [![Python versions](https://img.shields.io/pypi/pyversions/ssh-mcp)](https://pypi.org/project/ssh-mcp/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-brightgreen.svg)](LICENSE)
 
 ## What is this
 
@@ -166,4 +166,4 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Mozilla Public License 2.0. See [LICENSE](LICENSE).
