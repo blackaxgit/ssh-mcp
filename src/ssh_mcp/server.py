@@ -89,8 +89,7 @@ def _cleanup_connections() -> None:
 
     if _ssh is not None:
         try:
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(_ssh.close_all())
+            asyncio.run(_ssh.close_all())
         except Exception as e:
             logger.warning(f"Error during connection cleanup: {e}")
 

@@ -22,7 +22,7 @@ class TestSettings:
         assert settings.command_timeout == 30
         assert settings.max_output_bytes == 51200
         assert settings.connection_idle_timeout == 300
-        assert settings.known_hosts is False
+        assert settings.known_hosts is True
 
     def test_settings_custom_values(self) -> None:
         """Test Settings accepts custom values."""

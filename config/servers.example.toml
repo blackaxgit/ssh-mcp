@@ -16,8 +16,9 @@ max_output_bytes = 51200
 # Connection idle timeout in seconds (0 = no timeout)
 connection_idle_timeout = 300
 
-# Verify known_hosts (set to false if managing hosts dynamically)
-known_hosts = false
+# Verify server identity against known_hosts (recommended: true)
+# Set to false only for ephemeral/dynamic hosts where host keys change frequently
+known_hosts = true
 
 # =============================================================================
 # GROUP DEFINITIONS

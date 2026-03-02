@@ -279,6 +279,7 @@ class SSHManager:
         timeout: int = 30,
         working_dir: str | None = None,
         fail_fast: bool = False,
+        force: bool = False,
     ) -> list[ExecResult]:
         """Execute command on all servers in a group in parallel.
 
@@ -288,6 +289,7 @@ class SSHManager:
             timeout: Command timeout in seconds
             working_dir: Working directory for command execution
             fail_fast: Cancel remaining tasks on first failure
+            force: Bypass dangerous command detection (use with caution)
 
         Returns:
             List of ExecResult, one per server in the group
@@ -305,7 +307,7 @@ class SSHManager:
             async def execute_with_semaphore(server: ServerConfig) -> ExecResult:
                 async with semaphore:
                     return await self.execute(
-                        server.name, command, timeout, working_dir
+                        server.name, command, timeout, working_dir, force
                     )
 
             # Execute in parallel

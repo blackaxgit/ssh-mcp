@@ -18,17 +18,13 @@ from ssh_mcp.models import GroupConfig, ServerConfig, Settings
 class TestServerRegistryLoading:
     """Tests for ServerRegistry TOML loading."""
 
-    def test_load_actual_config(self) -> None:
-        """Test loading the actual config/servers.toml file."""
-        config_path = Path(__file__).parent.parent / "config" / "servers.toml"
-        registry = ServerRegistry(str(config_path))
+    def test_load_config_settings(self, tmp_config_file: Path) -> None:
+        """Test settings are loaded correctly from config file."""
+        registry = ServerRegistry(str(tmp_config_file))
 
-        # Verify settings loaded
+        # Verify explicitly set settings are loaded
         assert registry.settings.ssh_config_path.endswith(".ssh/config")
         assert registry.settings.command_timeout == 30
-        assert registry.settings.max_output_bytes == 51200
-        assert registry.settings.connection_idle_timeout == 300
-        assert registry.settings.known_hosts is False
 
         # Verify servers and groups exist
         servers = registry.all_servers()
@@ -37,25 +33,21 @@ class TestServerRegistryLoading:
         assert len(servers) > 0
         assert len(groups) > 0
 
-    def test_server_count_matches_expected(self) -> None:
-        """Test actual config has expected number of servers."""
-        config_path = Path(__file__).parent.parent / "config" / "servers.toml"
-        registry = ServerRegistry(str(config_path))
+    def test_server_count_matches_fixture(self, tmp_config_file: Path) -> None:
+        """Test config has expected number of servers from fixture."""
+        registry = ServerRegistry(str(tmp_config_file))
 
         servers = registry.all_servers()
 
-        # We expect at least 35 servers based on the config file
-        assert len(servers) >= 35
+        assert len(servers) == 3
 
-    def test_group_count_matches_expected(self) -> None:
-        """Test actual config has expected number of groups."""
-        config_path = Path(__file__).parent.parent / "config" / "servers.toml"
-        registry = ServerRegistry(str(config_path))
+    def test_group_count_matches_fixture(self, tmp_config_file: Path) -> None:
+        """Test config has expected number of groups from fixture."""
+        registry = ServerRegistry(str(tmp_config_file))
 
         groups = registry.all_groups()
 
-        # We expect at least 10 groups based on the config file
-        assert len(groups) >= 10
+        assert len(groups) == 2
 
     def test_load_missing_config_raises(self) -> None:
         """Test FileNotFoundError for missing config file."""
@@ -85,22 +77,19 @@ class TestServerRegistryLoading:
 class TestServerRegistryLookup:
     """Tests for ServerRegistry lookup methods."""
 
-    def test_get_server_known_server(self) -> None:
-        """Test get_server returns correct server from actual config."""
-        config_path = Path(__file__).parent.parent / "config" / "servers.toml"
-        registry = ServerRegistry(str(config_path))
+    def test_get_server_known_server(self, tmp_config_file: Path) -> None:
+        """Test get_server returns correct server from config."""
+        registry = ServerRegistry(str(tmp_config_file))
 
-        server = registry.get_server("pro-dicentra")
+        server = registry.get_server("test-web1")
 
-        assert server.name == "pro-dicentra"
-        assert server.description.startswith("Production Dicentra")
-        assert "dicentra" in server.groups
-        assert "dicentra-prod" in server.groups
+        assert server.name == "test-web1"
+        assert "Test web server 1" in server.description
+        assert "test-prod" in server.groups
 
-    def test_get_server_unknown_raises_keyerror(self) -> None:
+    def test_get_server_unknown_raises_keyerror(self, tmp_config_file: Path) -> None:
         """Test get_server raises KeyError for unknown server."""
-        config_path = Path(__file__).parent.parent / "config" / "servers.toml"
-        registry = ServerRegistry(str(config_path))
+        registry = ServerRegistry(str(tmp_config_file))
 
         with pytest.raises(KeyError) as exc_info:
             registry.get_server("nonexistent-server")
@@ -109,20 +98,18 @@ class TestServerRegistryLookup:
         assert "not found" in error_msg.lower()
         assert "available servers" in error_msg.lower()
 
-    def test_get_group_known_group(self) -> None:
-        """Test get_group returns correct group from actual config."""
-        config_path = Path(__file__).parent.parent / "config" / "servers.toml"
-        registry = ServerRegistry(str(config_path))
+    def test_get_group_known_group(self, tmp_config_file: Path) -> None:
+        """Test get_group returns correct group from config."""
+        registry = ServerRegistry(str(tmp_config_file))
 
-        group = registry.get_group("dicentra-prod")
+        group = registry.get_group("test-prod")
 
-        assert group.name == "dicentra-prod"
+        assert group.name == "test-prod"
         assert "production" in group.description.lower()
 
-    def test_get_group_unknown_raises_keyerror(self) -> None:
+    def test_get_group_unknown_raises_keyerror(self, tmp_config_file: Path) -> None:
         """Test get_group raises KeyError for unknown group."""
-        config_path = Path(__file__).parent.parent / "config" / "servers.toml"
-        registry = ServerRegistry(str(config_path))
+        registry = ServerRegistry(str(tmp_config_file))
 
         with pytest.raises(KeyError) as exc_info:
             registry.get_group("nonexistent-group")
@@ -131,22 +118,24 @@ class TestServerRegistryLookup:
         assert "not found" in error_msg.lower()
         assert "available groups" in error_msg.lower()
 
-    def test_servers_in_group_returns_correct_list(self) -> None:
+    def test_servers_in_group_returns_correct_list(
+        self, tmp_config_file: Path
+    ) -> None:
         """Test servers_in_group returns all servers in a group."""
-        config_path = Path(__file__).parent.parent / "config" / "servers.toml"
-        registry = ServerRegistry(str(config_path))
+        registry = ServerRegistry(str(tmp_config_file))
 
-        servers = registry.servers_in_group("dicentra-prod")
+        servers = registry.servers_in_group("test-prod")
 
         assert len(servers) > 0
-        # All returned servers should have dicentra-prod in their groups
+        # All returned servers should have test-prod in their groups
         for server in servers:
-            assert "dicentra-prod" in server.groups
+            assert "test-prod" in server.groups
 
-    def test_servers_in_group_unknown_group_raises(self) -> None:
+    def test_servers_in_group_unknown_group_raises(
+        self, tmp_config_file: Path
+    ) -> None:
         """Test servers_in_group raises KeyError for unknown group."""
-        config_path = Path(__file__).parent.parent / "config" / "servers.toml"
-        registry = ServerRegistry(str(config_path))
+        registry = ServerRegistry(str(tmp_config_file))
 
         with pytest.raises(KeyError):
             registry.servers_in_group("nonexistent-group")
@@ -199,15 +188,30 @@ class TestServerRegistryValidation:
         # Should have warning for name collision
         assert any("collides" in msg.lower() for msg in warning_messages)
 
-    def test_server_with_jump_host_loaded_correctly(self) -> None:
+    def test_server_with_jump_host_loaded_correctly(self, tmp_path: Path) -> None:
         """Test server with jump_host field is loaded correctly."""
-        config_path = Path(__file__).parent.parent / "config" / "servers.toml"
-        registry = ServerRegistry(str(config_path))
+        config_content = """
+[groups]
+infra = { description = "Infrastructure servers" }
+app = { description = "Application servers" }
 
-        server = registry.get_server("bastion")
+[servers.gateway]
+description = "Gateway host"
+groups = ["infra"]
 
-        assert server.jump_host == "work"
-        assert "santan" in server.groups
+[servers.app-server]
+description = "Application server behind gateway"
+groups = ["app"]
+jump_host = "gateway"
+"""
+        config_file = tmp_path / "jump_host_servers.toml"
+        config_file.write_text(config_content)
+        registry = ServerRegistry(str(config_file))
+
+        server = registry.get_server("app-server")
+
+        assert server.jump_host == "gateway"
+        assert "app" in server.groups
 
     def test_server_with_overrides_loaded_correctly(
         self, tmp_config_file: Path
@@ -225,15 +229,28 @@ class TestServerRegistryValidation:
 class TestServerRegistrySettings:
     """Tests for ServerRegistry settings loading."""
 
-    def test_settings_property_returns_settings(self) -> None:
+    def test_settings_property_returns_settings(
+        self, tmp_config_file: Path
+    ) -> None:
         """Test settings property returns Settings instance."""
-        config_path = Path(__file__).parent.parent / "config" / "servers.toml"
-        registry = ServerRegistry(str(config_path))
+        registry = ServerRegistry(str(tmp_config_file))
 
         settings = registry.settings
 
         assert isinstance(settings, Settings)
         assert settings.command_timeout == 30
+
+    def test_settings_defaults_applied_when_not_overridden(
+        self, tmp_config_file: Path
+    ) -> None:
+        """Test that unspecified settings receive correct default values."""
+        registry = ServerRegistry(str(tmp_config_file))
+
+        settings = registry.settings
+
+        # These fields are not set in tmp_config_file, so defaults apply
+        assert settings.max_output_bytes == 51200
+        assert settings.connection_idle_timeout == 300
 
     def test_settings_ssh_config_path_expanded(
         self, tmp_config_file: Path

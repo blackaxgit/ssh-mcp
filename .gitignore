@@ -9,6 +9,37 @@ build/
 
 # Config (contains real infrastructure data)
 config/servers.toml
+config/servers.toml.bak*
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.secret
+secrets/
+credentials/
+secrets.toml
+secrets.yaml
+secrets.yml
+credentials.json
+
+# SSH / TLS keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+id_ecdsa
+id_ecdsa.*
+id_dsa
+id_dsa.*
+*.pub
+*.ppk
 
 # Research / internal docs
 docs/research-prep/
@@ -23,6 +54,9 @@ logs/
 
 # Local MCP config (contains local paths)
 .mcp.json
+
+# Claude Code local settings
+.claude/
 
 # OS
 .DS_Store
