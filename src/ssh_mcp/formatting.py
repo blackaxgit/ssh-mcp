@@ -60,9 +60,7 @@ def format_server_table(servers: list[ServerConfig], filter_label: str = "") -> 
     return "\n".join(lines)
 
 
-def format_group_table(
-    groups: list[GroupConfig], server_counts: dict[str, int]
-) -> str:
+def format_group_table(groups: list[GroupConfig], server_counts: dict[str, int]) -> str:
     """Format a list of groups into a text table.
 
     Args:
@@ -96,7 +94,9 @@ def format_group_table(
     # Build rows
     for group in groups:
         count = server_counts.get(group.name, 0)
-        lines.append(f"{group.name:<{max_name}}  {count:<{max_count}}  {group.description}")
+        lines.append(
+            f"{group.name:<{max_name}}  {count:<{max_count}}  {group.description}"
+        )
 
     return "\n".join(lines)
 
@@ -175,7 +175,9 @@ def format_group_results(results: list[ExecResult], group_name: str) -> str:
         Summary: 2 succeeded, 0 failed
     """
     if not results:
-        return f"Executing on group '{group_name}' (0 servers)...\n\nNo servers in group."
+        return (
+            f"Executing on group '{group_name}' (0 servers)...\n\nNo servers in group."
+        )
 
     lines = [
         f"Executing on group '{group_name}' ({len(results)} servers)...",

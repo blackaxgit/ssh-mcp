@@ -6,7 +6,6 @@ and group execution summaries.
 
 from __future__ import annotations
 
-import pytest
 
 from ssh_mcp.formatting import (
     format_exec_result,
@@ -141,9 +140,7 @@ class TestFormatGroupTable:
 class TestFormatExecResult:
     """Tests for format_exec_result function."""
 
-    def test_format_exec_result_success(
-        self, sample_exec_result: ExecResult
-    ) -> None:
+    def test_format_exec_result_success(self, sample_exec_result: ExecResult) -> None:
         """Test formatting successful execution result."""
         output = format_exec_result(sample_exec_result)
 
@@ -158,9 +155,7 @@ class TestFormatExecResult:
         assert "Exit code: 0" in output
         assert "150ms" in output
 
-    def test_format_exec_result_with_error(
-        self, sample_exec_error: ExecResult
-    ) -> None:
+    def test_format_exec_result_with_error(self, sample_exec_error: ExecResult) -> None:
         """Test formatting execution result with error."""
         output = format_exec_result(sample_exec_error)
 

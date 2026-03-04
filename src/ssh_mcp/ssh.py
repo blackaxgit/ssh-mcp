@@ -320,7 +320,9 @@ class SSHManager:
                 for future in asyncio.as_completed(actual_tasks):
                     result = await future
                     results.append(result)
-                    if result.error or (result.exit_code is not None and result.exit_code != 0):
+                    if result.error or (
+                        result.exit_code is not None and result.exit_code != 0
+                    ):
                         for task in actual_tasks:
                             if not task.done():
                                 task.cancel()
@@ -376,9 +378,7 @@ class SSHManager:
                 )
             ]
 
-    async def upload(
-        self, server_name: str, local_path: str, remote_path: str
-    ) -> str:
+    async def upload(self, server_name: str, local_path: str, remote_path: str) -> str:
         """Upload file to remote server via SFTP.
 
         Args:
