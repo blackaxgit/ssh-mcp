@@ -6,14 +6,18 @@ initialization. All tests run without real SSH connections.
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import MagicMock
 
 import pytest
 
 from ssh_mcp.config import ServerRegistry
 from ssh_mcp.models import Settings
-from ssh_mcp.ssh import SSHManager, _DANGEROUS_PATTERNS, _SENSITIVE_PATHS, _is_dangerous_command, _validate_remote_path
+from ssh_mcp.ssh import (
+    SSHManager,
+    _DANGEROUS_PATTERNS,
+    _SENSITIVE_PATHS,
+    _is_dangerous_command,
+    _validate_remote_path,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -160,11 +164,15 @@ class TestDangerousPatternsDirectly:
     def test_mkfs_pattern(self) -> None:
         assert _DANGEROUS_PATTERNS[1].search("mkfs.ext4 /dev/sda") is not None
         assert _DANGEROUS_PATTERNS[1].search("mkfs") is not None
-        assert _DANGEROUS_PATTERNS[1].search("ls mkfs_backup") is not None  # substring match
+        assert (
+            _DANGEROUS_PATTERNS[1].search("ls mkfs_backup") is not None
+        )  # substring match
 
     def test_dd_if_pattern(self) -> None:
         assert _DANGEROUS_PATTERNS[2].search("dd if=/dev/zero of=/dev/sda") is not None
-        assert _DANGEROUS_PATTERNS[2].search("dd if=input.bin of=output.bin") is not None
+        assert (
+            _DANGEROUS_PATTERNS[2].search("dd if=input.bin of=output.bin") is not None
+        )
         assert _DANGEROUS_PATTERNS[2].search("dd bs=512 count=1") is None
 
     def test_redirect_dev_sd_pattern(self) -> None:
@@ -185,7 +193,9 @@ class TestDangerousPatternsDirectly:
     def test_fork_bomb_pattern(self) -> None:
         # Pattern uses \s* (zero-or-more), so spaces are optional
         assert _DANGEROUS_PATTERNS[5].search(":(){ :|:& };:") is not None
-        assert _DANGEROUS_PATTERNS[5].search(":(){ :|:&};:") is not None  # no trailing space also matches
+        assert (
+            _DANGEROUS_PATTERNS[5].search(":(){ :|:&};:") is not None
+        )  # no trailing space also matches
         # Pattern requires the exact structure; unrelated strings do not match
         assert _DANGEROUS_PATTERNS[5].search("echo hello") is None
         assert _DANGEROUS_PATTERNS[5].search("ls -la") is None
@@ -290,7 +300,6 @@ class TestSSHManagerInit:
     def _make_registry(self) -> ServerRegistry:
         """Return a minimal ServerRegistry backed by a real config file."""
         import tempfile
-        from pathlib import Path
 
         config_content = """
 [settings]
@@ -303,9 +312,7 @@ test = { description = "Test group" }
 description = "Test server"
 groups = ["test"]
 """
-        tmp = tempfile.NamedTemporaryFile(
-            suffix=".toml", mode="w", delete=False
-        )
+        tmp = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
         tmp.write(config_content)
         tmp.flush()
         tmp.close()

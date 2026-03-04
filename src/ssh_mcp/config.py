@@ -63,9 +63,7 @@ class ServerRegistry:
         """
         if name not in self._servers:
             available = ", ".join(sorted(self._servers.keys()))
-            raise KeyError(
-                f"Server '{name}' not found. Available servers: {available}"
-            )
+            raise KeyError(f"Server '{name}' not found. Available servers: {available}")
         return self._servers[name]
 
     def get_group(self, name: str) -> GroupConfig:
@@ -82,9 +80,7 @@ class ServerRegistry:
         """
         if name not in self._groups:
             available = ", ".join(sorted(self._groups.keys()))
-            raise KeyError(
-                f"Group '{name}' not found. Available groups: {available}"
-            )
+            raise KeyError(f"Group '{name}' not found. Available groups: {available}")
         return self._groups[name]
 
     def servers_in_group(self, group_name: str) -> list[ServerConfig]:
@@ -102,9 +98,7 @@ class ServerRegistry:
         # Validate group exists first
         self.get_group(group_name)
         return [
-            server
-            for server in self._servers.values()
-            if group_name in server.groups
+            server for server in self._servers.values() if group_name in server.groups
         ]
 
     def all_servers(self) -> list[ServerConfig]:
@@ -199,29 +193,27 @@ class ServerRegistry:
         for server_name, server in self._servers.items():
             # Every server must reference at least one group
             if not server.groups:
-                logger.warning(
-                    "Server '%s' has no groups assigned", server_name
-                )
+                logger.warning("Server '%s' has no groups assigned", server_name)
 
             # Every group referenced by a server must be defined
             for group in server.groups:
                 if group not in group_names:
                     logger.warning(
                         "Server '%s' references undefined group '%s'",
-                        server_name, group,
+                        server_name,
+                        group,
                     )
 
             # Server names must not collide with group names
             if server_name in group_names:
-                logger.warning(
-                    "Server name '%s' collides with group name", server_name
-                )
+                logger.warning("Server name '%s' collides with group name", server_name)
 
             # jump_host value must reference another defined server
             if server.jump_host and server.jump_host not in server_names:
                 logger.warning(
                     "Server '%s' references undefined jump_host '%s'",
-                    server_name, server.jump_host,
+                    server_name,
+                    server.jump_host,
                 )
 
         # Detect circular jump host chains

@@ -118,9 +118,7 @@ class TestServerRegistryLookup:
         assert "not found" in error_msg.lower()
         assert "available groups" in error_msg.lower()
 
-    def test_servers_in_group_returns_correct_list(
-        self, tmp_config_file: Path
-    ) -> None:
+    def test_servers_in_group_returns_correct_list(self, tmp_config_file: Path) -> None:
         """Test servers_in_group returns all servers in a group."""
         registry = ServerRegistry(str(tmp_config_file))
 
@@ -131,9 +129,7 @@ class TestServerRegistryLookup:
         for server in servers:
             assert "test-prod" in server.groups
 
-    def test_servers_in_group_unknown_group_raises(
-        self, tmp_config_file: Path
-    ) -> None:
+    def test_servers_in_group_unknown_group_raises(self, tmp_config_file: Path) -> None:
         """Test servers_in_group raises KeyError for unknown group."""
         registry = ServerRegistry(str(tmp_config_file))
 
@@ -169,7 +165,7 @@ class TestServerRegistryValidation:
     ) -> None:
         """Test validation warnings are logged for invalid config."""
         with caplog.at_level(logging.WARNING):
-            registry = ServerRegistry(str(invalid_config_file))
+            ServerRegistry(str(invalid_config_file))
 
         # Check that warnings were logged
         assert len(caplog.records) > 0
@@ -229,9 +225,7 @@ jump_host = "gateway"
 class TestServerRegistrySettings:
     """Tests for ServerRegistry settings loading."""
 
-    def test_settings_property_returns_settings(
-        self, tmp_config_file: Path
-    ) -> None:
+    def test_settings_property_returns_settings(self, tmp_config_file: Path) -> None:
         """Test settings property returns Settings instance."""
         registry = ServerRegistry(str(tmp_config_file))
 
@@ -252,9 +246,7 @@ class TestServerRegistrySettings:
         assert settings.max_output_bytes == 51200
         assert settings.connection_idle_timeout == 300
 
-    def test_settings_ssh_config_path_expanded(
-        self, tmp_config_file: Path
-    ) -> None:
+    def test_settings_ssh_config_path_expanded(self, tmp_config_file: Path) -> None:
         """Test tilde expansion in ssh_config_path."""
         registry = ServerRegistry(str(tmp_config_file))
 
