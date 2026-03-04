@@ -2,8 +2,6 @@
 
 SSH MCP server that lets AI assistants execute commands on remote servers.
 
-[![PyPI version](https://img.shields.io/pypi/v/ssh-mcp)](https://pypi.org/project/ssh-mcp/)
-[![Python versions](https://img.shields.io/pypi/pyversions/ssh-mcp)](https://pypi.org/project/ssh-mcp/)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-brightgreen.svg)](LICENSE)
 [![Claude Code Ready](https://img.shields.io/badge/Claude_Code-Auto_Install_Ready-blueviolet?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iMCAwIDE2IDE2Ij48dGV4dCB4PSIwIiB5PSIxMyIgZm9udC1zaXplPSIxNCI+8J+UpTwvdGV4dD48L3N2Zz4=)](#add-to-claude-code)
 
