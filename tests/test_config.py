@@ -253,3 +253,25 @@ class TestServerRegistrySettings:
         # Path should be expanded (not contain ~)
         assert not registry.settings.ssh_config_path.startswith("~")
         assert ".ssh/config" in registry.settings.ssh_config_path
+
+
+class TestCircularJumpHost:
+    def test_circular_jump_host_raises(self, tmp_path: Path) -> None:
+        config_content = """
+[groups]
+infra = { description = "Infrastructure" }
+
+[servers.host-a]
+description = "Host A"
+groups = ["infra"]
+jump_host = "host-b"
+
+[servers.host-b]
+description = "Host B"
+groups = ["infra"]
+jump_host = "host-a"
+"""
+        config_file = tmp_path / "circular.toml"
+        config_file.write_text(config_content)
+        with pytest.raises(ValueError, match="[Cc]ircular"):
+            ServerRegistry(str(config_file))
