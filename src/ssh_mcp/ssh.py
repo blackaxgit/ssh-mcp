@@ -13,6 +13,7 @@ import re
 import shlex
 import time
 from pathlib import Path
+from typing import Any
 
 import asyncssh
 
@@ -193,8 +194,8 @@ class SSHManager:
                 duration_ms = int((time.monotonic() - start_time) * 1000)
 
                 # Truncate output if needed
-                stdout = result.stdout or ""
-                stderr = result.stderr or ""
+                stdout = str(result.stdout or "")
+                stderr = str(result.stderr or "")
 
                 if len(stdout) > self.settings.max_output_bytes:
                     stdout = (
@@ -351,12 +352,12 @@ class SSHManager:
                 return results
             else:
                 # Wait for all tasks to complete
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                gather_results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 # Convert exceptions to ExecResult
                 normalized_results = []
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
+                for i, gather_result in enumerate(gather_results):
+                    if isinstance(gather_result, BaseException):
                         server_name = servers[i].name
                         normalized_results.append(
                             ExecResult(
@@ -365,11 +366,11 @@ class SSHManager:
                                 stdout="",
                                 stderr="",
                                 exit_code=None,
-                                error=f"Exception during execution: {result}",
+                                error=f"Exception during execution: {gather_result}",
                             )
                         )
                     else:
-                        normalized_results.append(result)
+                        normalized_results.append(gather_result)
 
                 return normalized_results
 
@@ -605,7 +606,7 @@ class SSHManager:
             Various SSH exceptions on connection failure
         """
         # Build connection parameters
-        connect_params = {
+        connect_params: dict[str, Any] = {
             "config": [self.settings.ssh_config_path],
         }
 

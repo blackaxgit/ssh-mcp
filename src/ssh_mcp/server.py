@@ -143,6 +143,8 @@ async def list_servers(group: str | None = None) -> str:
     """
     try:
         await _init()
+        assert _registry is not None
+        assert _ssh is not None
 
         if group is not None:
             # Filter by group
@@ -177,6 +179,8 @@ async def list_groups() -> str:
     """
     try:
         await _init()
+        assert _registry is not None
+        assert _ssh is not None
 
         groups = _registry.all_groups()
 
@@ -218,6 +222,8 @@ async def execute(
     """
     try:
         await _init()
+        assert _registry is not None
+        assert _ssh is not None
 
         result = await _ssh.execute(server, command, timeout, working_dir, force)
         return format_exec_result(result)
@@ -254,6 +260,8 @@ async def execute_on_group(
     """
     try:
         await _init()
+        assert _registry is not None
+        assert _ssh is not None
 
         results = await _ssh.execute_on_group(
             group, command, timeout, working_dir, fail_fast, force
@@ -285,6 +293,8 @@ async def upload_file(
     """
     try:
         await _init()
+        assert _registry is not None
+        assert _ssh is not None
 
         result = await _ssh.upload(server, local_path, remote_path)
         return result
@@ -314,6 +324,8 @@ async def download_file(
     """
     try:
         await _init()
+        assert _registry is not None
+        assert _ssh is not None
 
         result = await _ssh.download(server, remote_path, local_path)
         return result
