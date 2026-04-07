@@ -16,6 +16,7 @@ from ssh_mcp.ssh import (
     _DANGEROUS_PATTERNS,
     _SENSITIVE_PATHS,
     _is_dangerous_command,
+    _validate_local_path,
     _validate_remote_path,
 )
 
@@ -373,26 +374,80 @@ groups = ["test"]
 
         assert manager._audit is logging.getLogger("ssh_mcp.audit")
 
-    def test_eviction_task_is_none_in_sync_test(
+    def test_eviction_not_started_without_event_loop(
         self, sample_settings: Settings
     ) -> None:
-        """In a sync test, asyncio.create_task fails so _eviction_task stays None.
-
-        _start_eviction_loop sets _running=True before calling create_task.
-        create_task raises RuntimeError (no running loop in sync context),
-        which is caught in __init__, leaving _eviction_task as None.
-        """
+        """SSHManager defers eviction start when no event loop is running."""
         registry = self._make_registry()
         manager = SSHManager(registry, sample_settings)
-        # _running is True because it is set before create_task is called
-        assert manager._running is True
-        # But the task itself is None since create_task could not schedule it
+        # Eviction is deferred — _running should be False
+        assert manager._running is False
         assert manager._eviction_task is None
 
-    def test_running_flag_true_inside_event_loop(
-        self, sample_settings: Settings
-    ) -> None:
-        """_running is True when SSHManager is created inside a running event loop."""
-        registry = self._make_registry()
-        manager = SSHManager(registry, sample_settings)
-        assert manager._running is True
+
+# ---------------------------------------------------------------------------
+# _validate_local_path
+# ---------------------------------------------------------------------------
+
+
+class TestValidateLocalPath:
+    """Tests for _validate_local_path — blocks sensitive local files."""
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/home/user/../etc/shadow",
+            "../../etc/passwd",
+            "/etc/shadow",
+            "/etc/passwd",
+            "/home/user/.ssh/authorized_keys",
+            "/home/user/.ssh/id_rsa",
+            "/home/user/.ssh/id_ed25519",
+        ],
+        ids=lambda p: p.replace("/", "_").replace(".", "_")[:50],
+    )
+    def test_blocks_sensitive_local_path(self, path: str) -> None:
+        with pytest.raises(ValueError):
+            _validate_local_path(path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/var/log/app.log",
+            "/home/user/file.txt",
+            "/tmp/data",
+            "/opt/app/config.yaml",
+        ],
+        ids=lambda p: p.replace("/", "_")[:50],
+    )
+    def test_allows_normal_local_path(self, path: str) -> None:
+        _validate_local_path(path)  # Should not raise
+
+    def test_sensitive_local_paths_list_coverage(self) -> None:
+        for sensitive in _SENSITIVE_PATHS:
+            path = (
+                f"/home/user/{sensitive}"
+                if not sensitive.startswith("/")
+                else sensitive
+            )
+            with pytest.raises(ValueError):
+                _validate_local_path(path)
+
+
+# ---------------------------------------------------------------------------
+# force=True bypass
+# ---------------------------------------------------------------------------
+
+
+class TestDangerousCommandForceBypass:
+    """Tests for force=True bypassing dangerous command detection."""
+
+    def test_dangerous_command_blocked_without_force(self) -> None:
+        assert _is_dangerous_command("rm -rf /") is True
+
+    def test_force_parameter_exists_in_execute_signature(self) -> None:
+        """Verify force parameter exists in SSHManager.execute signature."""
+        import inspect
+
+        sig = inspect.signature(SSHManager.execute)
+        assert "force" in sig.parameters

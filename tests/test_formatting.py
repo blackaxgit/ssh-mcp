@@ -346,3 +346,21 @@ class TestFormatGroupResults:
 
         assert "Summary: 0 succeeded, 1 failed" in output
         assert "exit 1" in output
+
+    def test_format_group_results_none_exit_code_no_error_counted_as_failed(
+        self,
+    ) -> None:
+        """exit_code=None with no error should count as failed."""
+        results = [
+            ExecResult(
+                server="web1",
+                command="uptime",
+                stdout="up 142 days",
+                stderr="",
+                exit_code=None,
+                duration_ms=150,
+            ),
+        ]
+        output = format_group_results(results, "test")
+        assert "Summary: 0 succeeded, 1 failed" in output
+        assert "exit unknown" in output

@@ -1,0 +1,35 @@
+# Docker Compose configuration for ssh-mcp MCP server
+# Compose V2 format (no version key)
+# Runs Python MCP server with stdio transport for infrastructure SSH management
+
+services:
+  ssh-mcp:
+    # Build from local Dockerfile (production-ready multi-stage)
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # Enable stdin/stdout for MCP stdio protocol transport
+    # The MCP protocol communicates via standard input/output
+    stdin_open: true
+
+    # Volume mounts for configuration and SSH credentials
+    volumes:
+      # Server configuration (read-only)
+      # Contains host definitions, credentials, execution rules
+      - ./config/servers.toml:/config/servers.toml:ro
+
+      # User SSH keys and config (read-only)
+      # Maps host machine ~/.ssh to container for key-based authentication
+      - ~/.ssh:/home/sshmcp/.ssh:ro
+
+    # Environment configuration
+    environment:
+      # Point MCP server to the mounted config file
+      SSH_MCP_CONFIG: /config/servers.toml
+      # Ensure Python logs and MCP protocol messages go to stderr for container logging
+      PYTHONUNBUFFERED: "1"
+
+    # Restart policy: restart on failure but not if manually stopped
+    # Prevents thrashing on configuration errors while respecting manual stops
+    restart: unless-stopped

@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from ssh_mcp.config import ServerRegistry
 from ssh_mcp.formatting import (
@@ -44,6 +45,7 @@ mcp = FastMCP("ssh-mcp")
 # Lazy-initialized globals
 _registry: ServerRegistry | None = None
 _ssh: SSHManager | None = None
+_init_lock: asyncio.Lock | None = None
 
 
 def _get_config_path() -> str:
@@ -86,23 +88,37 @@ def _get_config_path() -> str:
 def _cleanup_connections() -> None:
     """Cleanup SSH connections on exit."""
     global _ssh
-
-    if _ssh is not None:
+    if _ssh is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_ssh.close_all())
+    except RuntimeError:
+        # No running event loop — create one for cleanup
         try:
             asyncio.run(_ssh.close_all())
         except Exception as e:
             logger.warning(f"Error during connection cleanup: {e}")
 
 
-def _init() -> None:
+async def _init() -> None:
     """Initialize registry and SSH manager on first tool call.
 
     Uses SSH_MCP_CONFIG environment variable if set, otherwise falls back to
     XDG standard path (~/.config/ssh-mcp/servers.toml) or development path.
     """
-    global _registry, _ssh
+    global _registry, _ssh, _init_lock
 
-    if _registry is None:
+    if _registry is not None:
+        return  # Fast path — already initialized
+
+    if _init_lock is None:
+        _init_lock = asyncio.Lock()
+
+    async with _init_lock:
+        if _registry is not None:
+            return  # Another coroutine initialized while we waited
+
         config_path = _get_config_path()
         logger.info(f"Loading configuration from {config_path}")
         _registry = ServerRegistry(config_path)
@@ -111,9 +127,21 @@ def _init() -> None:
             f"Initialized SSH MCP server: {len(_registry.all_servers())} servers, "
             f"{len(_registry.all_groups())} groups"
         )
-
-        # Register cleanup handler
         atexit.register(_cleanup_connections)
+
+
+def _get_registry() -> ServerRegistry:
+    """Return the initialized registry, raising if not yet initialized."""
+    if _registry is None:
+        raise RuntimeError("Server not initialized")
+    return _registry
+
+
+def _get_ssh() -> SSHManager:
+    """Return the initialized SSH manager, raising if not yet initialized."""
+    if _ssh is None:
+        raise RuntimeError("Server not initialized")
+    return _ssh
 
 
 @mcp.tool()
@@ -128,12 +156,13 @@ async def list_servers(group: str | None = None) -> str:
         Formatted table of servers with name, groups, and description.
     """
     try:
-        _init()
+        await _init()
+        registry = _get_registry()
 
         if group is not None:
             # Filter by group
             try:
-                servers = _registry.servers_in_group(group)
+                servers = registry.servers_in_group(group)
                 filter_label = f" in group '{group}'"
                 if not servers:
                     return f"No servers found in group '{group}'"
@@ -142,14 +171,16 @@ async def list_servers(group: str | None = None) -> str:
                 return f"Error: {e}"
         else:
             # Show all servers
-            servers = _registry.all_servers()
+            servers = registry.all_servers()
             filter_label = ""
 
         return format_server_table(servers, filter_label=filter_label)
 
+    except ToolError:
+        raise
     except Exception as e:
         logger.error(f"Error listing servers: {e}")
-        return f"Error listing servers: {e}"
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -160,21 +191,24 @@ async def list_groups() -> str:
         Formatted table of groups with name, description, and server count.
     """
     try:
-        _init()
+        await _init()
+        registry = _get_registry()
 
-        groups = _registry.all_groups()
+        groups = registry.all_groups()
 
         # Count servers per group
         server_counts = {}
         for group in groups:
-            count = len(_registry.servers_in_group(group.name))
+            count = len(registry.servers_in_group(group.name))
             server_counts[group.name] = count
 
         return format_group_table(groups, server_counts)
 
+    except ToolError:
+        raise
     except Exception as e:
         logger.error(f"Error listing groups: {e}")
-        return f"Error listing groups: {e}"
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -199,14 +233,17 @@ async def execute(
         Formatted command execution result with stdout, stderr, and exit code.
     """
     try:
-        _init()
+        await _init()
+        ssh = _get_ssh()
 
-        result = await _ssh.execute(server, command, timeout, working_dir, force)
+        result = await ssh.execute(server, command, timeout, working_dir, force)
         return format_exec_result(result)
 
+    except ToolError:
+        raise
     except Exception as e:
         logger.error(f"Error executing command on {server}: {e}")
-        return f"Error executing command on {server}: {e}"
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -216,6 +253,7 @@ async def execute_on_group(
     timeout: int = 30,
     working_dir: str | None = None,
     fail_fast: bool = False,
+    force: bool = False,
 ) -> str:
     """Execute a shell command on all servers in a group (parallel execution).
 
@@ -226,21 +264,25 @@ async def execute_on_group(
         timeout: Per-server command timeout in seconds. Default 30.
         working_dir: Remote directory to execute from on each server.
         fail_fast: If true, stop on first failure. Default false (run all).
+        force: Bypass dangerous command detection. Use with extreme caution. Default false.
 
     Returns:
         Formatted summary of results from all servers in the group.
     """
     try:
-        _init()
+        await _init()
+        ssh = _get_ssh()
 
-        results = await _ssh.execute_on_group(
-            group, command, timeout, working_dir, fail_fast
+        results = await ssh.execute_on_group(
+            group, command, timeout, working_dir, fail_fast, force
         )
         return format_group_results(results, group)
 
+    except ToolError:
+        raise
     except Exception as e:
         logger.error(f"Error executing command on group {group}: {e}")
-        return f"Error executing command on group {group}: {e}"
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -260,14 +302,17 @@ async def upload_file(
         Confirmation message with file size.
     """
     try:
-        _init()
+        await _init()
+        ssh = _get_ssh()
 
-        result = await _ssh.upload(server, local_path, remote_path)
+        result = await ssh.upload(server, local_path, remote_path)
         return result
 
+    except ToolError:
+        raise
     except Exception as e:
         logger.error(f"Error uploading file to {server}: {e}")
-        return f"Error uploading file to {server}: {e}"
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -287,14 +332,17 @@ async def download_file(
         Confirmation message with file size.
     """
     try:
-        _init()
+        await _init()
+        ssh = _get_ssh()
 
-        result = await _ssh.download(server, remote_path, local_path)
+        result = await ssh.download(server, remote_path, local_path)
         return result
 
+    except ToolError:
+        raise
     except Exception as e:
         logger.error(f"Error downloading file from {server}: {e}")
-        return f"Error downloading file from {server}: {e}"
+        raise ToolError(str(e))
 
 
 def main() -> None:

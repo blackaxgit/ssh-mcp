@@ -194,7 +194,8 @@ def format_group_results(results: list[ExecResult], group_name: str) -> str:
             failed += 1
             lines.append(f"[{result.server}] ERROR: {result.error}")
         else:
-            if result.exit_code == 0:
+            is_success = result.exit_code == 0
+            if is_success:
                 succeeded += 1
             else:
                 failed += 1
@@ -204,11 +205,9 @@ def format_group_results(results: list[ExecResult], group_name: str) -> str:
                 f"[{result.server}] (exit {exit_code}, {result.duration_ms}ms)"
             )
 
-            # Add stdout if present
             if result.stdout:
                 lines.append(result.stdout)
 
-            # Add stderr if present (with label)
             if result.stderr:
                 lines.append(f"STDERR: {result.stderr}")
 

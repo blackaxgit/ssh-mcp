@@ -16,12 +16,13 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: System :: Systems Administration",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
     "mcp[cli]>=1.2.0,<2.0.0",
-    "asyncssh>=2.14.0",
+    "asyncssh>=2.14.0,<3.0.0",
 ]
 
 [project.scripts]
@@ -36,6 +37,9 @@ Issues = "https://github.com/blackaxgit/ssh-mcp/issues"
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=6.0",
+    "mypy>=1.15",
+    "pip-audit>=2.9",
 ]
 
 [build-system]
@@ -48,3 +52,14 @@ path = "src/ssh_mcp/__init__.py"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "asyncssh.*"
+ignore_missing_imports = true

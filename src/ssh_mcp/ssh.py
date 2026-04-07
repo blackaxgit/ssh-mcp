@@ -13,6 +13,7 @@ import re
 import shlex
 import time
 from pathlib import Path
+from typing import Any
 
 import asyncssh
 
@@ -78,6 +79,28 @@ def _validate_remote_path(path: str) -> None:
             raise ValueError(f"Access to sensitive path blocked: {path}")
 
 
+def _validate_local_path(path: str) -> None:
+    """Validate local path for SFTP operations.
+
+    Prevents reading/writing arbitrary files on the MCP host.
+
+    Args:
+        path: Local path to validate
+
+    Raises:
+        ValueError: If path contains parent traversal or sensitive paths
+    """
+    # Block parent directory traversal
+    if ".." in path:
+        raise ValueError(f"Path traversal detected: {path}")
+
+    # Block access to sensitive paths
+    normalized_path = path.lower()
+    for sensitive in _SENSITIVE_PATHS:
+        if sensitive in normalized_path:
+            raise ValueError(f"Access to sensitive path blocked: {path}")
+
+
 class SSHManager:
     """Manages SSH connections with pooling and jump host support.
 
@@ -112,12 +135,7 @@ class SSHManager:
         # Audit logger for command tracking
         self._audit = logging.getLogger("ssh_mcp.audit")
 
-        # Start eviction loop (deferred if no event loop yet)
-        try:
-            self._start_eviction_loop()
-        except RuntimeError:
-            # No event loop running yet; will be started on first use
-            pass
+        # Eviction loop starts on first connection (deferred if no event loop)
 
     async def execute(
         self,
@@ -176,8 +194,8 @@ class SSHManager:
                 duration_ms = int((time.monotonic() - start_time) * 1000)
 
                 # Truncate output if needed
-                stdout = result.stdout or ""
-                stderr = result.stderr or ""
+                stdout = str(result.stdout or "")
+                stderr = str(result.stderr or "")
 
                 if len(stdout) > self.settings.max_output_bytes:
                     stdout = (
@@ -326,16 +344,20 @@ class SSHManager:
                         for task in actual_tasks:
                             if not task.done():
                                 task.cancel()
+                        # Drain cancelled tasks to prevent leaks
+                        remaining = [t for t in actual_tasks if not t.done()]
+                        if remaining:
+                            await asyncio.gather(*remaining, return_exceptions=True)
                         break
                 return results
             else:
                 # Wait for all tasks to complete
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                gather_results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 # Convert exceptions to ExecResult
                 normalized_results = []
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
+                for i, gather_result in enumerate(gather_results):
+                    if isinstance(gather_result, BaseException):
                         server_name = servers[i].name
                         normalized_results.append(
                             ExecResult(
@@ -344,11 +366,11 @@ class SSHManager:
                                 stdout="",
                                 stderr="",
                                 exit_code=None,
-                                error=f"Exception during execution: {result}",
+                                error=f"Exception during execution: {gather_result}",
                             )
                         )
                     else:
-                        normalized_results.append(result)
+                        normalized_results.append(gather_result)
 
                 return normalized_results
 
@@ -390,8 +412,9 @@ class SSHManager:
             Confirmation message with file size
         """
         try:
-            # Validate remote path
+            # Validate paths
             _validate_remote_path(remote_path)
+            _validate_local_path(local_path)
 
             start_time = time.monotonic()
             conn = await self._get_connection(server_name)
@@ -446,8 +469,9 @@ class SSHManager:
             Confirmation message with file size
         """
         try:
-            # Validate remote path
+            # Validate paths
             _validate_remote_path(remote_path)
+            _validate_local_path(local_path)
 
             start_time = time.monotonic()
             conn = await self._get_connection(server_name)
@@ -533,7 +557,10 @@ class SSHManager:
 
         # Ensure eviction loop is started
         if not self._running:
-            self._start_eviction_loop()
+            try:
+                self._start_eviction_loop()
+            except RuntimeError:
+                pass  # No event loop yet; will retry on next call
 
         # Get or create lock for this server
         lock = self._locks.setdefault(server_name, asyncio.Lock())
@@ -579,7 +606,7 @@ class SSHManager:
             Various SSH exceptions on connection failure
         """
         # Build connection parameters
-        connect_params = {
+        connect_params: dict[str, Any] = {
             "config": [self.settings.ssh_config_path],
         }
 
@@ -627,8 +654,8 @@ class SSHManager:
         if self._running:
             return
 
-        self._running = True
         self._eviction_task = asyncio.create_task(self._eviction_loop())
+        self._running = True
 
     async def _eviction_loop(self) -> None:
         """Background task that evicts idle connections.
@@ -665,13 +692,19 @@ class SSHManager:
 
                     # Acquire lock before evicting
                     async with lock:
+                        # Re-check freshness inside lock — prevents TOCTOU race
+                        current_last_used = self._last_used.get(server_name)
+                        if current_last_used is None:
+                            continue
+                        if now - current_last_used <= idle_threshold:
+                            continue  # Connection was refreshed while waiting for lock
                         if server_name in self._connections:
                             conn = self._connections[server_name]
                             try:
                                 conn.close()
                                 await conn.wait_closed()
                                 logger.info(
-                                    f"Evicted idle connection to {server_name} (idle {idle_time:.0f}s)"
+                                    f"Evicted idle connection to {server_name} (idle {now - current_last_used:.0f}s)"
                                 )
                             except Exception as e:
                                 logger.warning(
@@ -680,7 +713,6 @@ class SSHManager:
                             finally:
                                 self._connections.pop(server_name, None)
                                 self._last_used.pop(server_name, None)
-                                # Keep lock in _locks for reuse
 
         except asyncio.CancelledError:
             logger.info("Connection eviction loop cancelled")
