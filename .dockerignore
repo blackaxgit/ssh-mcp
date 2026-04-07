@@ -1,0 +1,81 @@
+# Git and version control
+.git
+.gitignore
+.gitattributes
+
+# Python virtual environments and caches
+.venv
+venv
+ENV
+env
+__pycache__
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+dist/
+build/
+
+# Testing and coverage
+tests/
+pytest.ini
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.sublime-project
+.sublime-workspace
+
+# Development tools
+.claude/
+.claude_code/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+azure-pipelines.yml
+
+# Documentation and changelog
+docs/
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
+PLAN.md
+
+# Logs and temporary files
+logs/
+*.log
+*.log.*
+tmp/
+temp/
+
+# Build artifacts
+*.tar.gz
+*.zip
+*.whl
+
+# Dependencies and lock files (handled by uv during build)
+# Note: pyproject.toml and uv.lock ARE copied and used
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# SSH and sensitive files (use runtime volumes instead)
+.ssh/
+*.pem
+*.key
+config/servers.toml
+
+# Miscellaneous
+.env
+.env.local
+.env.*.local
