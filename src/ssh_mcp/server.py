@@ -130,6 +130,20 @@ async def _init() -> None:
         atexit.register(_cleanup_connections)
 
 
+def _get_registry() -> ServerRegistry:
+    """Return the initialized registry, raising if not yet initialized."""
+    if _registry is None:
+        raise RuntimeError("Server not initialized")
+    return _registry
+
+
+def _get_ssh() -> SSHManager:
+    """Return the initialized SSH manager, raising if not yet initialized."""
+    if _ssh is None:
+        raise RuntimeError("Server not initialized")
+    return _ssh
+
+
 @mcp.tool()
 async def list_servers(group: str | None = None) -> str:
     """List all configured SSH servers with their groups and descriptions.
@@ -143,13 +157,13 @@ async def list_servers(group: str | None = None) -> str:
     """
     try:
         await _init()
-        assert _registry is not None
-        assert _ssh is not None
+        registry = _get_registry()
+        ssh = _get_ssh()
 
         if group is not None:
             # Filter by group
             try:
-                servers = _registry.servers_in_group(group)
+                servers = registry.servers_in_group(group)
                 filter_label = f" in group '{group}'"
                 if not servers:
                     return f"No servers found in group '{group}'"
@@ -158,7 +172,7 @@ async def list_servers(group: str | None = None) -> str:
                 return f"Error: {e}"
         else:
             # Show all servers
-            servers = _registry.all_servers()
+            servers = registry.all_servers()
             filter_label = ""
 
         return format_server_table(servers, filter_label=filter_label)
@@ -179,15 +193,15 @@ async def list_groups() -> str:
     """
     try:
         await _init()
-        assert _registry is not None
-        assert _ssh is not None
+        registry = _get_registry()
+        ssh = _get_ssh()
 
-        groups = _registry.all_groups()
+        groups = registry.all_groups()
 
         # Count servers per group
         server_counts = {}
         for group in groups:
-            count = len(_registry.servers_in_group(group.name))
+            count = len(registry.servers_in_group(group.name))
             server_counts[group.name] = count
 
         return format_group_table(groups, server_counts)
@@ -222,10 +236,10 @@ async def execute(
     """
     try:
         await _init()
-        assert _registry is not None
-        assert _ssh is not None
+        registry = _get_registry()
+        ssh = _get_ssh()
 
-        result = await _ssh.execute(server, command, timeout, working_dir, force)
+        result = await ssh.execute(server, command, timeout, working_dir, force)
         return format_exec_result(result)
 
     except ToolError:
@@ -260,10 +274,10 @@ async def execute_on_group(
     """
     try:
         await _init()
-        assert _registry is not None
-        assert _ssh is not None
+        registry = _get_registry()
+        ssh = _get_ssh()
 
-        results = await _ssh.execute_on_group(
+        results = await ssh.execute_on_group(
             group, command, timeout, working_dir, fail_fast, force
         )
         return format_group_results(results, group)
@@ -293,10 +307,10 @@ async def upload_file(
     """
     try:
         await _init()
-        assert _registry is not None
-        assert _ssh is not None
+        registry = _get_registry()
+        ssh = _get_ssh()
 
-        result = await _ssh.upload(server, local_path, remote_path)
+        result = await ssh.upload(server, local_path, remote_path)
         return result
 
     except ToolError:
@@ -324,10 +338,10 @@ async def download_file(
     """
     try:
         await _init()
-        assert _registry is not None
-        assert _ssh is not None
+        registry = _get_registry()
+        ssh = _get_ssh()
 
-        result = await _ssh.download(server, remote_path, local_path)
+        result = await ssh.download(server, remote_path, local_path)
         return result
 
     except ToolError:
