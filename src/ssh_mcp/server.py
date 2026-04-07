@@ -158,7 +158,6 @@ async def list_servers(group: str | None = None) -> str:
     try:
         await _init()
         registry = _get_registry()
-        ssh = _get_ssh()
 
         if group is not None:
             # Filter by group
@@ -194,7 +193,6 @@ async def list_groups() -> str:
     try:
         await _init()
         registry = _get_registry()
-        ssh = _get_ssh()
 
         groups = registry.all_groups()
 
@@ -236,7 +234,6 @@ async def execute(
     """
     try:
         await _init()
-        registry = _get_registry()
         ssh = _get_ssh()
 
         result = await ssh.execute(server, command, timeout, working_dir, force)
@@ -274,7 +271,6 @@ async def execute_on_group(
     """
     try:
         await _init()
-        registry = _get_registry()
         ssh = _get_ssh()
 
         results = await ssh.execute_on_group(
@@ -307,7 +303,6 @@ async def upload_file(
     """
     try:
         await _init()
-        registry = _get_registry()
         ssh = _get_ssh()
 
         result = await ssh.upload(server, local_path, remote_path)
@@ -338,7 +333,6 @@ async def download_file(
     """
     try:
         await _init()
-        registry = _get_registry()
         ssh = _get_ssh()
 
         result = await ssh.download(server, remote_path, local_path)
