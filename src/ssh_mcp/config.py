@@ -7,14 +7,67 @@ and filtering methods.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import tomllib
 from pathlib import Path
+from typing import Any
 
 from ssh_mcp.models import GroupConfig, ServerConfig, Settings
 
 logger = logging.getLogger(__name__)
+
+
+class ConfigError(ValueError):
+    """Raised when configuration loading or validation fails.
+
+    Subclass of ValueError for backward compatibility with existing callers
+    that catch ValueError, while allowing precise `except ConfigError` at
+    the MCP tool layer for actionable error messages.
+    """
+
+
+def _reject_unknown_keys(
+    section: str,
+    data: dict[str, Any],
+    known: set[str],
+    context: str = "",
+) -> None:
+    """Raise ConfigError if ``data`` contains keys not in ``known``.
+
+    Error message names every offending key AND lists every valid key, so
+    operators can diagnose typos without guessing.
+
+    Args:
+        section: TOML section label used in the error message.
+        data: Raw dict from tomllib.load.
+        known: Set of valid keys for this section.
+        context: Optional contextual label (e.g. server name).
+    """
+    unknown = set(data) - known
+    if unknown:
+        suffix = f" for '{context}'" if context else ""
+        bad = ", ".join(sorted(unknown))
+        valid = ", ".join(sorted(known))
+        raise ConfigError(
+            f"Unknown key(s) in [{section}]{suffix}: {bad}. Valid keys: {valid}"
+        )
+
+
+_SETTINGS_KEYS: set[str] = {f.name for f in dataclasses.fields(Settings)}
+_GROUP_KEYS: set[str] = {"description"}
+_SERVER_KEYS: set[str] = {
+    "description",
+    "groups",
+    "hostname",
+    "port",
+    "user",
+    "identity_file",
+    "jump_host",
+    "default_dir",
+    "timeout",
+}
 
 
 class ServerRegistry:
@@ -122,7 +175,7 @@ class ServerRegistry:
 
         Raises:
             FileNotFoundError: If config file doesn't exist
-            ValueError: If TOML is malformed or validation fails
+            ConfigError: If TOML is malformed or validation fails
         """
         if not self._config_path.exists():
             raise FileNotFoundError(
@@ -133,17 +186,24 @@ class ServerRegistry:
             with open(self._config_path, "rb") as f:
                 config_data = tomllib.load(f)
         except tomllib.TOMLDecodeError as e:
-            raise ValueError(f"Invalid TOML in {self._config_path}: {e}") from e
+            raise ConfigError(
+                f"Failed to parse {self._config_path}: {e}. "
+                f"Check TOML syntax near the reported position."
+            ) from e
 
         # Load settings
         if "settings" in config_data:
-            settings_dict = config_data["settings"]
+            settings_dict = dict(config_data["settings"])
+            _reject_unknown_keys("settings", settings_dict, _SETTINGS_KEYS)
             # Expand ~ in ssh_config_path
             if "ssh_config_path" in settings_dict:
                 settings_dict["ssh_config_path"] = os.path.expanduser(
                     settings_dict["ssh_config_path"]
                 )
-            self._settings = Settings(**settings_dict)
+            try:
+                self._settings = Settings(**settings_dict)
+            except (TypeError, ValueError) as e:
+                raise ConfigError(f"Invalid [settings]: {e}") from e
 
         # Warn if known_hosts verification is disabled
         if not self._settings.known_hosts:
@@ -154,6 +214,13 @@ class ServerRegistry:
         # Load groups
         if "groups" in config_data:
             for group_name, group_data in config_data["groups"].items():
+                _reject_unknown_keys(
+                    "groups", dict(group_data), _GROUP_KEYS, context=group_name
+                )
+                if "description" not in group_data:
+                    raise ConfigError(
+                        f"Group '{group_name}' is missing required key 'description'"
+                    )
                 self._groups[group_name] = GroupConfig(
                     name=group_name, description=group_data["description"]
                 )
@@ -161,6 +228,13 @@ class ServerRegistry:
         # Load servers
         if "servers" in config_data:
             for server_name, server_data in config_data["servers"].items():
+                _reject_unknown_keys(
+                    "servers", dict(server_data), _SERVER_KEYS, context=server_name
+                )
+                if "description" not in server_data:
+                    raise ConfigError(
+                        f"Server '{server_name}' is missing required key 'description'"
+                    )
                 # Convert groups list to tuple
                 groups = tuple(server_data.get("groups", []))
 

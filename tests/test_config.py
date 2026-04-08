@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from ssh_mcp.config import ServerRegistry
+from ssh_mcp.config import ConfigError, ServerRegistry
 from ssh_mcp.models import GroupConfig, ServerConfig, Settings
 
 
@@ -57,14 +57,16 @@ class TestServerRegistryLoading:
         assert "not found" in str(exc_info.value).lower()
 
     def test_load_malformed_toml_raises(self, tmp_path: Path) -> None:
-        """Test ValueError for malformed TOML."""
+        """Test ConfigError for malformed TOML includes file path context."""
         malformed_file = tmp_path / "malformed.toml"
         malformed_file.write_text("[servers\ninvalid toml syntax")
 
         with pytest.raises(ValueError) as exc_info:
             ServerRegistry(str(malformed_file))
 
-        assert "invalid toml" in str(exc_info.value).lower()
+        msg = str(exc_info.value)
+        assert "failed to parse" in msg.lower()
+        assert str(malformed_file) in msg  # path must appear in error
 
     def test_load_minimal_config(self, tmp_config_file: Path) -> None:
         """Test loading minimal valid config from fixture."""
@@ -275,3 +277,135 @@ jump_host = "host-a"
         config_file.write_text(config_content)
         with pytest.raises(ValueError, match="[Cc]ircular"):
             ServerRegistry(str(config_file))
+
+
+class TestUnknownKeyRejection:
+    """Tests for ConfigError on unknown TOML keys (A3)."""
+
+    def test_unknown_settings_key_lists_offender_and_valid_keys(
+        self, tmp_path: Path
+    ) -> None:
+        """Unknown [settings] key must be named AND valid keys listed."""
+        config_content = """
+[settings]
+command_timeout = 30
+typo_field = "oops"
+
+[groups]
+prod = { description = "Production" }
+
+[servers.web1]
+description = "Web"
+groups = ["prod"]
+"""
+        f = tmp_path / "bad-settings.toml"
+        f.write_text(config_content)
+        with pytest.raises(ConfigError) as exc_info:
+            ServerRegistry(str(f))
+
+        msg = str(exc_info.value)
+        assert "typo_field" in msg
+        assert "command_timeout" in msg  # valid key should be listed
+        assert "max_parallel_hosts" in msg  # another valid key
+
+    def test_unknown_server_key_rejected_with_server_name(
+        self, tmp_path: Path
+    ) -> None:
+        """Unknown [servers.x] key must name both the key AND the server."""
+        config_content = """
+[groups]
+prod = { description = "Production" }
+
+[servers.web1]
+description = "Web"
+groups = ["prod"]
+reigon = "us-east"
+"""
+        f = tmp_path / "bad-server.toml"
+        f.write_text(config_content)
+        with pytest.raises(ConfigError) as exc_info:
+            ServerRegistry(str(f))
+
+        msg = str(exc_info.value)
+        assert "reigon" in msg
+        assert "web1" in msg  # offending server name
+        assert "hostname" in msg  # valid key listed
+
+    def test_unknown_group_key_rejected_with_group_name(
+        self, tmp_path: Path
+    ) -> None:
+        """Unknown [groups.x] key must name both the key AND the group."""
+        config_content = """
+[groups]
+prod = { description = "Production", color = "red" }
+
+[servers.web1]
+description = "Web"
+groups = ["prod"]
+"""
+        f = tmp_path / "bad-group.toml"
+        f.write_text(config_content)
+        with pytest.raises(ConfigError) as exc_info:
+            ServerRegistry(str(f))
+
+        msg = str(exc_info.value)
+        assert "color" in msg
+        assert "prod" in msg
+
+    def test_missing_required_server_description_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """A server without 'description' must raise ConfigError, not KeyError."""
+        config_content = """
+[groups]
+prod = { description = "Production" }
+
+[servers.web1]
+groups = ["prod"]
+"""
+        f = tmp_path / "no-desc.toml"
+        f.write_text(config_content)
+        with pytest.raises(ConfigError, match="missing required key 'description'"):
+            ServerRegistry(str(f))
+
+    def test_missing_required_group_description_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """A group without 'description' must raise ConfigError."""
+        config_content = """
+[groups]
+prod = {}
+
+[servers.web1]
+description = "Web"
+groups = ["prod"]
+"""
+        f = tmp_path / "no-group-desc.toml"
+        f.write_text(config_content)
+        with pytest.raises(ConfigError, match="missing required key 'description'"):
+            ServerRegistry(str(f))
+
+    def test_invalid_settings_value_propagates_as_config_error(
+        self, tmp_path: Path
+    ) -> None:
+        """A negative timeout from TOML must surface as ConfigError, not ValueError."""
+        config_content = """
+[settings]
+command_timeout = -5
+
+[groups]
+prod = { description = "Production" }
+
+[servers.web1]
+description = "Web"
+groups = ["prod"]
+"""
+        f = tmp_path / "negative.toml"
+        f.write_text(config_content)
+        with pytest.raises(ConfigError) as exc_info:
+            ServerRegistry(str(f))
+        assert "command_timeout" in str(exc_info.value)
+
+    def test_config_error_is_valueerror_subclass(self) -> None:
+        """ConfigError must remain a ValueError subclass for backward compat."""
+        assert issubclass(ConfigError, ValueError)
