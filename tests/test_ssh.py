@@ -17,6 +17,7 @@ from ssh_mcp.ssh import (
     _DANGEROUS_PATTERNS,
     _SENSITIVE_PATHS,
     _is_dangerous_command,
+    _make_connection_id,
     _validate_local_path,
     _validate_remote_path,
 )
@@ -517,3 +518,179 @@ class TestDangerousCommandForceBypass:
 
         sig = inspect.signature(SSHManager.execute)
         assert "force" in sig.parameters
+
+
+# ---------------------------------------------------------------------------
+# connection_id generation + SFTP audit lifecycle (B2)
+# ---------------------------------------------------------------------------
+
+
+class TestConnectionIdGeneration:
+    """_make_connection_id produces grep-friendly unique identifiers."""
+
+    def test_connection_id_starts_with_server_name(self) -> None:
+        cid = _make_connection_id("web1")
+        assert cid.startswith("web1-")
+
+    def test_connection_id_contains_pid(self) -> None:
+        import os
+
+        cid = _make_connection_id("web1")
+        assert f"-{os.getpid()}-" in cid
+
+    def test_connection_ids_are_unique(self) -> None:
+        """Two calls must produce distinct ids even for the same server."""
+        ids = {_make_connection_id("web1") for _ in range(100)}
+        assert len(ids) == 100
+
+
+class TestSFTPAuditLogging:
+    """SFTP upload/download emit start/complete/failed audit logs."""
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[settings]
+command_timeout = 30
+
+[groups]
+test = { description = "Test group" }
+
+[servers.test-host]
+description = "Test server"
+groups = ["test"]
+"""
+        tmp = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        tmp.write(config_content)
+        tmp.flush()
+        tmp.close()
+        return ServerRegistry(tmp.name)
+
+    async def test_upload_emits_start_and_complete_audit_logs(
+        self,
+        tmp_path,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """upload() must emit sftp.upload.start AND sftp.upload.complete."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        local = tmp_path / "payload.txt"
+        local.write_bytes(b"hello sftp")
+
+        manager = SSHManager(self._make_registry(), sample_settings)
+        # Seed the pool so _get_connection returns our mock without touching
+        # real network or asyncssh.connect().
+        mock_sftp = MagicMock()
+        mock_sftp.put = AsyncMock(return_value=None)
+
+        sftp_ctx = MagicMock()
+        sftp_ctx.__aenter__ = AsyncMock(return_value=mock_sftp)
+        sftp_ctx.__aexit__ = AsyncMock(return_value=None)
+
+        mock_conn = MagicMock()
+        mock_conn.is_closed = MagicMock(return_value=False)
+        mock_conn.start_sftp_client = MagicMock(return_value=sftp_ctx)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            # Pre-seed the connection_id so audit log can reference it
+            manager._connection_ids["test-host"] = "test-host-1-abcd1234"
+
+            with caplog.at_level("INFO", logger="ssh_mcp.audit"):
+                await manager.upload("test-host", str(local), "/tmp/target.txt")
+
+        messages = [r.message for r in caplog.records]
+        assert any("sftp.upload.start" in m for m in messages), (
+            f"No start log in: {messages}"
+        )
+        assert any("sftp.upload.complete" in m for m in messages), (
+            f"No complete log in: {messages}"
+        )
+
+    async def test_upload_failure_emits_failed_audit_log(
+        self,
+        tmp_path,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """Upload failure must emit sftp.upload.failed with error type."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        local = tmp_path / "payload.txt"
+        local.write_bytes(b"data")
+
+        manager = SSHManager(self._make_registry(), sample_settings)
+
+        # start_sftp_client raises to simulate failure
+        mock_conn = MagicMock()
+        mock_conn.is_closed = MagicMock(return_value=False)
+        mock_conn.start_sftp_client = MagicMock(side_effect=OSError("no route"))
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            manager._connection_ids["test-host"] = "test-host-1-deadbeef"
+            with caplog.at_level("WARNING", logger="ssh_mcp.audit"):
+                with pytest.raises(RuntimeError, match="Upload failed"):
+                    await manager.upload(
+                        "test-host", str(local), "/tmp/target.txt"
+                    )
+
+        messages = [r.message for r in caplog.records]
+        assert any("sftp.upload.failed" in m for m in messages), (
+            f"No failed log in: {messages}"
+        )
+        # Error type should be included so operators can triage quickly
+        assert any("OSError" in m for m in messages)
+
+    async def test_download_emits_start_and_complete_audit_logs(
+        self,
+        tmp_path,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """download() must emit sftp.download.start AND sftp.download.complete."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        local = tmp_path / "downloaded.txt"
+        # Pre-create so Path(local_path).stat() works after mocked get()
+        local.write_bytes(b"some data")
+
+        manager = SSHManager(self._make_registry(), sample_settings)
+        mock_sftp = MagicMock()
+        mock_sftp.get = AsyncMock(return_value=None)
+
+        sftp_ctx = MagicMock()
+        sftp_ctx.__aenter__ = AsyncMock(return_value=mock_sftp)
+        sftp_ctx.__aexit__ = AsyncMock(return_value=None)
+
+        mock_conn = MagicMock()
+        mock_conn.is_closed = MagicMock(return_value=False)
+        mock_conn.start_sftp_client = MagicMock(return_value=sftp_ctx)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            manager._connection_ids["test-host"] = "test-host-1-cafef00d"
+            with caplog.at_level("INFO", logger="ssh_mcp.audit"):
+                await manager.download(
+                    "test-host", "/tmp/source.txt", str(local)
+                )
+
+        messages = [r.message for r in caplog.records]
+        assert any("sftp.download.start" in m for m in messages)
+        assert any("sftp.download.complete" in m for m in messages)
+
+    def test_connection_ids_cleared_on_close_all(
+        self, sample_settings: Settings
+    ) -> None:
+        """close_all() must clear the connection_ids dict."""
+        manager = SSHManager(self._make_registry(), sample_settings)
+        manager._connection_ids["test-host"] = "test-host-1-abcd"
+
+        asyncio.run(manager.close_all())
+
+        assert manager._connection_ids == {}

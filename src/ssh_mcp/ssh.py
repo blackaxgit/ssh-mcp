@@ -9,18 +9,32 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shlex
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 import asyncssh
+import structlog.contextvars
 
 from ssh_mcp.config import ServerRegistry
 from ssh_mcp.models import ExecResult, ServerConfig, Settings
 
 logger = logging.getLogger(__name__)
+
+
+def _make_connection_id(server_name: str) -> str:
+    """Return a short, grep-friendly connection identifier.
+
+    Format: ``{server}-{pid}-{short-uuid}``. Short enough to read in logs,
+    unique enough to distinguish reconnects. The UUID suffix is 8 hex chars
+    which gives ~4 billion possibilities — collisions in a single process
+    lifetime are effectively impossible.
+    """
+    return f"{server_name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 # Dangerous command patterns that could be destructive
 _DANGEROUS_PATTERNS = [
@@ -135,6 +149,10 @@ class SSHManager:
         self._connections: dict[str, asyncssh.SSHClientConnection] = {}
         self._last_used: dict[str, float] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # Per-connection stable id, generated at first connect and reused
+        # until eviction. Bound via structlog contextvars for every op so
+        # operators can grep all log lines from a single SSH session.
+        self._connection_ids: dict[str, str] = {}
 
         # Background eviction task
         self._eviction_task: asyncio.Task | None = None
@@ -411,6 +429,11 @@ class SSHManager:
     async def upload(self, server_name: str, local_path: str, remote_path: str) -> str:
         """Upload file to remote server via SFTP.
 
+        Emits three-stage audit logs (start → complete | failed) with the
+        ``connection_id`` and a monotonic ``duration_ms`` bound into the
+        structlog context so every log line from a single transfer is
+        grep-correlatable.
+
         Args:
             server_name: Server name from registry
             local_path: Local file path
@@ -419,36 +442,54 @@ class SSHManager:
         Returns:
             Confirmation message with file size
         """
+        # Validate paths BEFORE logging so audit logs do not contain
+        # sensitive values when validation blocks the call.
+        _validate_remote_path(remote_path)
+        _validate_local_path(local_path)
+
+        start_time = time.monotonic()
+        ctx_tokens: dict[str, Any] = dict(
+            structlog.contextvars.bind_contextvars(
+                server=server_name,
+                operation="upload",
+                local_path=local_path,
+                remote_path=remote_path,
+            )
+        )
         try:
-            # Validate paths
-            _validate_remote_path(remote_path)
-            _validate_local_path(local_path)
-
-            start_time = time.monotonic()
             conn = await self._get_connection(server_name)
+            # Now that we have (or reused) a connection, bind its id so the
+            # start/complete/failed lines all share the connection_id.
+            ctx_tokens.update(
+                structlog.contextvars.bind_contextvars(
+                    connection_id=self._connection_ids.get(server_name, "unknown"),
+                )
+            )
+            self._audit.info("sftp.upload.start")
 
-            # Start SFTP client
             async with conn.start_sftp_client() as sftp:
-                # Upload file
                 await sftp.put(local_path, remote_path)
 
-                # Get file size for confirmation
                 local_size = Path(local_path).stat().st_size
                 duration_ms = int((time.monotonic() - start_time) * 1000)
 
-                # Audit log upload
                 self._audit.info(
-                    "server=%s operation=upload local_path=%s remote_path=%s bytes=%s duration_ms=%s",
-                    server_name,
-                    local_path,
-                    remote_path,
+                    "sftp.upload.complete bytes=%s duration_ms=%s",
                     local_size,
                     duration_ms,
                 )
 
-                return f"Uploaded {local_path} to {server_name}:{remote_path} ({local_size} bytes)"
+                return (
+                    f"Uploaded {local_path} to {server_name}:{remote_path} "
+                    f"({local_size} bytes)"
+                )
 
         except FileNotFoundError as e:
+            duration_ms = int((time.monotonic() - start_time) * 1000)
+            self._audit.warning(
+                "sftp.upload.failed error=file_not_found duration_ms=%s",
+                duration_ms,
+            )
             error_msg = f"Local file not found: {e}"
             logger.error(error_msg)
             raise ValueError(error_msg) from e
@@ -459,14 +500,28 @@ class SSHManager:
             asyncssh.SFTPError,
             OSError,
         ) as e:
+            duration_ms = int((time.monotonic() - start_time) * 1000)
+            self._audit.warning(
+                "sftp.upload.failed error=%s duration_ms=%s",
+                type(e).__name__,
+                duration_ms,
+            )
             error_msg = f"Upload failed to {server_name}: {e}"
             logger.error(error_msg)
             raise RuntimeError(error_msg) from e
+
+        finally:
+            structlog.contextvars.reset_contextvars(**ctx_tokens)
 
     async def download(
         self, server_name: str, remote_path: str, local_path: str
     ) -> str:
         """Download file from remote server via SFTP.
+
+        Emits three-stage audit logs (start → complete | failed) with the
+        ``connection_id`` and a monotonic ``duration_ms`` bound into the
+        structlog context so every log line from a single transfer is
+        grep-correlatable.
 
         Args:
             server_name: Server name from registry
@@ -476,34 +531,43 @@ class SSHManager:
         Returns:
             Confirmation message with file size
         """
+        _validate_remote_path(remote_path)
+        _validate_local_path(local_path)
+
+        start_time = time.monotonic()
+        ctx_tokens: dict[str, Any] = dict(
+            structlog.contextvars.bind_contextvars(
+                server=server_name,
+                operation="download",
+                remote_path=remote_path,
+                local_path=local_path,
+            )
+        )
         try:
-            # Validate paths
-            _validate_remote_path(remote_path)
-            _validate_local_path(local_path)
-
-            start_time = time.monotonic()
             conn = await self._get_connection(server_name)
+            ctx_tokens.update(
+                structlog.contextvars.bind_contextvars(
+                    connection_id=self._connection_ids.get(server_name, "unknown"),
+                )
+            )
+            self._audit.info("sftp.download.start")
 
-            # Start SFTP client
             async with conn.start_sftp_client() as sftp:
-                # Download file
                 await sftp.get(remote_path, local_path)
 
-                # Get file size for confirmation
                 local_size = Path(local_path).stat().st_size
                 duration_ms = int((time.monotonic() - start_time) * 1000)
 
-                # Audit log download
                 self._audit.info(
-                    "server=%s operation=download remote_path=%s local_path=%s bytes=%s duration_ms=%s",
-                    server_name,
-                    remote_path,
-                    local_path,
+                    "sftp.download.complete bytes=%s duration_ms=%s",
                     local_size,
                     duration_ms,
                 )
 
-                return f"Downloaded {server_name}:{remote_path} to {local_path} ({local_size} bytes)"
+                return (
+                    f"Downloaded {server_name}:{remote_path} to {local_path} "
+                    f"({local_size} bytes)"
+                )
 
         except (
             asyncssh.DisconnectError,
@@ -511,9 +575,18 @@ class SSHManager:
             asyncssh.SFTPError,
             OSError,
         ) as e:
+            duration_ms = int((time.monotonic() - start_time) * 1000)
+            self._audit.warning(
+                "sftp.download.failed error=%s duration_ms=%s",
+                type(e).__name__,
+                duration_ms,
+            )
             error_msg = f"Download failed from {server_name}: {e}"
             logger.error(error_msg)
             raise RuntimeError(error_msg) from e
+
+        finally:
+            structlog.contextvars.reset_contextvars(**ctx_tokens)
 
     async def close_all(self) -> None:
         """Close all active SSH connections and stop eviction task."""
@@ -536,6 +609,7 @@ class SSHManager:
 
         self._connections.clear()
         self._last_used.clear()
+        self._connection_ids.clear()
 
     async def _get_connection(
         self, server_name: str, _depth: int = 0
@@ -591,11 +665,16 @@ class SSHManager:
             server = self.registry.get_server(server_name)
             conn = await self._create_connection(server, _depth)
 
-            # Cache connection and update last used time
+            # Cache connection, update last used time, mint fresh connection id
             self._connections[server_name] = conn
             self._last_used[server_name] = time.monotonic()
+            self._connection_ids[server_name] = _make_connection_id(server_name)
 
-            logger.info(f"Created new connection to {server_name}")
+            logger.info(
+                "Created new connection to %s (id=%s)",
+                server_name,
+                self._connection_ids[server_name],
+            )
             return conn
 
     async def _create_connection(
@@ -721,6 +800,7 @@ class SSHManager:
                             finally:
                                 self._connections.pop(server_name, None)
                                 self._last_used.pop(server_name, None)
+                                self._connection_ids.pop(server_name, None)
 
         except asyncio.CancelledError:
             logger.info("Connection eviction loop cancelled")
