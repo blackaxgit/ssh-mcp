@@ -6,6 +6,7 @@ initialization. All tests run without real SSH connections.
 
 from __future__ import annotations
 
+import asyncio
 
 import pytest
 
@@ -415,6 +416,39 @@ groups = ["test"]
         # Eviction is deferred — _running should be False
         assert manager._running is False
         assert manager._eviction_task is None
+
+    async def test_group_execution_semaphore_uses_max_parallel_hosts(self) -> None:
+        """execute_on_group's concurrency semaphore reflects Settings.max_parallel_hosts.
+
+        Guards against regressing the hardcoded ``Semaphore(10)``. We inject a
+        custom ``max_parallel_hosts`` and assert the semaphore built inside
+        ``execute_on_group`` has the matching bound by patching
+        ``asyncio.Semaphore`` and capturing its first positional argument.
+        """
+        from unittest.mock import patch
+
+        settings = Settings(max_parallel_hosts=7)
+        registry = self._make_registry()
+        manager = SSHManager(registry, settings)
+
+        captured: list[int] = []
+        real_semaphore = asyncio.Semaphore
+
+        def capturing_semaphore(value: int) -> asyncio.Semaphore:
+            captured.append(value)
+            return real_semaphore(value)
+
+        with patch("ssh_mcp.ssh.asyncio.Semaphore", side_effect=capturing_semaphore):
+            # Group has 1 test-host, so only 1 execute will be attempted;
+            # the real execute will fail (no SSH), but by then the Semaphore
+            # is already constructed.
+            try:
+                await manager.execute_on_group("test", "true")
+            except Exception:
+                pass
+
+        assert captured, "Semaphore was never constructed in execute_on_group"
+        assert captured[0] == 7
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,9 @@ class Settings:
         max_output_bytes: Maximum bytes to capture from command output
         connection_idle_timeout: Seconds before idle connection is closed
         known_hosts: Whether to enforce strict known_hosts checking
+        max_parallel_hosts: Maximum concurrent SSH connections during
+            group execution. Bounded to 1..100 to prevent accidentally
+            exhausting file descriptors or triggering fleet-wide load spikes.
     """
 
     ssh_config_path: str = "~/.ssh/config"
@@ -26,6 +29,28 @@ class Settings:
     max_output_bytes: int = 51200
     connection_idle_timeout: int = 300
     known_hosts: bool = True
+    max_parallel_hosts: int = 10
+
+    def __post_init__(self) -> None:
+        """Validate numeric ranges after construction."""
+        if not 1 <= self.max_parallel_hosts <= 100:
+            raise ValueError(
+                f"max_parallel_hosts must be between 1 and 100, "
+                f"got {self.max_parallel_hosts}"
+            )
+        if self.command_timeout < 1:
+            raise ValueError(
+                f"command_timeout must be >= 1 second, got {self.command_timeout}"
+            )
+        if self.max_output_bytes < 1024:
+            raise ValueError(
+                f"max_output_bytes must be >= 1024, got {self.max_output_bytes}"
+            )
+        if self.connection_idle_timeout < 10:
+            raise ValueError(
+                f"connection_idle_timeout must be >= 10 seconds, "
+                f"got {self.connection_idle_timeout}"
+            )
 
 
 @dataclass(frozen=True)

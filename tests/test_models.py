@@ -23,6 +23,36 @@ class TestSettings:
         assert settings.max_output_bytes == 51200
         assert settings.connection_idle_timeout == 300
         assert settings.known_hosts is True
+        assert settings.max_parallel_hosts == 10
+
+    def test_settings_max_parallel_hosts_custom(self) -> None:
+        """Test Settings accepts custom max_parallel_hosts within range."""
+        settings = Settings(max_parallel_hosts=25)
+        assert settings.max_parallel_hosts == 25
+
+    @pytest.mark.parametrize("bad_value", [0, -1, 101, 1000])
+    def test_settings_max_parallel_hosts_out_of_range_rejected(
+        self, bad_value: int
+    ) -> None:
+        """Test Settings rejects max_parallel_hosts outside 1..100."""
+        with pytest.raises(ValueError, match="max_parallel_hosts must be between 1 and 100"):
+            Settings(max_parallel_hosts=bad_value)
+
+    @pytest.mark.parametrize("bad_value", [0, -1, -30])
+    def test_settings_command_timeout_must_be_positive(self, bad_value: int) -> None:
+        """Test Settings rejects non-positive command_timeout."""
+        with pytest.raises(ValueError, match="command_timeout must be >= 1"):
+            Settings(command_timeout=bad_value)
+
+    def test_settings_max_output_bytes_too_small_rejected(self) -> None:
+        """Test Settings rejects max_output_bytes below 1024."""
+        with pytest.raises(ValueError, match="max_output_bytes must be >= 1024"):
+            Settings(max_output_bytes=512)
+
+    def test_settings_idle_timeout_too_small_rejected(self) -> None:
+        """Test Settings rejects connection_idle_timeout below 10s."""
+        with pytest.raises(ValueError, match="connection_idle_timeout must be >= 10"):
+            Settings(connection_idle_timeout=5)
 
     def test_settings_custom_values(self) -> None:
         """Test Settings accepts custom values."""

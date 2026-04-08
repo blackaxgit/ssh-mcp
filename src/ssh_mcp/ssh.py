@@ -327,8 +327,8 @@ class SSHManager:
                 logger.warning(f"Group '{group_name}' has no servers")
                 return []
 
-            # Limit concurrent connections
-            semaphore = asyncio.Semaphore(10)
+            # Limit concurrent connections (configurable via Settings)
+            semaphore = asyncio.Semaphore(self.settings.max_parallel_hosts)
 
             async def execute_with_semaphore(server: ServerConfig) -> ExecResult:
                 async with semaphore:
