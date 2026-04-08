@@ -56,6 +56,7 @@ def _make_connection_id(server_name: str) -> str:
     """
     return f"{server_name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
+
 # Dangerous command patterns that could be destructive
 _DANGEROUS_PATTERNS = [
     re.compile(r"rm\s+-rf\s+/"),

@@ -308,9 +308,7 @@ groups = ["prod"]
         assert "command_timeout" in msg  # valid key should be listed
         assert "max_parallel_hosts" in msg  # another valid key
 
-    def test_unknown_server_key_rejected_with_server_name(
-        self, tmp_path: Path
-    ) -> None:
+    def test_unknown_server_key_rejected_with_server_name(self, tmp_path: Path) -> None:
         """Unknown [servers.x] key must name both the key AND the server."""
         config_content = """
 [groups]
@@ -331,9 +329,7 @@ reigon = "us-east"
         assert "web1" in msg  # offending server name
         assert "hostname" in msg  # valid key listed
 
-    def test_unknown_group_key_rejected_with_group_name(
-        self, tmp_path: Path
-    ) -> None:
+    def test_unknown_group_key_rejected_with_group_name(self, tmp_path: Path) -> None:
         """Unknown [groups.x] key must name both the key AND the group."""
         config_content = """
 [groups]
@@ -352,9 +348,7 @@ groups = ["prod"]
         assert "color" in msg
         assert "prod" in msg
 
-    def test_missing_required_server_description_raises(
-        self, tmp_path: Path
-    ) -> None:
+    def test_missing_required_server_description_raises(self, tmp_path: Path) -> None:
         """A server without 'description' must raise ConfigError, not KeyError."""
         config_content = """
 [groups]
@@ -368,9 +362,7 @@ groups = ["prod"]
         with pytest.raises(ConfigError, match="missing required key 'description'"):
             ServerRegistry(str(f))
 
-    def test_missing_required_group_description_raises(
-        self, tmp_path: Path
-    ) -> None:
+    def test_missing_required_group_description_raises(self, tmp_path: Path) -> None:
         """A group without 'description' must raise ConfigError."""
         config_content = """
 [groups]

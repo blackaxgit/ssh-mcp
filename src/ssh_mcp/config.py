@@ -29,9 +29,7 @@ class ConfigError(ValueError):
     """
 
 
-def _format_validation_error(
-    section: str, context: str, exc: ValidationError
-) -> str:
+def _format_validation_error(section: str, context: str, exc: ValidationError) -> str:
     """Flatten a Pydantic ValidationError into a single actionable message.
 
     Pydantic lists each offending field with its error type and input value.

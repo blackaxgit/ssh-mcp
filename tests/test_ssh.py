@@ -637,9 +637,7 @@ groups = ["test"]
             manager._connection_ids["test-host"] = "test-host-1-deadbeef"
             with caplog.at_level("WARNING", logger="ssh_mcp.audit"):
                 with pytest.raises(RuntimeError, match="Upload failed"):
-                    await manager.upload(
-                        "test-host", str(local), "/tmp/target.txt"
-                    )
+                    await manager.upload("test-host", str(local), "/tmp/target.txt")
 
         messages = [r.message for r in caplog.records]
         assert any("sftp.upload.failed" in m for m in messages), (
@@ -678,9 +676,7 @@ groups = ["test"]
         ):
             manager._connection_ids["test-host"] = "test-host-1-cafef00d"
             with caplog.at_level("INFO", logger="ssh_mcp.audit"):
-                await manager.download(
-                    "test-host", "/tmp/source.txt", str(local)
-                )
+                await manager.download("test-host", "/tmp/source.txt", str(local))
 
         messages = [r.message for r in caplog.records]
         assert any("sftp.download.start" in m for m in messages)
@@ -753,15 +749,17 @@ class TestDangerousCommandProperties:
             min_size=1,
             max_size=80,
         ).filter(
-            lambda s: not any(
-                token in s.lower()
-                for token in (
-                    "rm -rf /",
-                    "rm  -rf  /",
-                    "mkfs",
-                    "dd if=",
-                    "/dev/sd",
-                    "chmod 777 /",
+            lambda s: (
+                not any(
+                    token in s.lower()
+                    for token in (
+                        "rm -rf /",
+                        "rm  -rf  /",
+                        "mkfs",
+                        "dd if=",
+                        "/dev/sd",
+                        "chmod 777 /",
+                    )
                 )
             )
         )
@@ -781,9 +779,7 @@ class TestDangerousCommandProperties:
         ),
         st.integers(min_value=1, max_value=10),
     )
-    def test_control_char_injection_never_bypasses(
-        self, cmd: str, n_ctrl: int
-    ) -> None:
+    def test_control_char_injection_never_bypasses(self, cmd: str, n_ctrl: int) -> None:
         """Property: injecting control chars into a known-bad command must NOT bypass.
 
         Red Team R2 fix: null bytes and other ASCII control characters are
@@ -797,6 +793,4 @@ class TestDangerousCommandProperties:
         for i in range(n_ctrl):
             pos = i % len(cmd)
             cmd = cmd[:pos] + chr(i % 32) + cmd[pos:]
-        assert _is_dangerous_command(cmd) is True, (
-            f"bypass found: {cmd!r}"
-        )
+        assert _is_dangerous_command(cmd) is True, f"bypass found: {cmd!r}"

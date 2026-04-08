@@ -87,9 +87,7 @@ class TestSettings:
         # Pydantic frozen dataclasses raise FrozenInstanceError
         import dataclasses as _dc
 
-        with pytest.raises(
-            (_dc.FrozenInstanceError, AttributeError, ValueError)
-        ):
+        with pytest.raises((_dc.FrozenInstanceError, AttributeError, ValueError)):
             settings.command_timeout = 60  # type: ignore[misc]
 
     def test_settings_partial_override(self) -> None:
@@ -118,9 +116,7 @@ class TestGroupConfig:
 
         group = GroupConfig(name="prod", description="Production servers")
 
-        with pytest.raises(
-            (_dc.FrozenInstanceError, AttributeError, ValueError)
-        ):
+        with pytest.raises((_dc.FrozenInstanceError, AttributeError, ValueError)):
             group.description = "New description"  # type: ignore[misc]
 
 
@@ -182,9 +178,7 @@ class TestServerConfig:
 
         server = ServerConfig(name="web1", description="Web server 1")
 
-        with pytest.raises(
-            (_dc.FrozenInstanceError, AttributeError, ValueError)
-        ):
+        with pytest.raises((_dc.FrozenInstanceError, AttributeError, ValueError)):
             server.description = "New description"  # type: ignore[misc]
 
     def test_server_empty_groups(self) -> None:
