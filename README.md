@@ -35,6 +35,31 @@ pip install ssh-mcp
 
 Requires Python 3.11+. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) to use `uvx`.
 
+#### Docker
+
+A prebuilt image is published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/blackaxgit/ssh-mcp:latest
+```
+
+Or run with Docker Compose:
+
+```yaml
+services:
+  ssh-mcp:
+    image: ghcr.io/blackaxgit/ssh-mcp:latest
+    stdin_open: true
+    restart: unless-stopped
+    environment:
+      SSH_MCP_CONFIG: /config/servers.toml
+    volumes:
+      - ./servers.toml:/config/servers.toml:ro
+      - ~/.ssh:/home/sshmcp/.ssh:ro
+```
+
+The image uses a non-root `sshmcp` user (uid 1000). Mount your SSH keys and config file read-only. See [compose.yaml](compose.yaml) in the repo for a working example.
+
 ### Create a config file
 
 ```bash
@@ -154,16 +179,20 @@ chmod 600 ~/.config/ssh-mcp/servers.toml
 |------|-------------|
 | `list_servers` | List configured servers; optionally filter by group |
 | `list_groups` | List server groups with member counts |
-| `execute` | Run a shell command on a single server |
-| `execute_on_group` | Run a command on all servers in a group (parallel) |
-| `upload_file` | Upload a local file to a server via SFTP |
-| `download_file` | Download a file from a server via SFTP |
+| `execute` | Run a shell command on a single server (supports `force` to bypass dangerous-command detection) |
+| `execute_on_group` | Run a command on all servers in a group (parallel; supports `fail_fast` and `force`) |
+| `upload_file` | Upload a local file to a server via SFTP (validates both local and remote paths) |
+| `download_file` | Download a file from a server via SFTP (validates both local and remote paths) |
 
 ## Security
 
-ssh-mcp warns before running commands that match known destructive patterns (`rm -rf`, disk wipes, shutdown). These are informational warnings — the AI assistant can still proceed if the operator confirms. Hard blocking is not enforced by design; access control is the operator's responsibility via SSH permissions on the target host.
+ssh-mcp blocks commands that match known destructive patterns (`rm -rf /`, disk wipes, fork bombs, `mkfs`, etc.) unless the tool caller passes `force=true`. Control characters (null bytes, newlines) are normalized before pattern matching to prevent trivial regex bypasses.
+
+SFTP operations validate BOTH remote and local paths to prevent reading/writing sensitive files on either side: `/etc/shadow`, `/etc/passwd`, `~/.ssh/id_*`, `~/.ssh/authorized_keys`, and any path containing `..` traversal.
 
 Host key verification is on by default (`known_hosts = true`). Disabling `StrictHostKeyChecking` in `~/.ssh/config` weakens MITM protection and should be avoided in production.
+
+All tool calls are audit-logged to stderr with: server, command, exit code, duration, and transfer byte counts. When running in Docker, capture stderr with `docker logs` for your audit trail.
 
 For vulnerability reports, see [SECURITY.md](SECURITY.md). Do not open public GitHub issues for security concerns.
 
