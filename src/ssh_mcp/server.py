@@ -346,6 +346,17 @@ async def download_file(
 
 def main() -> None:
     """Entry point for console script (uvx ssh-mcp)."""
+    from ssh_mcp import __version__
+
+    logger.info(
+        f"Starting ssh-mcp v{__version__} (stdio transport) - "
+        f"waiting for MCP client on stdin"
+    )
+    try:
+        config_path = _get_config_path()
+        logger.info(f"Config will be loaded from {config_path} on first tool call")
+    except FileNotFoundError as e:
+        logger.warning(f"No config file found yet: {e}")
     mcp.run(transport="stdio")
 
 
