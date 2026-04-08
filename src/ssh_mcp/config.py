@@ -11,10 +11,59 @@ import logging
 import os
 import tomllib
 from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
 
 from ssh_mcp.models import GroupConfig, ServerConfig, Settings
 
 logger = logging.getLogger(__name__)
+
+
+class ConfigError(ValueError):
+    """Raised when configuration loading or validation fails.
+
+    Subclass of ValueError for backward compatibility with existing callers
+    that catch ValueError, while allowing precise `except ConfigError` at
+    the MCP tool layer for actionable error messages.
+    """
+
+
+def _format_validation_error(section: str, context: str, exc: ValidationError) -> str:
+    """Flatten a Pydantic ValidationError into a single actionable message.
+
+    Pydantic lists each offending field with its error type and input value.
+    For ``extra_forbidden``, we surface both the offending field name AND
+    the list of valid keys for the section so operators can fix typos
+    without consulting the schema.
+
+    Args:
+        section: TOML section label (``settings``, ``groups``, ``servers``).
+        context: Optional entity name (e.g. server/group name) for scoping.
+        exc: The Pydantic ValidationError to flatten.
+    """
+    suffix = f" for '{context}'" if context else ""
+    messages: list[str] = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ())) or "<root>"
+        etype = err.get("type", "")
+        msg = err.get("msg", "")
+        if etype == "extra_forbidden":
+            messages.append(f"unknown key '{loc}'")
+        elif etype == "missing":
+            messages.append(f"missing required key '{loc}'")
+        else:
+            messages.append(f"'{loc}': {msg}")
+    joined = "; ".join(messages)
+    return f"Invalid [{section}]{suffix}: {joined}"
+
+
+def _valid_keys(model_cls: type) -> list[str]:
+    """Return sorted list of valid field names for a Pydantic dataclass."""
+    fields = getattr(model_cls, "__pydantic_fields__", None)
+    if fields is None:
+        return []
+    return sorted(fields.keys())
 
 
 class ServerRegistry:
@@ -122,7 +171,7 @@ class ServerRegistry:
 
         Raises:
             FileNotFoundError: If config file doesn't exist
-            ValueError: If TOML is malformed or validation fails
+            ConfigError: If TOML is malformed or Pydantic validation fails
         """
         if not self._config_path.exists():
             raise FileNotFoundError(
@@ -133,17 +182,25 @@ class ServerRegistry:
             with open(self._config_path, "rb") as f:
                 config_data = tomllib.load(f)
         except tomllib.TOMLDecodeError as e:
-            raise ValueError(f"Invalid TOML in {self._config_path}: {e}") from e
+            raise ConfigError(
+                f"Failed to parse {self._config_path}: {e}. "
+                f"Check TOML syntax near the reported position."
+            ) from e
 
         # Load settings
         if "settings" in config_data:
-            settings_dict = config_data["settings"]
-            # Expand ~ in ssh_config_path
+            settings_dict = dict(config_data["settings"])
+            # Expand ~ in ssh_config_path before validation
             if "ssh_config_path" in settings_dict:
                 settings_dict["ssh_config_path"] = os.path.expanduser(
                     settings_dict["ssh_config_path"]
                 )
-            self._settings = Settings(**settings_dict)
+            try:
+                self._settings = Settings(**settings_dict)
+            except ValidationError as e:
+                detail = _format_validation_error("settings", "", e)
+                valid = ", ".join(_valid_keys(Settings))
+                raise ConfigError(f"{detail}. Valid keys: {valid}") from e
 
         # Warn if known_hosts verification is disabled
         if not self._settings.known_hosts:
@@ -154,30 +211,36 @@ class ServerRegistry:
         # Load groups
         if "groups" in config_data:
             for group_name, group_data in config_data["groups"].items():
-                self._groups[group_name] = GroupConfig(
-                    name=group_name, description=group_data["description"]
-                )
+                try:
+                    self._groups[group_name] = GroupConfig(
+                        name=group_name,
+                        **dict(group_data),
+                    )
+                except ValidationError as e:
+                    detail = _format_validation_error("groups", group_name, e)
+                    valid = ", ".join(
+                        k for k in _valid_keys(GroupConfig) if k != "name"
+                    )
+                    raise ConfigError(f"{detail}. Valid keys: {valid}") from e
 
         # Load servers
         if "servers" in config_data:
             for server_name, server_data in config_data["servers"].items():
-                # Convert groups list to tuple
-                groups = tuple(server_data.get("groups", []))
-
-                # Build ServerConfig with optional overrides
-                server = ServerConfig(
-                    name=server_name,
-                    description=server_data["description"],
-                    groups=groups,
-                    hostname=server_data.get("hostname"),
-                    port=server_data.get("port"),
-                    user=server_data.get("user"),
-                    identity_file=server_data.get("identity_file"),
-                    jump_host=server_data.get("jump_host"),
-                    default_dir=server_data.get("default_dir"),
-                    timeout=server_data.get("timeout"),
-                )
-                self._servers[server_name] = server
+                # Convert groups list to tuple before Pydantic sees it
+                data: dict[str, Any] = dict(server_data)
+                if "groups" in data:
+                    data["groups"] = tuple(data["groups"])
+                try:
+                    self._servers[server_name] = ServerConfig(
+                        name=server_name,
+                        **data,
+                    )
+                except ValidationError as e:
+                    detail = _format_validation_error("servers", server_name, e)
+                    valid = ", ".join(
+                        k for k in _valid_keys(ServerConfig) if k != "name"
+                    )
+                    raise ConfigError(f"{detail}. Valid keys: {valid}") from e
 
         # Validate configuration
         self._validate()

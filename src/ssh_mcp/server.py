@@ -13,11 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import functools
 import logging
 import os
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any, TypeVar, cast
 
+import structlog
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -30,12 +34,70 @@ from ssh_mcp.formatting import (
 )
 from ssh_mcp.ssh import SSHManager
 
-# Configure logging to stderr (required for stdio transport)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    stream=sys.stderr,
-)
+
+def _configure_logging() -> None:
+    """Configure stderr logging with console or JSON output.
+
+    Routes stdlib ``logging`` calls (from all modules) through structlog so
+    any ``logger.info(...)`` call in ssh.py / config.py / server.py receives
+    consistent ISO timestamps and structured rendering without changes to
+    call sites.
+
+    Controlled by ``SSH_MCP_LOG_FORMAT``:
+      * unset / "console" (default): colorized human-readable output (dev)
+      * "json": single-line JSON, one object per event (production log
+        aggregators, structured search)
+
+    Called unconditionally at module import so tool calls are instrumented
+    even during lazy init. Idempotent — clears prior handlers before adding
+    its own so repeated imports (e.g. under pytest) do not duplicate output.
+    """
+    fmt = os.environ.get("SSH_MCP_LOG_FORMAT", "console").lower()
+
+    # Processors applied to BOTH structlog-native loggers and stdlib foreign
+    # loggers, so timestamps / levels / contextvars are consistent across
+    # every log line no matter which logger produced it.
+    shared_processors: list[Any] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+    ]
+
+    renderer: Any
+    if fmt == "json":
+        renderer = structlog.processors.JSONRenderer()
+    else:
+        renderer = structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty())
+
+    structlog.configure(
+        processors=[
+            *shared_processors,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
+    formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared_processors,
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            renderer,
+        ],
+    )
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    # Clear existing handlers so repeated configuration (e.g. under pytest
+    # reloads) does not duplicate log lines.
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+_configure_logging()
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +205,37 @@ def _get_ssh() -> SSHManager:
     return _ssh
 
 
+F = TypeVar("F", bound=Callable[..., Awaitable[str]])
+
+
+def _mcp_tool(func: F) -> F:
+    """Decorator: ensure server is initialized, log+raise ToolError on failure.
+
+    Collapses the duplicated try/except boilerplate from each MCP tool into a
+    single declarative wrapper. Preserves ToolError passthrough so structured
+    errors raised by inner code propagate unchanged. Any other exception is
+    logged with a traceback and re-raised as a ToolError so the MCP client
+    receives `isError=true` with a useful message.
+
+    Apply BELOW ``@mcp.tool()`` so FastMCP registers the wrapped function.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> str:
+        try:
+            await _init()
+            return await func(*args, **kwargs)
+        except ToolError:
+            raise
+        except Exception as e:
+            logger.error("%s failed: %s", func.__name__, e, exc_info=True)
+            raise ToolError(str(e)) from e
+
+    return cast(F, wrapper)
+
+
 @mcp.tool()
+@_mcp_tool
 async def list_servers(group: str | None = None) -> str:
     """List all configured SSH servers with their groups and descriptions.
 
@@ -154,63 +246,49 @@ async def list_servers(group: str | None = None) -> str:
     Returns:
         Formatted table of servers with name, groups, and description.
     """
-    try:
-        await _init()
-        registry = _get_registry()
+    registry = _get_registry()
 
-        if group is not None:
-            # Filter by group
-            try:
-                servers = registry.servers_in_group(group)
-                filter_label = f" in group '{group}'"
-                if not servers:
-                    return f"No servers found in group '{group}'"
-            except KeyError as e:
-                # Group not found - return error message instead of raising
-                return f"Error: {e}"
-        else:
-            # Show all servers
-            servers = registry.all_servers()
-            filter_label = ""
+    if group is not None:
+        # Filter by group
+        try:
+            servers = registry.servers_in_group(group)
+        except KeyError as e:
+            # Group not found - return error message instead of raising
+            return f"Error: {e}"
+        filter_label = f" in group '{group}'"
+        if not servers:
+            return f"No servers found in group '{group}'"
+    else:
+        # Show all servers
+        servers = registry.all_servers()
+        filter_label = ""
 
-        return format_server_table(servers, filter_label=filter_label)
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error listing servers: {e}")
-        raise ToolError(str(e))
+    return format_server_table(servers, filter_label=filter_label)
 
 
 @mcp.tool()
+@_mcp_tool
 async def list_groups() -> str:
     """List all server groups with descriptions and member counts.
 
     Returns:
         Formatted table of groups with name, description, and server count.
     """
-    try:
-        await _init()
-        registry = _get_registry()
+    registry = _get_registry()
 
-        groups = registry.all_groups()
+    groups = registry.all_groups()
 
-        # Count servers per group
-        server_counts = {}
-        for group in groups:
-            count = len(registry.servers_in_group(group.name))
-            server_counts[group.name] = count
+    # Count servers per group
+    server_counts = {}
+    for group in groups:
+        count = len(registry.servers_in_group(group.name))
+        server_counts[group.name] = count
 
-        return format_group_table(groups, server_counts)
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error listing groups: {e}")
-        raise ToolError(str(e))
+    return format_group_table(groups, server_counts)
 
 
 @mcp.tool()
+@_mcp_tool
 async def execute(
     server: str,
     command: str,
@@ -221,31 +299,29 @@ async def execute(
     """Execute a shell command on a single SSH server.
 
     Args:
-        server: Server name (e.g. 'pro-dicentra', 'inf-ai'). Must match a configured
-                server. Use list_servers to see available servers.
-        command: Shell command to execute on the remote server.
-        timeout: Command timeout in seconds. Default 30.
-        working_dir: Remote directory to execute from. Uses server default if omitted.
-        force: Bypass dangerous command detection. Use with extreme caution. Default false.
+        server: Server name (e.g. 'web-prod-01'). Must match a configured server.
+                Use list_servers to see available servers.
+        command: Shell command to execute on the remote server (exactly as it
+                would be typed at a bash prompt).
+        timeout: Command timeout in **seconds**. Default 30. Range 1–3600.
+        working_dir: Absolute remote directory to cd into before running the
+                command. Uses the server's ``default_dir`` from servers.toml
+                if omitted, or the SSH login directory if neither is set.
+        force: If True, bypass the dangerous-command detection regex. Use only
+                for audited bulk operations — the block list catches rm -rf /,
+                mkfs, dd-to-disk, chmod 777 /, and fork bombs. Default False.
 
     Returns:
         Formatted command execution result with stdout, stderr, and exit code.
+        Long output is truncated at ``max_output_bytes`` (default 50 KiB).
     """
-    try:
-        await _init()
-        ssh = _get_ssh()
-
-        result = await ssh.execute(server, command, timeout, working_dir, force)
-        return format_exec_result(result)
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error executing command on {server}: {e}")
-        raise ToolError(str(e))
+    ssh = _get_ssh()
+    result = await ssh.execute(server, command, timeout, working_dir, force)
+    return format_exec_result(result)
 
 
 @mcp.tool()
+@_mcp_tool
 async def execute_on_group(
     group: str,
     command: str,
@@ -254,37 +330,39 @@ async def execute_on_group(
     fail_fast: bool = False,
     force: bool = False,
 ) -> str:
-    """Execute a shell command on all servers in a group (parallel execution).
+    """Execute a shell command on all servers in a group in parallel.
+
+    Concurrency is capped by the ``max_parallel_hosts`` setting (default 10;
+    configure in ``[settings]`` of servers.toml, range 1–100).
 
     Args:
-        group: Group name (e.g. 'dicentra-prod', 'infra'). Use list_groups to see
+        group: Group name (e.g. 'production', 'web'). Use list_groups to see
                available groups.
-        command: Shell command to execute on all servers in the group.
-        timeout: Per-server command timeout in seconds. Default 30.
-        working_dir: Remote directory to execute from on each server.
-        fail_fast: If true, stop on first failure. Default false (run all).
-        force: Bypass dangerous command detection. Use with extreme caution. Default false.
+        command: Shell command to execute on every server in the group.
+        timeout: Per-server command timeout in **seconds**. Default 30.
+                Each server has its own timer; slow servers do NOT extend the
+                per-server limit for others.
+        working_dir: Absolute remote directory to cd into on each server.
+                Uses each server's ``default_dir`` if omitted.
+        fail_fast: If True, cancel remaining tasks as soon as any server
+                returns a non-zero exit code or errors. Default False —
+                run all servers to completion and report each result.
+        force: If True, bypass the dangerous-command detection regex. Use only
+                for audited bulk operations. Default False.
 
     Returns:
-        Formatted summary of results from all servers in the group.
+        Formatted summary showing per-server results, success/failure counts,
+        and aggregate exit status.
     """
-    try:
-        await _init()
-        ssh = _get_ssh()
-
-        results = await ssh.execute_on_group(
-            group, command, timeout, working_dir, fail_fast, force
-        )
-        return format_group_results(results, group)
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error executing command on group {group}: {e}")
-        raise ToolError(str(e))
+    ssh = _get_ssh()
+    results = await ssh.execute_on_group(
+        group, command, timeout, working_dir, fail_fast, force
+    )
+    return format_group_results(results, group)
 
 
 @mcp.tool()
+@_mcp_tool
 async def upload_file(
     server: str,
     local_path: str,
@@ -300,21 +378,12 @@ async def upload_file(
     Returns:
         Confirmation message with file size.
     """
-    try:
-        await _init()
-        ssh = _get_ssh()
-
-        result = await ssh.upload(server, local_path, remote_path)
-        return result
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error uploading file to {server}: {e}")
-        raise ToolError(str(e))
+    ssh = _get_ssh()
+    return await ssh.upload(server, local_path, remote_path)
 
 
 @mcp.tool()
+@_mcp_tool
 async def download_file(
     server: str,
     remote_path: str,
@@ -330,22 +399,23 @@ async def download_file(
     Returns:
         Confirmation message with file size.
     """
-    try:
-        await _init()
-        ssh = _get_ssh()
-
-        result = await ssh.download(server, remote_path, local_path)
-        return result
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error downloading file from {server}: {e}")
-        raise ToolError(str(e))
+    ssh = _get_ssh()
+    return await ssh.download(server, remote_path, local_path)
 
 
 def main() -> None:
     """Entry point for console script (uvx ssh-mcp)."""
+    from ssh_mcp import __version__
+
+    logger.info(
+        f"Starting ssh-mcp v{__version__} (stdio transport) - "
+        f"waiting for MCP client on stdin"
+    )
+    try:
+        config_path = _get_config_path()
+        logger.info(f"Config will be loaded from {config_path} on first tool call")
+    except FileNotFoundError as e:
+        logger.warning(f"No config file found yet: {e}")
     mcp.run(transport="stdio")
 
 

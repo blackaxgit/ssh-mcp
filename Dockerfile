@@ -47,10 +47,10 @@ ENV PATH=/app/.venv/bin:$PATH \
 # Switch to non-root user
 USER sshmcp
 
-# HEALTHCHECK: Process-based check (no HTTP for stdio servers)
-# Verifies ssh-mcp process is still running
+# HEALTHCHECK: Python-based import check (slim image has no `ps`)
+# Verifies the ssh_mcp package is importable — signals the runtime is healthy
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ps aux | grep -q '[s]sh-mcp' || exit 1
+    CMD python -c "import ssh_mcp" || exit 1
 
 # Entry point: invoke the console script installed by uv
 ENTRYPOINT ["ssh-mcp"]

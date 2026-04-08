@@ -6,8 +6,11 @@ initialization. All tests run without real SSH connections.
 
 from __future__ import annotations
 
+import asyncio
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from ssh_mcp.config import ServerRegistry
 from ssh_mcp.models import Settings
@@ -16,6 +19,7 @@ from ssh_mcp.ssh import (
     _DANGEROUS_PATTERNS,
     _SENSITIVE_PATHS,
     _is_dangerous_command,
+    _make_connection_id,
     _validate_local_path,
     _validate_remote_path,
 )
@@ -416,6 +420,39 @@ groups = ["test"]
         assert manager._running is False
         assert manager._eviction_task is None
 
+    async def test_group_execution_semaphore_uses_max_parallel_hosts(self) -> None:
+        """execute_on_group's concurrency semaphore reflects Settings.max_parallel_hosts.
+
+        Guards against regressing the hardcoded ``Semaphore(10)``. We inject a
+        custom ``max_parallel_hosts`` and assert the semaphore built inside
+        ``execute_on_group`` has the matching bound by patching
+        ``asyncio.Semaphore`` and capturing its first positional argument.
+        """
+        from unittest.mock import patch
+
+        settings = Settings(max_parallel_hosts=7)
+        registry = self._make_registry()
+        manager = SSHManager(registry, settings)
+
+        captured: list[int] = []
+        real_semaphore = asyncio.Semaphore
+
+        def capturing_semaphore(value: int) -> asyncio.Semaphore:
+            captured.append(value)
+            return real_semaphore(value)
+
+        with patch("ssh_mcp.ssh.asyncio.Semaphore", side_effect=capturing_semaphore):
+            # Group has 1 test-host, so only 1 execute will be attempted;
+            # the real execute will fail (no SSH), but by then the Semaphore
+            # is already constructed.
+            try:
+                await manager.execute_on_group("test", "true")
+            except Exception:
+                pass
+
+        assert captured, "Semaphore was never constructed in execute_on_group"
+        assert captured[0] == 7
+
 
 # ---------------------------------------------------------------------------
 # _validate_local_path
@@ -483,3 +520,277 @@ class TestDangerousCommandForceBypass:
 
         sig = inspect.signature(SSHManager.execute)
         assert "force" in sig.parameters
+
+
+# ---------------------------------------------------------------------------
+# connection_id generation + SFTP audit lifecycle (B2)
+# ---------------------------------------------------------------------------
+
+
+class TestConnectionIdGeneration:
+    """_make_connection_id produces grep-friendly unique identifiers."""
+
+    def test_connection_id_starts_with_server_name(self) -> None:
+        cid = _make_connection_id("web1")
+        assert cid.startswith("web1-")
+
+    def test_connection_id_contains_pid(self) -> None:
+        import os
+
+        cid = _make_connection_id("web1")
+        assert f"-{os.getpid()}-" in cid
+
+    def test_connection_ids_are_unique(self) -> None:
+        """Two calls must produce distinct ids even for the same server."""
+        ids = {_make_connection_id("web1") for _ in range(100)}
+        assert len(ids) == 100
+
+
+class TestSFTPAuditLogging:
+    """SFTP upload/download emit start/complete/failed audit logs."""
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[settings]
+command_timeout = 30
+
+[groups]
+test = { description = "Test group" }
+
+[servers.test-host]
+description = "Test server"
+groups = ["test"]
+"""
+        tmp = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        tmp.write(config_content)
+        tmp.flush()
+        tmp.close()
+        return ServerRegistry(tmp.name)
+
+    async def test_upload_emits_start_and_complete_audit_logs(
+        self,
+        tmp_path,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """upload() must emit sftp.upload.start AND sftp.upload.complete."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        local = tmp_path / "payload.txt"
+        local.write_bytes(b"hello sftp")
+
+        manager = SSHManager(self._make_registry(), sample_settings)
+        # Seed the pool so _get_connection returns our mock without touching
+        # real network or asyncssh.connect().
+        mock_sftp = MagicMock()
+        mock_sftp.put = AsyncMock(return_value=None)
+
+        sftp_ctx = MagicMock()
+        sftp_ctx.__aenter__ = AsyncMock(return_value=mock_sftp)
+        sftp_ctx.__aexit__ = AsyncMock(return_value=None)
+
+        mock_conn = MagicMock()
+        mock_conn.is_closed = MagicMock(return_value=False)
+        mock_conn.start_sftp_client = MagicMock(return_value=sftp_ctx)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            # Pre-seed the connection_id so audit log can reference it
+            manager._connection_ids["test-host"] = "test-host-1-abcd1234"
+
+            with caplog.at_level("INFO", logger="ssh_mcp.audit"):
+                await manager.upload("test-host", str(local), "/tmp/target.txt")
+
+        messages = [r.message for r in caplog.records]
+        assert any("sftp.upload.start" in m for m in messages), (
+            f"No start log in: {messages}"
+        )
+        assert any("sftp.upload.complete" in m for m in messages), (
+            f"No complete log in: {messages}"
+        )
+
+    async def test_upload_failure_emits_failed_audit_log(
+        self,
+        tmp_path,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """Upload failure must emit sftp.upload.failed with error type."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        local = tmp_path / "payload.txt"
+        local.write_bytes(b"data")
+
+        manager = SSHManager(self._make_registry(), sample_settings)
+
+        # start_sftp_client raises to simulate failure
+        mock_conn = MagicMock()
+        mock_conn.is_closed = MagicMock(return_value=False)
+        mock_conn.start_sftp_client = MagicMock(side_effect=OSError("no route"))
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            manager._connection_ids["test-host"] = "test-host-1-deadbeef"
+            with caplog.at_level("WARNING", logger="ssh_mcp.audit"):
+                with pytest.raises(RuntimeError, match="Upload failed"):
+                    await manager.upload("test-host", str(local), "/tmp/target.txt")
+
+        messages = [r.message for r in caplog.records]
+        assert any("sftp.upload.failed" in m for m in messages), (
+            f"No failed log in: {messages}"
+        )
+        # Error type should be included so operators can triage quickly
+        assert any("OSError" in m for m in messages)
+
+    async def test_download_emits_start_and_complete_audit_logs(
+        self,
+        tmp_path,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """download() must emit sftp.download.start AND sftp.download.complete."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        local = tmp_path / "downloaded.txt"
+        # Pre-create so Path(local_path).stat() works after mocked get()
+        local.write_bytes(b"some data")
+
+        manager = SSHManager(self._make_registry(), sample_settings)
+        mock_sftp = MagicMock()
+        mock_sftp.get = AsyncMock(return_value=None)
+
+        sftp_ctx = MagicMock()
+        sftp_ctx.__aenter__ = AsyncMock(return_value=mock_sftp)
+        sftp_ctx.__aexit__ = AsyncMock(return_value=None)
+
+        mock_conn = MagicMock()
+        mock_conn.is_closed = MagicMock(return_value=False)
+        mock_conn.start_sftp_client = MagicMock(return_value=sftp_ctx)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            manager._connection_ids["test-host"] = "test-host-1-cafef00d"
+            with caplog.at_level("INFO", logger="ssh_mcp.audit"):
+                await manager.download("test-host", "/tmp/source.txt", str(local))
+
+        messages = [r.message for r in caplog.records]
+        assert any("sftp.download.start" in m for m in messages)
+        assert any("sftp.download.complete" in m for m in messages)
+
+    def test_connection_ids_cleared_on_close_all(
+        self, sample_settings: Settings
+    ) -> None:
+        """close_all() must clear the connection_ids dict."""
+        manager = SSHManager(self._make_registry(), sample_settings)
+        manager._connection_ids["test-host"] = "test-host-1-abcd"
+
+        asyncio.run(manager.close_all())
+
+        assert manager._connection_ids == {}
+
+
+# ---------------------------------------------------------------------------
+# Property-based fuzz tests for _is_dangerous_command (B3)
+#
+# These tests use Hypothesis to explore the input space beyond the
+# hand-curated parametrize cases. They catch regressions where:
+#   * a regex change accidentally makes rm -rf / slip past the filter
+#   * a regex change starts rejecting benign commands that happen to
+#     contain "dd" or "chmod" substrings in non-destructive positions
+#   * control-character sanitization leaves exploitable gaps
+# ---------------------------------------------------------------------------
+
+
+class TestDangerousCommandProperties:
+    """Property-based tests using Hypothesis to fuzz ``_is_dangerous_command``."""
+
+    @given(
+        st.text(
+            alphabet=st.characters(min_codepoint=0, max_codepoint=255),
+            max_size=200,
+        )
+    )
+    def test_never_crashes_on_arbitrary_byte_input(self, payload: str) -> None:
+        """Property: the function returns bool for ANY input, never raises.
+
+        Guards against regex regressions (catastrophic backtracking,
+        encoding errors) that would crash the whole tool call instead of
+        returning a safe "not dangerous" verdict.
+        """
+        result = _is_dangerous_command(payload)
+        assert isinstance(result, bool)
+
+    @given(st.from_regex(r"rm\s+-rf\s+/.*", fullmatch=False))
+    def test_rm_rf_root_always_caught(self, payload: str) -> None:
+        """Property: any string containing ``rm -rf /`` is rejected."""
+        assert _is_dangerous_command(payload) is True
+
+    @given(st.from_regex(r"mkfs\.\w+", fullmatch=False))
+    def test_mkfs_always_caught(self, payload: str) -> None:
+        """Property: any string matching ``mkfs.<fstype>`` is rejected."""
+        assert _is_dangerous_command(payload) is True
+
+    @given(st.from_regex(r"dd\s+if=/dev/\w+", fullmatch=False))
+    def test_dd_with_device_input_always_caught(self, payload: str) -> None:
+        """Property: ``dd if=/dev/*`` patterns are rejected."""
+        assert _is_dangerous_command(payload) is True
+
+    @given(
+        st.text(
+            alphabet=st.characters(
+                whitelist_categories=("Lu", "Ll", "Nd"),
+                whitelist_characters=" -./_",
+            ),
+            min_size=1,
+            max_size=80,
+        ).filter(
+            lambda s: (
+                not any(
+                    token in s.lower()
+                    for token in (
+                        "rm -rf /",
+                        "rm  -rf  /",
+                        "mkfs",
+                        "dd if=",
+                        "/dev/sd",
+                        "chmod 777 /",
+                    )
+                )
+            )
+        )
+    )
+    def test_safe_looking_text_not_flagged(self, payload: str) -> None:
+        """Property: letters+digits+path-safe chars without dangerous tokens pass.
+
+        Narrower than "any text" to avoid false positives from generated
+        substrings accidentally matching a dangerous regex — the filter
+        excludes any payload containing a known dangerous substring.
+        """
+        assert _is_dangerous_command(payload) is False
+
+    @given(
+        st.sampled_from(
+            ["rm -rf /", "mkfs.ext4 /dev/sda", "dd if=/dev/zero of=/dev/sdb"]
+        ),
+        st.integers(min_value=1, max_value=10),
+    )
+    def test_control_char_injection_never_bypasses(self, cmd: str, n_ctrl: int) -> None:
+        """Property: injecting control chars into a known-bad command must NOT bypass.
+
+        Red Team R2 fix: null bytes and other ASCII control characters are
+        normalized to spaces before regex matching. This property verifies
+        the normalization across every dangerous token and every possible
+        control character insertion point.
+        """
+        # Insert control chars at a couple of positions in the command.
+        # Pick positions deterministically from n_ctrl so Hypothesis
+        # shrinking produces meaningful counterexamples on failure.
+        for i in range(n_ctrl):
+            pos = i % len(cmd)
+            cmd = cmd[:pos] + chr(i % 32) + cmd[pos:]
+        assert _is_dangerous_command(cmd) is True, f"bypass found: {cmd!r}"

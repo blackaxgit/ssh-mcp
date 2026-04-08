@@ -35,6 +35,31 @@ pip install ssh-mcp
 
 Requires Python 3.11+. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) to use `uvx`.
 
+#### Docker
+
+A prebuilt image is published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/blackaxgit/ssh-mcp:latest
+```
+
+Or run with Docker Compose:
+
+```yaml
+services:
+  ssh-mcp:
+    image: ghcr.io/blackaxgit/ssh-mcp:latest
+    stdin_open: true
+    restart: unless-stopped
+    environment:
+      SSH_MCP_CONFIG: /config/servers.toml
+    volumes:
+      - ./servers.toml:/config/servers.toml:ro
+      - ~/.ssh:/home/sshmcp/.ssh:ro
+```
+
+The image uses a non-root `sshmcp` user (uid 1000). Mount your SSH keys and config file read-only. See [compose.yaml](compose.yaml) in the repo for a working example.
+
 ### Create a config file
 
 ```bash
@@ -105,7 +130,17 @@ claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx ssh-mcp
 
 ## Configuration
 
-Config file location (checked in order):
+### Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SSH_MCP_CONFIG` | — | Absolute path to a TOML config file. Overrides the default search path. |
+| `SSH_MCP_LOG_FORMAT` | `console` | Log output format. Set to `json` to emit single-line JSON events (timestamp, level, event, contextvars) suitable for log aggregators like Loki, Datadog, or Splunk. Any other value falls back to the colorized console renderer. |
+| `HYPOTHESIS_PROFILE` | `dev` | For local development / CI only. Set to `ci` to run property-based tests with `max_examples=200` instead of `50`. |
+
+### Config file location
+
+Checked in order:
 
 1. `$SSH_MCP_CONFIG` environment variable
 2. `~/.config/ssh-mcp/servers.toml` (default)
@@ -116,10 +151,11 @@ Example `servers.toml`:
 ```toml
 [settings]
 ssh_config_path = "~/.ssh/config"
-command_timeout = 30
-max_output_bytes = 51200
-connection_idle_timeout = 300
-known_hosts = true
+command_timeout = 30          # seconds, range 1..3600
+max_output_bytes = 51200      # truncate captured output at this many bytes
+connection_idle_timeout = 300 # seconds; eviction scan runs every 60s
+known_hosts = true            # false removes MITM protection
+max_parallel_hosts = 10       # concurrency cap for execute_on_group (1..100)
 
 [groups]
 production = { description = "Production servers" }
@@ -154,16 +190,36 @@ chmod 600 ~/.config/ssh-mcp/servers.toml
 |------|-------------|
 | `list_servers` | List configured servers; optionally filter by group |
 | `list_groups` | List server groups with member counts |
-| `execute` | Run a shell command on a single server |
-| `execute_on_group` | Run a command on all servers in a group (parallel) |
-| `upload_file` | Upload a local file to a server via SFTP |
-| `download_file` | Download a file from a server via SFTP |
+| `execute` | Run a shell command on a single server (supports `force` to bypass dangerous-command detection) |
+| `execute_on_group` | Run a command on all servers in a group (parallel; supports `fail_fast` and `force`) |
+| `upload_file` | Upload a local file to a server via SFTP (validates both local and remote paths) |
+| `download_file` | Download a file from a server via SFTP (validates both local and remote paths) |
 
 ## Security
 
-ssh-mcp warns before running commands that match known destructive patterns (`rm -rf`, disk wipes, shutdown). These are informational warnings — the AI assistant can still proceed if the operator confirms. Hard blocking is not enforced by design; access control is the operator's responsibility via SSH permissions on the target host.
+**Dangerous command blocking.** ssh-mcp rejects commands that match known destructive patterns (`rm -rf /`, disk wipes, fork bombs, `mkfs`, `chmod 777 /`, etc.) unless the tool caller passes `force=true`. ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normalized to spaces before pattern matching so `rm\x00-rf /` is caught just like `rm -rf /`. The regex is fuzz-tested with Hypothesis on every CI run.
 
-Host key verification is on by default (`known_hosts = true`). Disabling `StrictHostKeyChecking` in `~/.ssh/config` weakens MITM protection and should be avoided in production.
+When `force=true` is used, the audit log records the bypass explicitly so the operator has a clean paper trail. Do not grant `force=true` to untrusted MCP clients.
+
+**Path validation.** SFTP `upload_file` and `download_file` validate **both** remote and local paths. Any of these block the transfer:
+
+- Sensitive Unix paths: `/etc/shadow`, `/etc/passwd`
+- SSH key material: `~/.ssh/authorized_keys`, `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, `~/.ssh/id_dsa`
+- Any path containing `..` (parent traversal)
+
+This prevents an LLM client from exfiltrating secrets on either the MCP host or a managed server.
+
+**Host key verification** is on by default (`known_hosts = true`). Disabling `StrictHostKeyChecking` in `~/.ssh/config` weakens MITM protection and should be avoided in production.
+
+**Audit logging.** Every tool call is logged to stderr with `server`, `command`, `exit_code`, `duration_ms`, and (for SFTP) byte counts. SFTP operations emit three-stage events: `sftp.upload.start` → `sftp.upload.complete` (or `sftp.upload.failed`), each tagged with a stable `connection_id` so a single transfer is grep-correlatable.
+
+For production log aggregation, set `SSH_MCP_LOG_FORMAT=json` to emit single-line JSON events:
+
+```json
+{"event": "sftp.upload.complete bytes=4096 duration_ms=183", "level": "info", "timestamp": "2026-04-08T16:00:11.761575Z", "server": "web-prod-01", "operation": "upload", "local_path": "/tmp/app.tar.gz", "remote_path": "/var/www/release.tar.gz", "connection_id": "web-prod-01-4242-a3f1c9d2"}
+```
+
+When running in Docker, capture stderr with `docker logs` for the audit trail.
 
 For vulnerability reports, see [SECURITY.md](SECURITY.md). Do not open public GitHub issues for security concerns.
 

@@ -21,8 +21,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "mcp[cli]>=1.2.0,<2.0.0",
+    "mcp[cli]>=1.27.0,<2.0.0",
     "asyncssh>=2.14.0,<3.0.0",
+    "structlog>=25.5.0,<26.0.0",
+    "orjson>=3.10.0,<4.0.0",
+    "pydantic>=2.10.0,<3.0.0",
 ]
 
 [project.scripts]
@@ -40,6 +43,7 @@ dev = [
     "pytest-cov>=6.0",
     "mypy>=1.15",
     "pip-audit>=2.9",
+    "hypothesis>=6.151.0,<7.0.0",
 ]
 
 [build-system]

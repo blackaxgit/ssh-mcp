@@ -1,15 +1,32 @@
 """Data models for SSH MCP server.
 
-This module defines immutable configuration and result models using dataclasses.
-All configuration models are frozen to ensure immutability.
+This module defines immutable configuration models using Pydantic v2
+dataclasses with ``extra='forbid'`` strict key validation, plus a mutable
+``ExecResult`` stdlib dataclass used to shuttle execution output.
+
+Pydantic validates at construction time, so:
+  * Unknown TOML keys raise a ``ValidationError`` that names the offender
+    and lists valid fields — the config loader converts this into a
+    ``ConfigError`` with section / host context.
+  * Numeric ranges (``command_timeout``, ``max_output_bytes``,
+    ``connection_idle_timeout``, ``max_parallel_hosts``) are enforced by
+    ``Field(ge=..., le=...)`` — no manual ``__post_init__`` guards needed.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass as stdlib_dataclass
+
+from pydantic import ConfigDict, Field
+from pydantic.dataclasses import dataclass as pyd_dataclass
+
+# Strict config: unknown keys rejected, frozen instances cannot be mutated.
+# ``validate_assignment=True`` is omitted because the classes are frozen —
+# assignment is already blocked at the dataclass level.
+_STRICT: ConfigDict = ConfigDict(extra="forbid")
 
 
-@dataclass(frozen=True)
+@pyd_dataclass(frozen=True, config=_STRICT)
 class Settings:
     """Global settings for SSH operations.
 
@@ -19,16 +36,20 @@ class Settings:
         max_output_bytes: Maximum bytes to capture from command output
         connection_idle_timeout: Seconds before idle connection is closed
         known_hosts: Whether to enforce strict known_hosts checking
+        max_parallel_hosts: Maximum concurrent SSH connections during
+            group execution. Bounded to 1..100 to prevent accidentally
+            exhausting file descriptors or triggering fleet-wide load spikes.
     """
 
     ssh_config_path: str = "~/.ssh/config"
-    command_timeout: int = 30
-    max_output_bytes: int = 51200
-    connection_idle_timeout: int = 300
+    command_timeout: int = Field(default=30, ge=1, le=3600)
+    max_output_bytes: int = Field(default=51200, ge=1024)
+    connection_idle_timeout: int = Field(default=300, ge=10)
     known_hosts: bool = True
+    max_parallel_hosts: int = Field(default=10, ge=1, le=100)
 
 
-@dataclass(frozen=True)
+@pyd_dataclass(frozen=True, config=_STRICT)
 class GroupConfig:
     """Configuration for a logical server group.
 
@@ -43,7 +64,7 @@ class GroupConfig:
     description: str
 
 
-@dataclass(frozen=True)
+@pyd_dataclass(frozen=True, config=_STRICT)
 class ServerConfig:
     """Configuration for a managed SSH server.
 
@@ -67,19 +88,22 @@ class ServerConfig:
     description: str
     groups: tuple[str, ...] = ()
     hostname: str | None = None
-    port: int | None = None
+    port: int | None = Field(default=None, ge=1, le=65535)
     user: str | None = None
     identity_file: str | None = None
     jump_host: str | None = None
     default_dir: str | None = None
-    timeout: int | None = None
+    timeout: int | None = Field(default=None, ge=1, le=3600)
 
 
-@dataclass
+@stdlib_dataclass
 class ExecResult:
     """Result from executing a command on a remote server.
 
-    Mutable to allow construction during execution.
+    Mutable to allow construction during execution. This remains a stdlib
+    dataclass because it is never loaded from user input — it is always
+    constructed from trusted ``asyncssh`` output — and Pydantic validation
+    would add runtime cost for every command execution.
 
     Attributes:
         server: Server name where command was executed

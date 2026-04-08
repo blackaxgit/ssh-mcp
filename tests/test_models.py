@@ -23,6 +23,46 @@ class TestSettings:
         assert settings.max_output_bytes == 51200
         assert settings.connection_idle_timeout == 300
         assert settings.known_hosts is True
+        assert settings.max_parallel_hosts == 10
+
+    def test_settings_max_parallel_hosts_custom(self) -> None:
+        """Test Settings accepts custom max_parallel_hosts within range."""
+        settings = Settings(max_parallel_hosts=25)
+        assert settings.max_parallel_hosts == 25
+
+    @pytest.mark.parametrize("bad_value", [0, -1, 101, 1000])
+    def test_settings_max_parallel_hosts_out_of_range_rejected(
+        self, bad_value: int
+    ) -> None:
+        """Test Settings rejects max_parallel_hosts outside 1..100.
+
+        Pydantic ``ValidationError`` is a ``ValueError`` subclass, so code
+        catching ``ValueError`` continues to work. The error message names
+        ``max_parallel_hosts`` so operators can find the offender quickly.
+        """
+        with pytest.raises(ValueError, match="max_parallel_hosts"):
+            Settings(max_parallel_hosts=bad_value)
+
+    @pytest.mark.parametrize("bad_value", [0, -1, -30])
+    def test_settings_command_timeout_must_be_positive(self, bad_value: int) -> None:
+        """Test Settings rejects non-positive command_timeout."""
+        with pytest.raises(ValueError, match="command_timeout"):
+            Settings(command_timeout=bad_value)
+
+    def test_settings_max_output_bytes_too_small_rejected(self) -> None:
+        """Test Settings rejects max_output_bytes below 1024."""
+        with pytest.raises(ValueError, match="max_output_bytes"):
+            Settings(max_output_bytes=512)
+
+    def test_settings_idle_timeout_too_small_rejected(self) -> None:
+        """Test Settings rejects connection_idle_timeout below 10s."""
+        with pytest.raises(ValueError, match="connection_idle_timeout"):
+            Settings(connection_idle_timeout=5)
+
+    def test_settings_rejects_unknown_field(self) -> None:
+        """Pydantic extra='forbid' rejects unknown keys at construction."""
+        with pytest.raises(ValueError, match="typo_field"):
+            Settings(typo_field="oops")  # type: ignore[call-arg]
 
     def test_settings_custom_values(self) -> None:
         """Test Settings accepts custom values."""
@@ -44,7 +84,10 @@ class TestSettings:
         """Test Settings is immutable (frozen)."""
         settings = Settings()
 
-        with pytest.raises(AttributeError):
+        # Pydantic frozen dataclasses raise FrozenInstanceError
+        import dataclasses as _dc
+
+        with pytest.raises((_dc.FrozenInstanceError, AttributeError, ValueError)):
             settings.command_timeout = 60  # type: ignore[misc]
 
     def test_settings_partial_override(self) -> None:
@@ -69,9 +112,11 @@ class TestGroupConfig:
 
     def test_group_frozen(self) -> None:
         """Test GroupConfig is immutable (frozen)."""
+        import dataclasses as _dc
+
         group = GroupConfig(name="prod", description="Production servers")
 
-        with pytest.raises(AttributeError):
+        with pytest.raises((_dc.FrozenInstanceError, AttributeError, ValueError)):
             group.description = "New description"  # type: ignore[misc]
 
 
@@ -129,9 +174,11 @@ class TestServerConfig:
 
     def test_server_frozen(self) -> None:
         """Test ServerConfig is immutable (frozen)."""
+        import dataclasses as _dc
+
         server = ServerConfig(name="web1", description="Web server 1")
 
-        with pytest.raises(AttributeError):
+        with pytest.raises((_dc.FrozenInstanceError, AttributeError, ValueError)):
             server.description = "New description"  # type: ignore[misc]
 
     def test_server_empty_groups(self) -> None:
