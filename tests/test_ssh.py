@@ -144,6 +144,38 @@ class TestIsDangerousCommand:
         """Dangerous command after a semicolon is still detected."""
         assert _is_dangerous_command("ls -la; rm -rf /") is True
 
+    # --- Null-byte and control-character injection bypass attempts ---
+
+    def test_null_byte_between_rm_and_flag_is_still_dangerous(self) -> None:
+        """Null byte injected between 'rm' and '-rf' must not bypass detection."""
+        # Without sanitization "rm\x00-rf /" would not match r"rm\s+-rf\s+/"
+        # because \x00 is not \s. Sanitization strips it before matching.
+        assert _is_dangerous_command("rm\x00-rf /") is True
+
+    def test_null_byte_before_mkfs_device_is_still_dangerous(self) -> None:
+        """Null byte between mkfs and device path must not bypass detection."""
+        assert _is_dangerous_command("mkfs\x00/dev/sda") is True
+
+    def test_embedded_newline_in_rm_rf_is_still_dangerous(self) -> None:
+        """Embedded newline splitting 'rm -rf /' must not bypass detection."""
+        assert _is_dangerous_command("rm -rf\n/") is True
+
+    def test_carriage_return_in_rm_rf_is_still_dangerous(self) -> None:
+        """Carriage return splitting token must not bypass detection."""
+        assert _is_dangerous_command("rm\r-rf /") is True
+
+    def test_multiple_control_chars_do_not_bypass_detection(self) -> None:
+        """Multiple interspersed control chars must not bypass detection."""
+        assert _is_dangerous_command("rm\x01\x02-rf\x03 /") is True
+
+    def test_null_byte_only_command_is_safe(self) -> None:
+        """A command consisting only of null bytes produces an empty string — safe."""
+        assert _is_dangerous_command("\x00\x00\x00") is False
+
+    def test_control_chars_around_safe_command_remain_safe(self) -> None:
+        """Control chars around a safe command do not make it dangerous."""
+        assert _is_dangerous_command("\x01ls\x02 -la\x03") is False
+
 
 # ---------------------------------------------------------------------------
 # _DANGEROUS_PATTERNS coverage: each pattern tested individually

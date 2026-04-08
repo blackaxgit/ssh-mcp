@@ -45,7 +45,9 @@ mcp = FastMCP("ssh-mcp")
 # Lazy-initialized globals
 _registry: ServerRegistry | None = None
 _ssh: SSHManager | None = None
-_init_lock: asyncio.Lock | None = None
+# Lock is created at import time (not lazily) to eliminate the race window
+# between `if _init_lock is None` and `_init_lock = asyncio.Lock()`.
+_init_lock: asyncio.Lock = asyncio.Lock()
 
 
 def _get_config_path() -> str:
@@ -107,13 +109,10 @@ async def _init() -> None:
     Uses SSH_MCP_CONFIG environment variable if set, otherwise falls back to
     XDG standard path (~/.config/ssh-mcp/servers.toml) or development path.
     """
-    global _registry, _ssh, _init_lock
+    global _registry, _ssh
 
     if _registry is not None:
         return  # Fast path — already initialized
-
-    if _init_lock is None:
-        _init_lock = asyncio.Lock()
 
     async with _init_lock:
         if _registry is not None:

@@ -29,7 +29,9 @@ def reset_server_globals(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset server module globals before each test."""
     monkeypatch.setattr(server_module, "_registry", None)
     monkeypatch.setattr(server_module, "_ssh", None)
-    monkeypatch.setattr(server_module, "_init_lock", None)
+    # _init_lock is now a module-level Lock (never None); replace with a fresh
+    # one so each test starts with an uncontended lock.
+    monkeypatch.setattr(server_module, "_init_lock", asyncio.Lock())
 
 
 @pytest.fixture
@@ -169,19 +171,24 @@ class TestInit:
         assert server_module._registry is first_registry
         assert server_module._ssh is first_ssh
 
-    async def test_concurrent_calls_no_duplicates(
+    async def test_concurrent_calls_initialize_exactly_once(
         self, monkeypatch: pytest.MonkeyPatch, tmp_config_file: Path
     ) -> None:
-        """Test concurrent _init calls only initialize once (lock works)."""
+        """Test concurrent _init calls only initialize registry once (lock works)."""
         monkeypatch.setenv("SSH_MCP_CONFIG", str(tmp_config_file))
 
-        # Run multiple concurrent _init calls
-        await asyncio.gather(
-            server_module._init(),
-            server_module._init(),
-            server_module._init(),
-        )
+        with patch(
+            "ssh_mcp.server.ServerRegistry", wraps=ServerRegistry
+        ) as mock_registry_cls:
+            await asyncio.gather(
+                server_module._init(),
+                server_module._init(),
+                server_module._init(),
+            )
 
+        # ServerRegistry.__init__ must be called exactly once regardless of
+        # how many concurrent callers raced to _init().
+        assert mock_registry_cls.call_count == 1
         assert server_module._registry is not None
         assert server_module._ssh is not None
 
