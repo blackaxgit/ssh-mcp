@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import functools
 import logging
 import os
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any, TypeVar, cast
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -143,7 +146,37 @@ def _get_ssh() -> SSHManager:
     return _ssh
 
 
+F = TypeVar("F", bound=Callable[..., Awaitable[str]])
+
+
+def _mcp_tool(func: F) -> F:
+    """Decorator: ensure server is initialized, log+raise ToolError on failure.
+
+    Collapses the duplicated try/except boilerplate from each MCP tool into a
+    single declarative wrapper. Preserves ToolError passthrough so structured
+    errors raised by inner code propagate unchanged. Any other exception is
+    logged with a traceback and re-raised as a ToolError so the MCP client
+    receives `isError=true` with a useful message.
+
+    Apply BELOW ``@mcp.tool()`` so FastMCP registers the wrapped function.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> str:
+        try:
+            await _init()
+            return await func(*args, **kwargs)
+        except ToolError:
+            raise
+        except Exception as e:
+            logger.error("%s failed: %s", func.__name__, e, exc_info=True)
+            raise ToolError(str(e)) from e
+
+    return cast(F, wrapper)
+
+
 @mcp.tool()
+@_mcp_tool
 async def list_servers(group: str | None = None) -> str:
     """List all configured SSH servers with their groups and descriptions.
 
@@ -154,63 +187,49 @@ async def list_servers(group: str | None = None) -> str:
     Returns:
         Formatted table of servers with name, groups, and description.
     """
-    try:
-        await _init()
-        registry = _get_registry()
+    registry = _get_registry()
 
-        if group is not None:
-            # Filter by group
-            try:
-                servers = registry.servers_in_group(group)
-                filter_label = f" in group '{group}'"
-                if not servers:
-                    return f"No servers found in group '{group}'"
-            except KeyError as e:
-                # Group not found - return error message instead of raising
-                return f"Error: {e}"
-        else:
-            # Show all servers
-            servers = registry.all_servers()
-            filter_label = ""
+    if group is not None:
+        # Filter by group
+        try:
+            servers = registry.servers_in_group(group)
+        except KeyError as e:
+            # Group not found - return error message instead of raising
+            return f"Error: {e}"
+        filter_label = f" in group '{group}'"
+        if not servers:
+            return f"No servers found in group '{group}'"
+    else:
+        # Show all servers
+        servers = registry.all_servers()
+        filter_label = ""
 
-        return format_server_table(servers, filter_label=filter_label)
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error listing servers: {e}")
-        raise ToolError(str(e))
+    return format_server_table(servers, filter_label=filter_label)
 
 
 @mcp.tool()
+@_mcp_tool
 async def list_groups() -> str:
     """List all server groups with descriptions and member counts.
 
     Returns:
         Formatted table of groups with name, description, and server count.
     """
-    try:
-        await _init()
-        registry = _get_registry()
+    registry = _get_registry()
 
-        groups = registry.all_groups()
+    groups = registry.all_groups()
 
-        # Count servers per group
-        server_counts = {}
-        for group in groups:
-            count = len(registry.servers_in_group(group.name))
-            server_counts[group.name] = count
+    # Count servers per group
+    server_counts = {}
+    for group in groups:
+        count = len(registry.servers_in_group(group.name))
+        server_counts[group.name] = count
 
-        return format_group_table(groups, server_counts)
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error listing groups: {e}")
-        raise ToolError(str(e))
+    return format_group_table(groups, server_counts)
 
 
 @mcp.tool()
+@_mcp_tool
 async def execute(
     server: str,
     command: str,
@@ -231,21 +250,13 @@ async def execute(
     Returns:
         Formatted command execution result with stdout, stderr, and exit code.
     """
-    try:
-        await _init()
-        ssh = _get_ssh()
-
-        result = await ssh.execute(server, command, timeout, working_dir, force)
-        return format_exec_result(result)
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error executing command on {server}: {e}")
-        raise ToolError(str(e))
+    ssh = _get_ssh()
+    result = await ssh.execute(server, command, timeout, working_dir, force)
+    return format_exec_result(result)
 
 
 @mcp.tool()
+@_mcp_tool
 async def execute_on_group(
     group: str,
     command: str,
@@ -268,23 +279,15 @@ async def execute_on_group(
     Returns:
         Formatted summary of results from all servers in the group.
     """
-    try:
-        await _init()
-        ssh = _get_ssh()
-
-        results = await ssh.execute_on_group(
-            group, command, timeout, working_dir, fail_fast, force
-        )
-        return format_group_results(results, group)
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error executing command on group {group}: {e}")
-        raise ToolError(str(e))
+    ssh = _get_ssh()
+    results = await ssh.execute_on_group(
+        group, command, timeout, working_dir, fail_fast, force
+    )
+    return format_group_results(results, group)
 
 
 @mcp.tool()
+@_mcp_tool
 async def upload_file(
     server: str,
     local_path: str,
@@ -300,21 +303,12 @@ async def upload_file(
     Returns:
         Confirmation message with file size.
     """
-    try:
-        await _init()
-        ssh = _get_ssh()
-
-        result = await ssh.upload(server, local_path, remote_path)
-        return result
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error uploading file to {server}: {e}")
-        raise ToolError(str(e))
+    ssh = _get_ssh()
+    return await ssh.upload(server, local_path, remote_path)
 
 
 @mcp.tool()
+@_mcp_tool
 async def download_file(
     server: str,
     remote_path: str,
@@ -330,18 +324,8 @@ async def download_file(
     Returns:
         Confirmation message with file size.
     """
-    try:
-        await _init()
-        ssh = _get_ssh()
-
-        result = await ssh.download(server, remote_path, local_path)
-        return result
-
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.error(f"Error downloading file from {server}: {e}")
-        raise ToolError(str(e))
+    ssh = _get_ssh()
+    return await ssh.download(server, remote_path, local_path)
 
 
 def main() -> None:
