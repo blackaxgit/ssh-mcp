@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-08
+
+### Added
+
+- **Pydantic v2 config validation.** `Settings`, `GroupConfig`, and `ServerConfig` are now `pydantic.dataclasses` with `extra='forbid'`. Unknown TOML keys, out-of-range numeric values, and missing required fields all raise a `ConfigError` (ValueError subclass) naming the offending field, its section/host context, and the list of valid keys.
+- **SFTP audit lifecycle logs.** `upload_file` and `download_file` now emit three structured events per transfer: `sftp.{upload,download}.start` → `sftp.{upload,download}.complete` (or `.failed`), each tagged with a stable `connection_id` contextvar so a single transfer is grep-correlatable. Failure events include the exception type and elapsed `duration_ms`.
+- **`connection_id` contextvar.** Every pooled SSH connection is assigned a stable `{server}-{pid}-{hex}` identifier at first connect and reused until eviction. Bound via structlog contextvars for all operations on that connection.
+- **Hypothesis property tests.** `_is_dangerous_command` is fuzz-tested on every CI run with 6 new properties: never-crashes-on-arbitrary-input, rm-rf-always-caught, mkfs-always-caught, dd-always-caught, safe-text-not-flagged, control-char-injection-never-bypasses. `HYPOTHESIS_PROFILE=ci` runs 200 examples per property.
+- Hypothesis `>=6.151,<7.0` as a dev dependency.
+- Pydantic `>=2.10,<3.0` as a runtime dependency.
+- `_EVICTION_LOOP_INTERVAL_S` and `_MAX_JUMP_HOST_DEPTH` module-level constants for discoverability and testability.
+
+### Changed
+
+- `mcp[cli]` lower bound bumped from `>=1.2.0` to `>=1.27.0` — aligns with the April 2026 MCP Dev Summit release that introduced OAuth resource validation (RFC 8707), StreamableHTTP idle timeouts, and the TasksCallCapability backport.
+- `Settings` field validation is now enforced by Pydantic `Field(ge=..., le=...)` instead of a manual `__post_init__` guard. Error messages still name the offending field.
+- README security section expanded with explicit documentation of: the `force=true` audit trail, the full list of blocked sensitive paths, Hypothesis fuzzing coverage, and a JSON log example including `connection_id`.
+- `servers.example.toml` settings fields now have inline comments explaining units, ranges, and tuning guidance for every field.
+- `execute` and `execute_on_group` docstrings explicitly call out that `timeout` is in **seconds** and document the 1..3600 / 1..100 ranges.
+
 ## [0.1.1] - 2026-04-08
 
 ### Added
@@ -73,6 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/blackaxgit/ssh-mcp/releases/tag/v0.1.0
