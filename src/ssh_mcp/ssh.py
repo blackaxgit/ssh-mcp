@@ -47,14 +47,22 @@ _SENSITIVE_PATHS = [
 def _is_dangerous_command(command: str) -> bool:
     """Check if command matches any dangerous patterns.
 
+    Strips null bytes and ASCII control characters before matching so that
+    homoglyph / null-byte injection cannot bypass the regex patterns.
+
     Args:
         command: Command string to check
 
     Returns:
         True if command matches a dangerous pattern
     """
+    # Replace null bytes and ASCII control characters (0x00–0x1F, 0x7F) with a
+    # space before matching.  Deletion would collapse adjacent tokens (e.g.
+    # "rm\x00-rf" → "rm-rf") and miss the pattern; replacement preserves
+    # token boundaries while removing the bypass character.
+    sanitized = re.sub(r"[\x00-\x1f\x7f]", " ", command)
     for pattern in _DANGEROUS_PATTERNS:
-        if pattern.search(command):
+        if pattern.search(sanitized):
             return True
     return False
 
