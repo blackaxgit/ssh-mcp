@@ -12,7 +12,7 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=0
 
-WORKDIR /build
+WORKDIR /app
 
 # Install runtime dependencies only (no dev deps)
 # Use cache mounts for uv's package cache to speed up builds
@@ -36,7 +36,7 @@ RUN useradd --uid 1000 --create-home --shell /sbin/nologin sshmcp
 WORKDIR /app
 
 # Copy virtual environment from builder with proper ownership
-COPY --from=builder --chown=sshmcp:sshmcp /build/.venv /app/.venv
+COPY --from=builder --chown=sshmcp:sshmcp /app/.venv /app/.venv
 
 # Add venv to PATH
 ENV PATH=/app/.venv/bin:$PATH \
