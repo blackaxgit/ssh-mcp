@@ -25,6 +25,26 @@ from ssh_mcp.models import ExecResult, ServerConfig, Settings
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Tunable constants — promoted from inline literals for discoverability.
+#
+# These are deliberately NOT promoted to Settings fields: they are
+# implementation details that operators should not need to tune. Lifting
+# them to module-level makes them greppable and testable without widening
+# the public config surface.
+# ---------------------------------------------------------------------------
+
+# Eviction loop wakes this often to scan for idle connections. Smaller =
+# tighter idle enforcement, more wake-ups; larger = looser enforcement,
+# fewer wake-ups. 60s matches a typical SSH keepalive cadence.
+_EVICTION_LOOP_INTERVAL_S: int = 60
+
+# Maximum recursion depth for chained jump hosts. Prevents infinite loops
+# from mis-configured circular ProxyJump chains (the config loader also
+# detects this at load time — this is a belt-and-suspenders guard at
+# runtime in case the registry is mutated between loads).
+_MAX_JUMP_HOST_DEPTH: int = 5
+
 
 def _make_connection_id(server_name: str) -> str:
     """Return a short, grep-friendly connection identifier.
@@ -632,9 +652,11 @@ class SSHManager:
             Various SSH exceptions on connection failure
         """
         # Check recursion depth
-        if _depth > 5:
+        if _depth > _MAX_JUMP_HOST_DEPTH:
             raise RuntimeError(
-                f"Maximum jump host depth exceeded (depth={_depth}, server={server_name})"
+                f"Maximum jump host depth exceeded "
+                f"(depth={_depth}, limit={_MAX_JUMP_HOST_DEPTH}, "
+                f"server={server_name})"
             )
 
         # Ensure eviction loop is started
@@ -747,14 +769,14 @@ class SSHManager:
     async def _eviction_loop(self) -> None:
         """Background task that evicts idle connections.
 
-        Runs every 60 seconds and closes connections idle longer than
-        settings.connection_idle_timeout.
+        Runs every ``_EVICTION_LOOP_INTERVAL_S`` seconds and closes
+        connections idle longer than ``settings.connection_idle_timeout``.
         """
         logger.info("Started connection eviction loop")
 
         try:
             while self._running:
-                await asyncio.sleep(60)
+                await asyncio.sleep(_EVICTION_LOOP_INTERVAL_S)
 
                 if not self._running:
                     break
