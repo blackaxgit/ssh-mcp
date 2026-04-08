@@ -45,6 +45,9 @@ id_dsa.*
 docs/research-prep/
 docs/internal/
 
+# Hypothesis database
+.hypothesis/
+
 # Logs
 logs/
 
