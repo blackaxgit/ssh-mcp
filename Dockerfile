@@ -14,17 +14,19 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
-# Install runtime dependencies only (no dev deps)
+# Install runtime dependencies only (no dev deps, no editable install)
+# --no-editable ensures the package is copied into site-packages, not linked via .pth
 # Use cache mounts for uv's package cache to speed up builds
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     --mount=type=bind,source=uv.lock,target=uv.lock \
-    uv sync --no-install-project --no-dev --locked
+    uv sync --no-install-project --no-dev --no-editable --locked
 
-# Copy source code and complete the installation
+# Copy source code and install the project into the venv (non-editable)
+# Non-editable install is required because only .venv is copied to runtime stage
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --no-dev --locked
+    uv sync --no-dev --no-editable --locked
 
 # Stage 2: Runtime - minimal production image
 
