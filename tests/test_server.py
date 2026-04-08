@@ -280,7 +280,7 @@ class TestExecute:
         )
 
         mock_init.execute.assert_awaited_once_with(
-            "test-web1", "uptime", 15, "/tmp", True
+            "test-web1", "uptime", 15, "/tmp", True, False
         )
         assert "uptime" in result or "up 10 days" in result
 
@@ -347,7 +347,7 @@ class TestExecuteOnGroup:
         )
 
         mock_init.execute_on_group.assert_awaited_once_with(
-            "test-prod", "uptime", 20, "/var", True, True
+            "test-prod", "uptime", 20, "/var", True, True, False
         )
 
     async def test_exception_raises_tool_error(self, mock_init: MagicMock) -> None:

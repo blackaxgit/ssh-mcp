@@ -523,6 +523,140 @@ class TestDangerousCommandForceBypass:
 
 
 # ---------------------------------------------------------------------------
+# dry_run parameter (C3)
+# ---------------------------------------------------------------------------
+
+
+class TestDryRun:
+    """Tests for dry_run=True preview behavior."""
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[settings]
+command_timeout = 30
+
+[groups]
+test = { description = "Test group" }
+
+[servers.test-host]
+description = "Test server"
+groups = ["test"]
+default_dir = "/srv/app"
+"""
+        tmp = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        tmp.write(config_content)
+        tmp.flush()
+        tmp.close()
+        return ServerRegistry(tmp.name)
+
+    async def test_dry_run_does_not_call_get_connection(self) -> None:
+        """dry_run=True must skip connection setup entirely."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute("test-host", "uptime", dry_run=True)
+
+        assert result.exit_code == 0
+        assert result.error is None
+        assert "[DRY RUN]" in result.stdout
+        assert "uptime" in result.stdout
+        assert "test-host" in result.stdout
+
+    async def test_dry_run_includes_default_dir_from_config(self) -> None:
+        """The preview must show the server's default_dir when no override."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute("test-host", "uptime", dry_run=True)
+
+        assert "/srv/app" in result.stdout
+
+    async def test_dry_run_working_dir_override_wins(self) -> None:
+        """An explicit working_dir override must appear in the preview."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute(
+                "test-host",
+                "ls",
+                working_dir="/custom/path",
+                dry_run=True,
+            )
+
+        assert "/custom/path" in result.stdout
+        assert "/srv/app" not in result.stdout
+
+    async def test_dry_run_still_blocks_dangerous_commands(self) -> None:
+        """Dangerous commands must be rejected even in dry_run mode.
+
+        This is the whole point of dry_run: preview what would happen,
+        including rejection. Skipping the dangerous-command check would
+        defeat the use case of previewing a plan before committing.
+        """
+        manager = SSHManager(self._make_registry(), Settings())
+        result = await manager.execute("test-host", "rm -rf /", dry_run=True)
+
+        assert result.error is not None
+        assert "Blocked" in result.error
+        assert "[DRY RUN]" not in result.stdout
+
+    async def test_dry_run_with_force_bypasses_dangerous_check(self) -> None:
+        """dry_run + force should preview a dangerous command without blocking."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute(
+                "test-host",
+                "rm -rf /",
+                force=True,
+                dry_run=True,
+            )
+
+        assert result.error is None
+        assert "[DRY RUN]" in result.stdout
+        assert "rm -rf /" in result.stdout
+
+    async def test_dry_run_group_produces_result_per_server(self) -> None:
+        """execute_on_group dry_run must produce a preview for every server."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            results = await manager.execute_on_group("test", "uptime", dry_run=True)
+
+        assert len(results) == 1  # test group has 1 server
+        assert all(r.exit_code == 0 for r in results)
+        assert all("[DRY RUN]" in r.stdout for r in results)
+
+
+# ---------------------------------------------------------------------------
 # connection_id generation + SFTP audit lifecycle (B2)
 # ---------------------------------------------------------------------------
 

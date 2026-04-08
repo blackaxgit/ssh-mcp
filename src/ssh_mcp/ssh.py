@@ -200,15 +200,16 @@ class SSHManager:
         timeout: int = 30,
         working_dir: str | None = None,
         force: bool = False,
+        dry_run: bool = False,
     ) -> ExecResult:
         """Execute command on a remote server.
 
         Thin tracing wrapper around ``_execute_impl``. When OTel is
         available it opens a ``ssh.execute`` span with ``ssh.host``,
         ``ssh.command_length`` (NOT the raw command — avoids leaking
-        secrets into traces), and ``ssh.force`` attributes at entry, and
-        populates ``ssh.exit_code`` / ``ssh.duration_ms`` / ``ssh.error``
-        from the final ExecResult before returning.
+        secrets into traces), ``ssh.force``, and ``ssh.dry_run`` attributes
+        at entry, and populates ``ssh.exit_code`` / ``ssh.duration_ms`` /
+        ``ssh.error`` from the final ExecResult before returning.
 
         Args:
             server_name: Server name from registry
@@ -216,20 +217,24 @@ class SSHManager:
             timeout: Command timeout in seconds
             working_dir: Working directory for command execution
             force: Bypass dangerous command detection (use with caution)
+            dry_run: If True, skip connection and execution — return a
+                preview describing what WOULD run. Dangerous-command detection
+                still applies so rejection can be previewed.
 
         Returns:
             ExecResult with command output and metadata
         """
         if _ssh_tracer is None:
             return await self._execute_impl(
-                server_name, command, timeout, working_dir, force
+                server_name, command, timeout, working_dir, force, dry_run
             )
         with _ssh_tracer.start_as_current_span("ssh.execute") as span:
             span.set_attribute("ssh.host", server_name)
             span.set_attribute("ssh.command_length", len(command))
             span.set_attribute("ssh.force", force)
+            span.set_attribute("ssh.dry_run", dry_run)
             result = await self._execute_impl(
-                server_name, command, timeout, working_dir, force
+                server_name, command, timeout, working_dir, force, dry_run
             )
             if result.exit_code is not None:
                 span.set_attribute("ssh.exit_code", result.exit_code)
@@ -239,9 +244,7 @@ class SSHManager:
                 # Truncate error messages into spans — some operators ingest
                 # traces into cost-sensitive backends.
                 span.set_attribute("ssh.error", result.error[:200])
-                span.set_status(
-                    _otel_trace.Status(_otel_trace.StatusCode.ERROR)
-                )
+                span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
             return result
 
     async def _execute_impl(
@@ -251,6 +254,7 @@ class SSHManager:
         timeout: int = 30,
         working_dir: str | None = None,
         force: bool = False,
+        dry_run: bool = False,
     ) -> ExecResult:
         """Internal implementation of execute without tracing.
 
@@ -261,7 +265,9 @@ class SSHManager:
         try:
             server = self.registry.get_server(server_name)
 
-            # Check for dangerous commands unless force is enabled
+            # Check for dangerous commands unless force is enabled. Dangerous-
+            # command detection ALSO runs in dry_run mode so users can preview
+            # rejection without connecting.
             if not force and _is_dangerous_command(command):
                 logger.warning(
                     f"Blocked potentially destructive command on {server_name}: {command}"
@@ -273,6 +279,28 @@ class SSHManager:
                     stderr="",
                     exit_code=None,
                     error="Blocked: potentially destructive command detected. Review and use with caution.",
+                )
+
+            # Dry-run mode: don't connect, don't execute — just describe
+            # what WOULD happen. Useful for LLM-driven plans that want to
+            # preview destructive cascades before committing.
+            if dry_run:
+                effective_wd = working_dir or server.default_dir or "<login dir>"
+                effective_to = server.timeout or timeout
+                preview = (
+                    f"[DRY RUN] Would execute on {server_name}\n"
+                    f"  command:     {command}\n"
+                    f"  working_dir: {effective_wd}\n"
+                    f"  timeout:     {effective_to}s\n"
+                    f"  force:       {force}"
+                )
+                return ExecResult(
+                    server=server_name,
+                    command=command,
+                    stdout=preview,
+                    stderr="",
+                    exit_code=0,
+                    duration_ms=0,
                 )
 
             # Use server-specific timeout if configured
@@ -399,6 +427,7 @@ class SSHManager:
         working_dir: str | None = None,
         fail_fast: bool = False,
         force: bool = False,
+        dry_run: bool = False,
     ) -> list[ExecResult]:
         """Execute command on all servers in a group in parallel.
 
@@ -409,6 +438,8 @@ class SSHManager:
             working_dir: Working directory for command execution
             fail_fast: Cancel remaining tasks on first failure
             force: Bypass dangerous command detection (use with caution)
+            dry_run: If True, preview what WOULD run on each server without
+                connecting. Dangerous-command detection still applies.
 
         Returns:
             List of ExecResult, one per server in the group
@@ -426,7 +457,12 @@ class SSHManager:
             async def execute_with_semaphore(server: ServerConfig) -> ExecResult:
                 async with semaphore:
                     return await self.execute(
-                        server.name, command, timeout, working_dir, force
+                        server.name,
+                        command,
+                        timeout,
+                        working_dir,
+                        force,
+                        dry_run,
                     )
 
             # Execute in parallel

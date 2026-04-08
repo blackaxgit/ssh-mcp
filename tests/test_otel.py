@@ -80,9 +80,7 @@ class TestSSHExecuteTracing:
         # cached at import time points to the old NoOp provider. Patch it.
         import ssh_mcp.ssh as ssh_module
 
-        with patch.object(
-            ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")
-        ):
+        with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
             manager = SSHManager(_make_registry(), Settings())
             result = await manager.execute("test-host", "rm -rf /", timeout=30)
 
@@ -112,9 +110,7 @@ class TestSSHExecuteTracing:
         import ssh_mcp.ssh as ssh_module
 
         secret_cmd = "echo 'password=hunter2' > /tmp/out"
-        with patch.object(
-            ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")
-        ):
+        with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
             manager = SSHManager(_make_registry(), Settings())
             # Mock _get_connection to avoid real SSH; the call will still
             # enter the span creation path.

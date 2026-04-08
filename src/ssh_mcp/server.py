@@ -355,6 +355,7 @@ async def execute(
     timeout: int = 30,
     working_dir: str | None = None,
     force: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Execute a shell command on a single SSH server.
 
@@ -370,13 +371,18 @@ async def execute(
         force: If True, bypass the dangerous-command detection regex. Use only
                 for audited bulk operations — the block list catches rm -rf /,
                 mkfs, dd-to-disk, chmod 777 /, and fork bombs. Default False.
+        dry_run: If True, do NOT connect or execute. Return a preview describing
+                what would run (server, command, working_dir, timeout, force).
+                Dangerous-command detection still runs so rejection can be
+                previewed. Useful for LLM plans that want to validate intent
+                before committing. Default False.
 
     Returns:
         Formatted command execution result with stdout, stderr, and exit code.
         Long output is truncated at ``max_output_bytes`` (default 50 KiB).
     """
     ssh = _get_ssh()
-    result = await ssh.execute(server, command, timeout, working_dir, force)
+    result = await ssh.execute(server, command, timeout, working_dir, force, dry_run)
     return format_exec_result(result)
 
 
@@ -389,6 +395,7 @@ async def execute_on_group(
     working_dir: str | None = None,
     fail_fast: bool = False,
     force: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Execute a shell command on all servers in a group in parallel.
 
@@ -409,6 +416,10 @@ async def execute_on_group(
                 run all servers to completion and report each result.
         force: If True, bypass the dangerous-command detection regex. Use only
                 for audited bulk operations. Default False.
+        dry_run: If True, do NOT connect or execute anywhere. Return a
+                per-server preview describing what would run. Dangerous-
+                command detection still applies. Useful for previewing
+                fleet-wide rollouts before committing. Default False.
 
     Returns:
         Formatted summary showing per-server results, success/failure counts,
@@ -416,7 +427,7 @@ async def execute_on_group(
     """
     ssh = _get_ssh()
     results = await ssh.execute_on_group(
-        group, command, timeout, working_dir, fail_fast, force
+        group, command, timeout, working_dir, fail_fast, force, dry_run
     )
     return format_group_results(results, group)
 
