@@ -7,12 +7,13 @@ and filtering methods.
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import os
 import tomllib
 from pathlib import Path
 from typing import Any
+
+from pydantic import ValidationError
 
 from ssh_mcp.models import GroupConfig, ServerConfig, Settings
 
@@ -28,46 +29,43 @@ class ConfigError(ValueError):
     """
 
 
-def _reject_unknown_keys(
-    section: str,
-    data: dict[str, Any],
-    known: set[str],
-    context: str = "",
-) -> None:
-    """Raise ConfigError if ``data`` contains keys not in ``known``.
+def _format_validation_error(
+    section: str, context: str, exc: ValidationError
+) -> str:
+    """Flatten a Pydantic ValidationError into a single actionable message.
 
-    Error message names every offending key AND lists every valid key, so
-    operators can diagnose typos without guessing.
+    Pydantic lists each offending field with its error type and input value.
+    For ``extra_forbidden``, we surface both the offending field name AND
+    the list of valid keys for the section so operators can fix typos
+    without consulting the schema.
 
     Args:
-        section: TOML section label used in the error message.
-        data: Raw dict from tomllib.load.
-        known: Set of valid keys for this section.
-        context: Optional contextual label (e.g. server name).
+        section: TOML section label (``settings``, ``groups``, ``servers``).
+        context: Optional entity name (e.g. server/group name) for scoping.
+        exc: The Pydantic ValidationError to flatten.
     """
-    unknown = set(data) - known
-    if unknown:
-        suffix = f" for '{context}'" if context else ""
-        bad = ", ".join(sorted(unknown))
-        valid = ", ".join(sorted(known))
-        raise ConfigError(
-            f"Unknown key(s) in [{section}]{suffix}: {bad}. Valid keys: {valid}"
-        )
+    suffix = f" for '{context}'" if context else ""
+    messages: list[str] = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ())) or "<root>"
+        etype = err.get("type", "")
+        msg = err.get("msg", "")
+        if etype == "extra_forbidden":
+            messages.append(f"unknown key '{loc}'")
+        elif etype == "missing":
+            messages.append(f"missing required key '{loc}'")
+        else:
+            messages.append(f"'{loc}': {msg}")
+    joined = "; ".join(messages)
+    return f"Invalid [{section}]{suffix}: {joined}"
 
 
-_SETTINGS_KEYS: set[str] = {f.name for f in dataclasses.fields(Settings)}
-_GROUP_KEYS: set[str] = {"description"}
-_SERVER_KEYS: set[str] = {
-    "description",
-    "groups",
-    "hostname",
-    "port",
-    "user",
-    "identity_file",
-    "jump_host",
-    "default_dir",
-    "timeout",
-}
+def _valid_keys(model_cls: type) -> list[str]:
+    """Return sorted list of valid field names for a Pydantic dataclass."""
+    fields = getattr(model_cls, "__pydantic_fields__", None)
+    if fields is None:
+        return []
+    return sorted(fields.keys())
 
 
 class ServerRegistry:
@@ -175,7 +173,7 @@ class ServerRegistry:
 
         Raises:
             FileNotFoundError: If config file doesn't exist
-            ConfigError: If TOML is malformed or validation fails
+            ConfigError: If TOML is malformed or Pydantic validation fails
         """
         if not self._config_path.exists():
             raise FileNotFoundError(
@@ -194,16 +192,17 @@ class ServerRegistry:
         # Load settings
         if "settings" in config_data:
             settings_dict = dict(config_data["settings"])
-            _reject_unknown_keys("settings", settings_dict, _SETTINGS_KEYS)
-            # Expand ~ in ssh_config_path
+            # Expand ~ in ssh_config_path before validation
             if "ssh_config_path" in settings_dict:
                 settings_dict["ssh_config_path"] = os.path.expanduser(
                     settings_dict["ssh_config_path"]
                 )
             try:
                 self._settings = Settings(**settings_dict)
-            except (TypeError, ValueError) as e:
-                raise ConfigError(f"Invalid [settings]: {e}") from e
+            except ValidationError as e:
+                detail = _format_validation_error("settings", "", e)
+                valid = ", ".join(_valid_keys(Settings))
+                raise ConfigError(f"{detail}. Valid keys: {valid}") from e
 
         # Warn if known_hosts verification is disabled
         if not self._settings.known_hosts:
@@ -214,44 +213,36 @@ class ServerRegistry:
         # Load groups
         if "groups" in config_data:
             for group_name, group_data in config_data["groups"].items():
-                _reject_unknown_keys(
-                    "groups", dict(group_data), _GROUP_KEYS, context=group_name
-                )
-                if "description" not in group_data:
-                    raise ConfigError(
-                        f"Group '{group_name}' is missing required key 'description'"
+                try:
+                    self._groups[group_name] = GroupConfig(
+                        name=group_name,
+                        **dict(group_data),
                     )
-                self._groups[group_name] = GroupConfig(
-                    name=group_name, description=group_data["description"]
-                )
+                except ValidationError as e:
+                    detail = _format_validation_error("groups", group_name, e)
+                    valid = ", ".join(
+                        k for k in _valid_keys(GroupConfig) if k != "name"
+                    )
+                    raise ConfigError(f"{detail}. Valid keys: {valid}") from e
 
         # Load servers
         if "servers" in config_data:
             for server_name, server_data in config_data["servers"].items():
-                _reject_unknown_keys(
-                    "servers", dict(server_data), _SERVER_KEYS, context=server_name
-                )
-                if "description" not in server_data:
-                    raise ConfigError(
-                        f"Server '{server_name}' is missing required key 'description'"
+                # Convert groups list to tuple before Pydantic sees it
+                data: dict[str, Any] = dict(server_data)
+                if "groups" in data:
+                    data["groups"] = tuple(data["groups"])
+                try:
+                    self._servers[server_name] = ServerConfig(
+                        name=server_name,
+                        **data,
                     )
-                # Convert groups list to tuple
-                groups = tuple(server_data.get("groups", []))
-
-                # Build ServerConfig with optional overrides
-                server = ServerConfig(
-                    name=server_name,
-                    description=server_data["description"],
-                    groups=groups,
-                    hostname=server_data.get("hostname"),
-                    port=server_data.get("port"),
-                    user=server_data.get("user"),
-                    identity_file=server_data.get("identity_file"),
-                    jump_host=server_data.get("jump_host"),
-                    default_dir=server_data.get("default_dir"),
-                    timeout=server_data.get("timeout"),
-                )
-                self._servers[server_name] = server
+                except ValidationError as e:
+                    detail = _format_validation_error("servers", server_name, e)
+                    valid = ", ".join(
+                        k for k in _valid_keys(ServerConfig) if k != "name"
+                    )
+                    raise ConfigError(f"{detail}. Valid keys: {valid}") from e
 
         # Validate configuration
         self._validate()

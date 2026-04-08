@@ -1423,6 +1423,7 @@ dependencies = [
     { name = "asyncssh" },
     { name = "mcp", extra = ["cli"] },
     { name = "orjson" },
+    { name = "pydantic" },
     { name = "structlog" },
 ]
 
@@ -1442,6 +1443,7 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.15" },
     { name = "orjson", specifier = ">=3.10.0,<4.0.0" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.9" },
+    { name = "pydantic", specifier = ">=2.10.0,<3.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.0" },
