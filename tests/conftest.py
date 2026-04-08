@@ -6,11 +6,29 @@ test data structures used across multiple test modules.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
+from hypothesis import HealthCheck, settings
 
 from ssh_mcp.models import ExecResult, GroupConfig, ServerConfig, Settings
+
+# Hypothesis profiles: tuned for fast local dev, thorough CI.
+# Select via HYPOTHESIS_PROFILE=ci env var — CI workflow sets this.
+settings.register_profile(
+    "dev",
+    max_examples=50,
+    deadline=500,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+settings.register_profile(
+    "ci",
+    max_examples=200,
+    deadline=1000,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 
 
 @pytest.fixture

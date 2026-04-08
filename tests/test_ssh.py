@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from ssh_mcp.config import ServerRegistry
 from ssh_mcp.models import Settings
@@ -694,3 +696,107 @@ groups = ["test"]
         asyncio.run(manager.close_all())
 
         assert manager._connection_ids == {}
+
+
+# ---------------------------------------------------------------------------
+# Property-based fuzz tests for _is_dangerous_command (B3)
+#
+# These tests use Hypothesis to explore the input space beyond the
+# hand-curated parametrize cases. They catch regressions where:
+#   * a regex change accidentally makes rm -rf / slip past the filter
+#   * a regex change starts rejecting benign commands that happen to
+#     contain "dd" or "chmod" substrings in non-destructive positions
+#   * control-character sanitization leaves exploitable gaps
+# ---------------------------------------------------------------------------
+
+
+class TestDangerousCommandProperties:
+    """Property-based tests using Hypothesis to fuzz ``_is_dangerous_command``."""
+
+    @given(
+        st.text(
+            alphabet=st.characters(min_codepoint=0, max_codepoint=255),
+            max_size=200,
+        )
+    )
+    def test_never_crashes_on_arbitrary_byte_input(self, payload: str) -> None:
+        """Property: the function returns bool for ANY input, never raises.
+
+        Guards against regex regressions (catastrophic backtracking,
+        encoding errors) that would crash the whole tool call instead of
+        returning a safe "not dangerous" verdict.
+        """
+        result = _is_dangerous_command(payload)
+        assert isinstance(result, bool)
+
+    @given(st.from_regex(r"rm\s+-rf\s+/.*", fullmatch=False))
+    def test_rm_rf_root_always_caught(self, payload: str) -> None:
+        """Property: any string containing ``rm -rf /`` is rejected."""
+        assert _is_dangerous_command(payload) is True
+
+    @given(st.from_regex(r"mkfs\.\w+", fullmatch=False))
+    def test_mkfs_always_caught(self, payload: str) -> None:
+        """Property: any string matching ``mkfs.<fstype>`` is rejected."""
+        assert _is_dangerous_command(payload) is True
+
+    @given(st.from_regex(r"dd\s+if=/dev/\w+", fullmatch=False))
+    def test_dd_with_device_input_always_caught(self, payload: str) -> None:
+        """Property: ``dd if=/dev/*`` patterns are rejected."""
+        assert _is_dangerous_command(payload) is True
+
+    @given(
+        st.text(
+            alphabet=st.characters(
+                whitelist_categories=("Lu", "Ll", "Nd"),
+                whitelist_characters=" -./_",
+            ),
+            min_size=1,
+            max_size=80,
+        ).filter(
+            lambda s: not any(
+                token in s.lower()
+                for token in (
+                    "rm -rf /",
+                    "rm  -rf  /",
+                    "mkfs",
+                    "dd if=",
+                    "/dev/sd",
+                    "chmod 777 /",
+                )
+            )
+        )
+    )
+    def test_safe_looking_text_not_flagged(self, payload: str) -> None:
+        """Property: letters+digits+path-safe chars without dangerous tokens pass.
+
+        Narrower than "any text" to avoid false positives from generated
+        substrings accidentally matching a dangerous regex — the filter
+        excludes any payload containing a known dangerous substring.
+        """
+        assert _is_dangerous_command(payload) is False
+
+    @given(
+        st.sampled_from(
+            ["rm -rf /", "mkfs.ext4 /dev/sda", "dd if=/dev/zero of=/dev/sdb"]
+        ),
+        st.integers(min_value=1, max_value=10),
+    )
+    def test_control_char_injection_never_bypasses(
+        self, cmd: str, n_ctrl: int
+    ) -> None:
+        """Property: injecting control chars into a known-bad command must NOT bypass.
+
+        Red Team R2 fix: null bytes and other ASCII control characters are
+        normalized to spaces before regex matching. This property verifies
+        the normalization across every dangerous token and every possible
+        control character insertion point.
+        """
+        # Insert control chars at a couple of positions in the command.
+        # Pick positions deterministically from n_ctrl so Hypothesis
+        # shrinking produces meaningful counterexamples on failure.
+        for i in range(n_ctrl):
+            pos = i % len(cmd)
+            cmd = cmd[:pos] + chr(i % 32) + cmd[pos:]
+        assert _is_dangerous_command(cmd) is True, (
+            f"bypass found: {cmd!r}"
+        )

@@ -43,6 +43,7 @@ dev = [
     "pytest-cov>=6.0",
     "mypy>=1.15",
     "pip-audit>=2.9",
+    "hypothesis>=6.151.0,<7.0.0",
 ]
 
 [build-system]
