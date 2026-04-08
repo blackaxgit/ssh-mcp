@@ -25,6 +25,15 @@ from ssh_mcp.models import ExecResult, ServerConfig, Settings
 
 logger = logging.getLogger(__name__)
 
+# Soft OTel import — see server.py for rationale. When the extras aren't
+# installed, ``_ssh_tracer`` is None and inner ops skip span creation.
+try:
+    from opentelemetry import trace as _otel_trace
+
+    _ssh_tracer: Any = _otel_trace.get_tracer("ssh_mcp.ssh")
+except ImportError:  # pragma: no cover - exercised by env without extras
+    _ssh_tracer = None
+
 # ---------------------------------------------------------------------------
 # Tunable constants — promoted from inline literals for discoverability.
 #
@@ -194,6 +203,13 @@ class SSHManager:
     ) -> ExecResult:
         """Execute command on a remote server.
 
+        Thin tracing wrapper around ``_execute_impl``. When OTel is
+        available it opens a ``ssh.execute`` span with ``ssh.host``,
+        ``ssh.command_length`` (NOT the raw command — avoids leaking
+        secrets into traces), and ``ssh.force`` attributes at entry, and
+        populates ``ssh.exit_code`` / ``ssh.duration_ms`` / ``ssh.error``
+        from the final ExecResult before returning.
+
         Args:
             server_name: Server name from registry
             command: Command to execute
@@ -203,6 +219,44 @@ class SSHManager:
 
         Returns:
             ExecResult with command output and metadata
+        """
+        if _ssh_tracer is None:
+            return await self._execute_impl(
+                server_name, command, timeout, working_dir, force
+            )
+        with _ssh_tracer.start_as_current_span("ssh.execute") as span:
+            span.set_attribute("ssh.host", server_name)
+            span.set_attribute("ssh.command_length", len(command))
+            span.set_attribute("ssh.force", force)
+            result = await self._execute_impl(
+                server_name, command, timeout, working_dir, force
+            )
+            if result.exit_code is not None:
+                span.set_attribute("ssh.exit_code", result.exit_code)
+            if result.duration_ms:
+                span.set_attribute("ssh.duration_ms", result.duration_ms)
+            if result.error:
+                # Truncate error messages into spans — some operators ingest
+                # traces into cost-sensitive backends.
+                span.set_attribute("ssh.error", result.error[:200])
+                span.set_status(
+                    _otel_trace.Status(_otel_trace.StatusCode.ERROR)
+                )
+            return result
+
+    async def _execute_impl(
+        self,
+        server_name: str,
+        command: str,
+        timeout: int = 30,
+        working_dir: str | None = None,
+        force: bool = False,
+    ) -> ExecResult:
+        """Internal implementation of execute without tracing.
+
+        See ``execute`` for public contract. Separated so the span wrapper
+        stays thin and the complex exit-path logic below does not need
+        per-branch tracing glue.
         """
         try:
             server = self.registry.get_server(server_name)

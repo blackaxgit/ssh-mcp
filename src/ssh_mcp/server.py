@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import functools
 import logging
 import os
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -33,6 +34,56 @@ from ssh_mcp.formatting import (
     format_server_table,
 )
 from ssh_mcp.ssh import SSHManager
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry tracing — soft-imported so ssh_mcp[otel] is genuinely optional.
+#
+# When `opentelemetry-api` is installed, every MCP tool call gets a span
+# named ``mcp.tool.{name}`` with attributes for the tool name and (on
+# failure) the exception type. Inner SSH operations create child spans
+# inside this one via automatic context propagation. Operators bring their
+# own SDK + exporter (Jaeger, Tempo, OTLP collector, etc).
+#
+# When `opentelemetry-api` is NOT installed, the helper ``_span`` below is a
+# no-op context manager — zero runtime cost, zero import errors.
+# ---------------------------------------------------------------------------
+try:
+    from opentelemetry import trace as _otel_trace
+
+    _tracer: Any = _otel_trace.get_tracer("ssh_mcp")
+    _otel_available: bool = True
+except ImportError:  # pragma: no cover - exercised by env without extras
+    _tracer = None
+    _otel_available = False
+
+
+@contextlib.contextmanager
+def _span(name: str, **attributes: Any) -> Iterator[Any]:
+    """Start an OTel span if the API is available, else a no-op.
+
+    Usage::
+
+        with _span("mcp.tool.execute", **{"mcp.tool.name": "execute"}) as span:
+            ...
+            if span is not None:
+                span.set_attribute("ssh.exit_code", result.exit_code)
+
+    The yielded span is ``None`` when OTel is not installed so caller code
+    must null-check before calling ``set_attribute``.
+    """
+    if _tracer is None:
+        yield None
+        return
+    with _tracer.start_as_current_span(name) as span:
+        for k, v in attributes.items():
+            if v is not None:
+                span.set_attribute(k, v)
+        try:
+            yield span
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
+            raise
 
 
 def _configure_logging() -> None:
@@ -209,7 +260,8 @@ F = TypeVar("F", bound=Callable[..., Awaitable[str]])
 
 
 def _mcp_tool(func: F) -> F:
-    """Decorator: ensure server is initialized, log+raise ToolError on failure.
+    """Decorator: ensure server is initialized, log+raise ToolError on failure,
+    and open an OpenTelemetry span around every tool invocation.
 
     Collapses the duplicated try/except boilerplate from each MCP tool into a
     single declarative wrapper. Preserves ToolError passthrough so structured
@@ -217,18 +269,26 @@ def _mcp_tool(func: F) -> F:
     logged with a traceback and re-raised as a ToolError so the MCP client
     receives `isError=true` with a useful message.
 
+    The surrounding OTel span is named ``mcp.tool.{name}`` and carries the
+    ``mcp.tool.name`` attribute. On failure it is marked with exception info
+    and ``StatusCode.ERROR`` via ``_span``'s error path. When OTel is not
+    installed, the span is a no-op.
+
     Apply BELOW ``@mcp.tool()`` so FastMCP registers the wrapped function.
     """
+
+    tool_name = func.__name__
 
     @functools.wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> str:
         try:
-            await _init()
-            return await func(*args, **kwargs)
+            with _span(f"mcp.tool.{tool_name}", **{"mcp.tool.name": tool_name}):
+                await _init()
+                return await func(*args, **kwargs)
         except ToolError:
             raise
         except Exception as e:
-            logger.error("%s failed: %s", func.__name__, e, exc_info=True)
+            logger.error("%s failed: %s", tool_name, e, exc_info=True)
             raise ToolError(str(e)) from e
 
     return cast(F, wrapper)
