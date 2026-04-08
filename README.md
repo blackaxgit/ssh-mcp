@@ -130,7 +130,17 @@ claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx ssh-mcp
 
 ## Configuration
 
-Config file location (checked in order):
+### Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SSH_MCP_CONFIG` | — | Absolute path to a TOML config file. Overrides the default search path. |
+| `SSH_MCP_LOG_FORMAT` | `console` | Log output format. Set to `json` to emit single-line JSON events (timestamp, level, event, contextvars) suitable for log aggregators like Loki, Datadog, or Splunk. Any other value falls back to the colorized console renderer. |
+| `HYPOTHESIS_PROFILE` | `dev` | For local development / CI only. Set to `ci` to run property-based tests with `max_examples=200` instead of `50`. |
+
+### Config file location
+
+Checked in order:
 
 1. `$SSH_MCP_CONFIG` environment variable
 2. `~/.config/ssh-mcp/servers.toml` (default)
@@ -141,10 +151,11 @@ Example `servers.toml`:
 ```toml
 [settings]
 ssh_config_path = "~/.ssh/config"
-command_timeout = 30
-max_output_bytes = 51200
-connection_idle_timeout = 300
-known_hosts = true
+command_timeout = 30          # seconds, range 1..3600
+max_output_bytes = 51200      # truncate captured output at this many bytes
+connection_idle_timeout = 300 # seconds; eviction scan runs every 60s
+known_hosts = true            # false removes MITM protection
+max_parallel_hosts = 10       # concurrency cap for execute_on_group (1..100)
 
 [groups]
 production = { description = "Production servers" }
@@ -186,13 +197,29 @@ chmod 600 ~/.config/ssh-mcp/servers.toml
 
 ## Security
 
-ssh-mcp blocks commands that match known destructive patterns (`rm -rf /`, disk wipes, fork bombs, `mkfs`, etc.) unless the tool caller passes `force=true`. Control characters (null bytes, newlines) are normalized before pattern matching to prevent trivial regex bypasses.
+**Dangerous command blocking.** ssh-mcp rejects commands that match known destructive patterns (`rm -rf /`, disk wipes, fork bombs, `mkfs`, `chmod 777 /`, etc.) unless the tool caller passes `force=true`. ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normalized to spaces before pattern matching so `rm\x00-rf /` is caught just like `rm -rf /`. The regex is fuzz-tested with Hypothesis on every CI run.
 
-SFTP operations validate BOTH remote and local paths to prevent reading/writing sensitive files on either side: `/etc/shadow`, `/etc/passwd`, `~/.ssh/id_*`, `~/.ssh/authorized_keys`, and any path containing `..` traversal.
+When `force=true` is used, the audit log records the bypass explicitly so the operator has a clean paper trail. Do not grant `force=true` to untrusted MCP clients.
 
-Host key verification is on by default (`known_hosts = true`). Disabling `StrictHostKeyChecking` in `~/.ssh/config` weakens MITM protection and should be avoided in production.
+**Path validation.** SFTP `upload_file` and `download_file` validate **both** remote and local paths. Any of these block the transfer:
 
-All tool calls are audit-logged to stderr with: server, command, exit code, duration, and transfer byte counts. When running in Docker, capture stderr with `docker logs` for your audit trail.
+- Sensitive Unix paths: `/etc/shadow`, `/etc/passwd`
+- SSH key material: `~/.ssh/authorized_keys`, `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, `~/.ssh/id_dsa`
+- Any path containing `..` (parent traversal)
+
+This prevents an LLM client from exfiltrating secrets on either the MCP host or a managed server.
+
+**Host key verification** is on by default (`known_hosts = true`). Disabling `StrictHostKeyChecking` in `~/.ssh/config` weakens MITM protection and should be avoided in production.
+
+**Audit logging.** Every tool call is logged to stderr with `server`, `command`, `exit_code`, `duration_ms`, and (for SFTP) byte counts. SFTP operations emit three-stage events: `sftp.upload.start` → `sftp.upload.complete` (or `sftp.upload.failed`), each tagged with a stable `connection_id` so a single transfer is grep-correlatable.
+
+For production log aggregation, set `SSH_MCP_LOG_FORMAT=json` to emit single-line JSON events:
+
+```json
+{"event": "sftp.upload.complete bytes=4096 duration_ms=183", "level": "info", "timestamp": "2026-04-08T16:00:11.761575Z", "server": "web-prod-01", "operation": "upload", "local_path": "/tmp/app.tar.gz", "remote_path": "/var/www/release.tar.gz", "connection_id": "web-prod-01-4242-a3f1c9d2"}
+```
+
+When running in Docker, capture stderr with `docker logs` for the audit trail.
 
 For vulnerability reports, see [SECURITY.md](SECURITY.md). Do not open public GitHub issues for security concerns.
 

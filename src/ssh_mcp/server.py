@@ -299,15 +299,21 @@ async def execute(
     """Execute a shell command on a single SSH server.
 
     Args:
-        server: Server name (e.g. 'pro-dicentra', 'inf-ai'). Must match a configured
-                server. Use list_servers to see available servers.
-        command: Shell command to execute on the remote server.
-        timeout: Command timeout in seconds. Default 30.
-        working_dir: Remote directory to execute from. Uses server default if omitted.
-        force: Bypass dangerous command detection. Use with extreme caution. Default false.
+        server: Server name (e.g. 'web-prod-01'). Must match a configured server.
+                Use list_servers to see available servers.
+        command: Shell command to execute on the remote server (exactly as it
+                would be typed at a bash prompt).
+        timeout: Command timeout in **seconds**. Default 30. Range 1–3600.
+        working_dir: Absolute remote directory to cd into before running the
+                command. Uses the server's ``default_dir`` from servers.toml
+                if omitted, or the SSH login directory if neither is set.
+        force: If True, bypass the dangerous-command detection regex. Use only
+                for audited bulk operations — the block list catches rm -rf /,
+                mkfs, dd-to-disk, chmod 777 /, and fork bombs. Default False.
 
     Returns:
         Formatted command execution result with stdout, stderr, and exit code.
+        Long output is truncated at ``max_output_bytes`` (default 50 KiB).
     """
     ssh = _get_ssh()
     result = await ssh.execute(server, command, timeout, working_dir, force)
@@ -324,19 +330,29 @@ async def execute_on_group(
     fail_fast: bool = False,
     force: bool = False,
 ) -> str:
-    """Execute a shell command on all servers in a group (parallel execution).
+    """Execute a shell command on all servers in a group in parallel.
+
+    Concurrency is capped by the ``max_parallel_hosts`` setting (default 10;
+    configure in ``[settings]`` of servers.toml, range 1–100).
 
     Args:
-        group: Group name (e.g. 'dicentra-prod', 'infra'). Use list_groups to see
+        group: Group name (e.g. 'production', 'web'). Use list_groups to see
                available groups.
-        command: Shell command to execute on all servers in the group.
-        timeout: Per-server command timeout in seconds. Default 30.
-        working_dir: Remote directory to execute from on each server.
-        fail_fast: If true, stop on first failure. Default false (run all).
-        force: Bypass dangerous command detection. Use with extreme caution. Default false.
+        command: Shell command to execute on every server in the group.
+        timeout: Per-server command timeout in **seconds**. Default 30.
+                Each server has its own timer; slow servers do NOT extend the
+                per-server limit for others.
+        working_dir: Absolute remote directory to cd into on each server.
+                Uses each server's ``default_dir`` if omitted.
+        fail_fast: If True, cancel remaining tasks as soon as any server
+                returns a non-zero exit code or errors. Default False —
+                run all servers to completion and report each result.
+        force: If True, bypass the dangerous-command detection regex. Use only
+                for audited bulk operations. Default False.
 
     Returns:
-        Formatted summary of results from all servers in the group.
+        Formatted summary showing per-server results, success/failure counts,
+        and aggregate exit status.
     """
     ssh = _get_ssh()
     results = await ssh.execute_on_group(

@@ -4,21 +4,31 @@
 # Server names below MUST match SSH config Host entries.
 
 [settings]
-# Path to SSH config file (supports ~ expansion)
+# Path to SSH config file (supports ~ expansion). Host aliases, port, user,
+# identity file, and ProxyJump chains are read from here.
 ssh_config_path = "~/.ssh/config"
 
-# Command execution timeout in seconds
+# Default command execution timeout in SECONDS. Range 1..3600. Individual
+# servers may override via `timeout = N` in their [servers.*] block.
 command_timeout = 30
 
-# Maximum output bytes to capture (prevents memory issues)
+# Maximum bytes to capture from stdout/stderr per command. Longer output is
+# truncated with a `[... output truncated]` marker. Minimum 1024.
 max_output_bytes = 51200
 
-# Connection idle timeout in seconds (0 = no timeout)
+# Seconds an SSH connection may be idle before the background eviction loop
+# closes it to free resources. Minimum 10. Eviction scan interval is 60s.
 connection_idle_timeout = 300
 
-# Verify server identity against known_hosts (recommended: true)
-# Set to false only for ephemeral/dynamic hosts where host keys change frequently
+# Verify server identity against known_hosts (recommended: true).
+# Set to false ONLY for ephemeral/dynamic hosts where host keys change
+# frequently. Disabling this removes MITM protection.
 known_hosts = true
+
+# Maximum concurrent SSH connections during `execute_on_group` calls.
+# Range 1..100. Higher values speed up large-fleet rollouts but may
+# exhaust file descriptors or trigger fleet-wide load spikes.
+max_parallel_hosts = 10
 
 # =============================================================================
 # GROUP DEFINITIONS
