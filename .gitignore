@@ -43,6 +43,7 @@ id_dsa.*
 
 # Research / internal docs
 docs/research-prep/
+docs/internal/
 
 # Logs
 logs/
