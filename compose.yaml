@@ -1,6 +1,16 @@
 # Docker Compose configuration for ssh-mcp MCP server
 # Compose V2 format (no version key)
-# Runs Python MCP server with stdio transport for infrastructure SSH management
+#
+# Two services are defined:
+#   * ssh-mcp       — default stdio transport, launched as a subprocess by
+#                     an MCP client via ``docker compose run``.
+#   * ssh-mcp-http  — MCP streamable HTTP transport with bearer-token
+#                     authentication, suitable for shared-team or
+#                     containerized deployments. Commented out by default.
+#
+# Run the stdio service:      docker compose run --rm ssh-mcp
+# Run the HTTP service:       uncomment the block below, set SSH_MCP_HTTP_TOKEN,
+#                             then: docker compose up ssh-mcp-http
 
 services:
   ssh-mcp:
@@ -33,3 +43,59 @@ services:
     # Restart policy: restart on failure but not if manually stopped
     # Prevents thrashing on configuration errors while respecting manual stops
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # HTTP transport (commented out by default — uncomment to enable)
+  #
+  # SECURITY:
+  #   * Binding to 0.0.0.0 REQUIRES SSH_MCP_HTTP_TOKEN (enforced at startup).
+  #   * Generate a strong token:  openssl rand -hex 32
+  #   * Pass via a Docker secret or an env file — do NOT hardcode here.
+  #   * Put the service behind a TLS reverse proxy (Caddy, Traefik, nginx)
+  #     for production — raw uvicorn on port 8000 is HTTP, not HTTPS.
+  #   * SSH_MCP_HTTP_ALLOWED_HOSTS must list any hostname clients will use
+  #     in the Host header (DNS rebinding protection).
+  #
+  # Example client request:
+  #   curl -H "Authorization: Bearer ${SSH_MCP_HTTP_TOKEN}" \
+  #        -H "Host: ssh-mcp.internal" \
+  #        http://localhost:8000/mcp
+  # ---------------------------------------------------------------------------
+  # ssh-mcp-http:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     # Publish the HTTP port to the host. Put nginx/Caddy in front for TLS.
+  #     - "8000:8000"
+  #   volumes:
+  #     - ./config/servers.toml:/config/servers.toml:ro
+  #     - ~/.ssh:/home/sshmcp/.ssh:ro
+  #   environment:
+  #     SSH_MCP_CONFIG: /config/servers.toml
+  #     PYTHONUNBUFFERED: "1"
+  #     # Transport selection
+  #     SSH_MCP_TRANSPORT: streamable-http
+  #     # Bind to 0.0.0.0 inside the container so the published port works
+  #     SSH_MCP_HTTP_HOST: "0.0.0.0"
+  #     SSH_MCP_HTTP_PORT: "8000"
+  #     # Stateless mode is recommended for containers (no per-client session state)
+  #     SSH_MCP_HTTP_STATELESS: "true"
+  #     # Structured JSON logs for centralized aggregation (Loki, Datadog, etc.)
+  #     SSH_MCP_LOG_FORMAT: "json"
+  #     # Optional: extend DNS-rebinding allowlist for your internal hostname
+  #     # SSH_MCP_HTTP_ALLOWED_HOSTS: "ssh-mcp.internal:*"
+  #   # Load the bearer token from a .env file (never commit it)
+  #   # Create .env.ssh-mcp with: SSH_MCP_HTTP_TOKEN=<32+ char random value>
+  #   env_file:
+  #     - .env.ssh-mcp
+  #   restart: unless-stopped
+  #   # Healthcheck: probe the /mcp endpoint with auth, fall back to import check
+  #   healthcheck:
+  #     test:
+  #       - CMD-SHELL
+  #       - python -c "import ssh_mcp; import urllib.request, os; req = urllib.request.Request(f'http://127.0.0.1:{os.environ.get(\"SSH_MCP_HTTP_PORT\", \"8000\")}/mcp', headers={'Authorization': 'Bearer ' + os.environ['SSH_MCP_HTTP_TOKEN']}); urllib.request.urlopen(req, timeout=3)"
+  #     interval: 30s
+  #     timeout: 5s
+  #     retries: 3
+  #     start_period: 5s
