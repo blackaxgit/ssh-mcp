@@ -66,14 +66,38 @@ def _make_connection_id(server_name: str) -> str:
     return f"{server_name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
-# Dangerous command patterns that could be destructive
+# Dangerous command patterns that could be destructive.
+#
+# This list is a TRIPWIRE for obvious accidents, NOT a security boundary.
+# Sophisticated attackers can bypass it with base64-encoded payloads,
+# shell hex escapes, Unicode homoglyphs, or subshell indirection. The
+# patterns below catch the highest-frequency mistakes — they are NOT
+# expected to resist a motivated adversary. Operators who need real
+# isolation must sandbox at a lower layer (containers, SELinux, etc.).
 _DANGEROUS_PATTERNS = [
-    re.compile(r"rm\s+-rf\s+/"),
+    # Filesystem root wipe via rm -rf — catches both `/` and `~` (home)
+    # forms. The original R1/R2 regex only caught `/`; `rm -rf ~` was a
+    # trivial bypass fixed in R3.
+    re.compile(r"rm\s+-[rRfI]*r[rRfI]*f[rRfI]*\s+/"),
+    re.compile(r"rm\s+-[rRfI]*r[rRfI]*f[rRfI]*\s+~"),
+    # Filesystem creation over raw devices
     re.compile(r"mkfs"),
+    # dd to/from a block device
     re.compile(r"dd\s+if="),
+    # Redirect into a block device
     re.compile(r">\s*/dev/sd"),
-    re.compile(r"chmod\s+777\s+/"),
-    re.compile(r":\(\)\{\s*:\|:&\s*\};:"),  # fork bomb
+    re.compile(r">\s*/dev/nvme"),
+    # chmod / chown on root or home
+    re.compile(r"chmod\s+-?R?\s*777\s+/"),
+    # find-based recursive delete — equivalent destructive power
+    re.compile(r"find\s+[/~][\w/~.-]*\s+.*-delete"),
+    re.compile(r"find\s+[/~][\w/~.-]*\s+.*-exec\s+rm\b"),
+    # Block-level wipes
+    re.compile(r"shred\s+(-\w*\s+)*/dev/"),
+    re.compile(r"wipefs\s+(-\w+\s+|--\w+\s+)*/dev/"),
+    # Classic fork bomb — original required adjacent (){ which missed
+    # the spaced variant. Tolerant regex handles both.
+    re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
 ]
 
 # Sensitive paths that should be blocked in SFTP operations.

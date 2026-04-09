@@ -187,55 +187,54 @@ class TestIsDangerousCommand:
 
 
 class TestDangerousPatternsDirectly:
-    """Ensure every compiled pattern in _DANGEROUS_PATTERNS fires correctly."""
+    """Ensure every compiled pattern in _DANGEROUS_PATTERNS fires correctly.
 
-    def test_pattern_count(self) -> None:
-        """Sanity check: the expected number of patterns are present."""
-        assert len(_DANGEROUS_PATTERNS) == 6
+    These tests use ``_is_dangerous_command`` (the public entry point) rather
+    than ``_DANGEROUS_PATTERNS[n]`` with hardcoded indices — Red Team R3
+    added several new patterns and the indices would be brittle to future
+    extensions.
+    """
+
+    def test_pattern_list_is_nonempty(self) -> None:
+        """Sanity: at least the original six patterns plus R3 additions."""
+        assert len(_DANGEROUS_PATTERNS) >= 6
 
     def test_rm_rf_slash_pattern(self) -> None:
-        assert _DANGEROUS_PATTERNS[0].search("rm -rf /") is not None
-        assert _DANGEROUS_PATTERNS[0].search("rm -rf /tmp") is not None
-        assert _DANGEROUS_PATTERNS[0].search("rm -rf mydir") is None
+        assert _is_dangerous_command("rm -rf /") is True
+        assert _is_dangerous_command("rm -rf /tmp") is True
+        assert _is_dangerous_command("rm -rf mydir") is False
 
     def test_mkfs_pattern(self) -> None:
-        assert _DANGEROUS_PATTERNS[1].search("mkfs.ext4 /dev/sda") is not None
-        assert _DANGEROUS_PATTERNS[1].search("mkfs") is not None
-        assert (
-            _DANGEROUS_PATTERNS[1].search("ls mkfs_backup") is not None
-        )  # substring match
+        assert _is_dangerous_command("mkfs.ext4 /dev/sda") is True
+        assert _is_dangerous_command("mkfs") is True
 
     def test_dd_if_pattern(self) -> None:
-        assert _DANGEROUS_PATTERNS[2].search("dd if=/dev/zero of=/dev/sda") is not None
-        assert (
-            _DANGEROUS_PATTERNS[2].search("dd if=input.bin of=output.bin") is not None
-        )
-        assert _DANGEROUS_PATTERNS[2].search("dd bs=512 count=1") is None
+        assert _is_dangerous_command("dd if=/dev/zero of=/dev/sda") is True
+        assert _is_dangerous_command("dd if=input.bin of=output.bin") is True
+        assert _is_dangerous_command("dd bs=512 count=1") is False
 
     def test_redirect_dev_sd_pattern(self) -> None:
-        assert _DANGEROUS_PATTERNS[3].search("> /dev/sda") is not None
-        assert _DANGEROUS_PATTERNS[3].search("echo x > /dev/sdb") is not None
-        assert _DANGEROUS_PATTERNS[3].search("echo x > /dev/null") is None
+        assert _is_dangerous_command("> /dev/sda") is True
+        assert _is_dangerous_command("echo x > /dev/sdb") is True
+        assert _is_dangerous_command("echo x > /dev/null") is False
 
     def test_chmod_777_slash_pattern(self) -> None:
-        # Pattern matches chmod 777 followed by any / prefix — all absolute paths
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 /") is not None
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 /etc") is not None
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 /home/user") is not None
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 /tmp/mydir") is not None
+        assert _is_dangerous_command("chmod 777 /") is True
+        assert _is_dangerous_command("chmod 777 /etc") is True
+        assert _is_dangerous_command("chmod 777 /home/user") is True
         # Relative paths (no /) are safe
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 mydir") is None
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 ./scripts") is None
+        assert _is_dangerous_command("chmod 777 mydir") is False
+        assert _is_dangerous_command("chmod 777 ./scripts") is False
 
     def test_fork_bomb_pattern(self) -> None:
-        # Pattern uses \s* (zero-or-more), so spaces are optional
-        assert _DANGEROUS_PATTERNS[5].search(":(){ :|:& };:") is not None
-        assert (
-            _DANGEROUS_PATTERNS[5].search(":(){ :|:&};:") is not None
-        )  # no trailing space also matches
-        # Pattern requires the exact structure; unrelated strings do not match
-        assert _DANGEROUS_PATTERNS[5].search("echo hello") is None
-        assert _DANGEROUS_PATTERNS[5].search("ls -la") is None
+        assert _is_dangerous_command(":(){ :|:& };:") is True
+        assert _is_dangerous_command(":(){ :|:&};:") is True
+        # R3 extension: spaced variants also caught
+        assert _is_dangerous_command(":() { :|:& };:") is True
+        assert _is_dangerous_command(":()  {  :|:&  };:") is True
+        # Unrelated strings do not match
+        assert _is_dangerous_command("echo hello") is False
+        assert _is_dangerous_command("ls -la") is False
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +628,54 @@ class TestExpandedSensitiveAllowlist:
 # ---------------------------------------------------------------------------
 # force=True bypass
 # ---------------------------------------------------------------------------
+
+
+class TestDangerousCommandR3Extensions:
+    """Red Team R3 regex extensions: home-wipe, find-delete, shred, wipefs, spaced fork bomb."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Home directory wipe — `~` is shell-expanded to $HOME and can
+            # nuke the user's entire home. Previously bypassed because
+            # the regex required a literal `/` after `-rf`.
+            "rm -rf ~",
+            "rm -rf ~/",
+            "rm -rf ~/Documents",
+            "sudo rm -rf ~",
+            # find / -delete  — same destructive power as rm -rf /
+            "find / -delete",
+            "find /home -delete",
+            "find / -exec rm {} +",
+            # shred / wipefs — block-level destruction
+            "shred /dev/sda",
+            "shred -zvu /dev/sda",
+            "wipefs -a /dev/sda",
+            "wipefs --all /dev/nvme0n1",
+            # Spaced fork bomb — the original regex required adjacent (){
+            ":() { :|:& };:",
+            ":()  {  :|:&  };:",
+        ],
+    )
+    def test_r3_dangerous_patterns_blocked(self, command: str) -> None:
+        assert _is_dangerous_command(command) is True, (
+            f"R3 regex must block: {command!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Don't over-flag — these must stay allowed
+            "find /var/log -name '*.log' -mtime +30",
+            "find . -type f",
+            "shred --help",  # docs lookup, no device arg
+            "wipefs --version",
+        ],
+    )
+    def test_r3_false_positives_not_blocked(self, command: str) -> None:
+        assert _is_dangerous_command(command) is False, (
+            f"R3 regex over-matched: {command!r}"
+        )
 
 
 class TestDangerousCommandForceBypass:

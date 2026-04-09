@@ -247,7 +247,15 @@ chmod 600 ~/.config/ssh-mcp/servers.toml
 
 ## Security
 
-**Dangerous command blocking.** ssh-mcp rejects commands that match known destructive patterns (`rm -rf /`, disk wipes, fork bombs, `mkfs`, `chmod 777 /`, etc.) unless the tool caller passes `force=true`. ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normalized to spaces before pattern matching so `rm\x00-rf /` is caught just like `rm -rf /`. The regex is fuzz-tested with Hypothesis on every CI run.
+**Dangerous command blocking.** ssh-mcp rejects commands that match known destructive patterns — `rm -rf /`, `rm -rf ~`, `find / -delete`, `find / -exec rm`, `shred /dev/*`, `wipefs /dev/*`, `mkfs`, `dd if=...`, `> /dev/sd*`, `chmod 777 /`, fork bombs (spaced and adjacent variants) — unless the tool caller passes `force=true`. ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normalized to spaces before matching, so `rm\x00-rf /` is caught just like `rm -rf /`. The regex is fuzz-tested with Hypothesis on every CI run.
+
+> **This is a TRIPWIRE, not a security boundary.** The regex catches obvious accidents and shortcut destructive commands. It does NOT defend against a motivated attacker:
+> - Base64-encoded payloads (`echo <b64> | base64 -d | bash`) bypass by design
+> - Shell hex escapes (`$'\x72\x6d -rf /'`) are interpreted AFTER regex matching
+> - Unicode homoglyphs (Cyrillic `р`, Greek `ρ`) do not match Latin `r`
+> - Indirection via `$(...)`, `` `...` ``, `eval`, `python -c`, etc. can hide intent
+>
+> If you need real isolation for untrusted tool callers, sandbox at a lower layer: run ssh-mcp inside a container with a restricted SSH config, use `ForceCommand` on the managed servers, or audit `force=false` usage via the structured logs. The dangerous-command filter exists to stop LLM accidents and typos, not adversaries.
 
 When `force=true` is used, the audit log records the bypass explicitly so the operator has a clean paper trail. Do not grant `force=true` to untrusted MCP clients.
 
