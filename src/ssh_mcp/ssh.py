@@ -427,12 +427,24 @@ class SSHManager:
             if dry_run:
                 effective_wd = working_dir or server.default_dir or "<login dir>"
                 effective_to = server.timeout or timeout
+                # Red Team R3 finding H1: when force=True bypasses a
+                # dangerous-command match, the dry_run preview must surface
+                # a visible warning so LLM planners can't overlook it.
+                dangerous_banner = ""
+                if force and _is_dangerous_command(command):
+                    dangerous_banner = (
+                        "\n"
+                        "  ⚠️  DANGEROUS: matched the destructive-command tripwire.\n"
+                        "      force=True would bypass the block on real execution.\n"
+                        "      Review carefully before removing dry_run=True."
+                    )
                 preview = (
                     f"[DRY RUN] Would execute on {server_name}\n"
                     f"  command:     {command}\n"
                     f"  working_dir: {effective_wd}\n"
                     f"  timeout:     {effective_to}s\n"
                     f"  force:       {force}"
+                    f"{dangerous_banner}"
                 )
                 return ExecResult(
                     server=server_name,

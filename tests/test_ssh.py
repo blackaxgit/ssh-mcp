@@ -861,6 +861,52 @@ default_dir = "/srv/app"
         assert "[DRY RUN]" in result.stdout
         assert "rm -rf /" in result.stdout
 
+    async def test_dry_run_with_force_warns_about_dangerous_bypass(self) -> None:
+        """Red Team R3 finding H1: dry_run+force must warn when the dangerous
+        check would otherwise have blocked the command. An LLM building a
+        force-enabled rollout plan needs a visible signal that the preview
+        contains a command that matched a destructive pattern.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute(
+                "test-host",
+                "rm -rf /",
+                force=True,
+                dry_run=True,
+            )
+
+        # Warning banner must be present
+        assert "DANGEROUS" in result.stdout.upper() or "⚠" in result.stdout, (
+            f"dry_run+force must surface a warning. Got: {result.stdout!r}"
+        )
+
+    async def test_dry_run_with_force_no_warning_for_safe_command(self) -> None:
+        """dry_run+force on a SAFE command must NOT emit a dangerous warning."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute(
+                "test-host",
+                "uptime",
+                force=True,
+                dry_run=True,
+            )
+        # No warning banner on a safe command
+        assert "DANGEROUS" not in result.stdout.upper()
+        assert "⚠" not in result.stdout
+
     async def test_dry_run_group_produces_result_per_server(self) -> None:
         """execute_on_group dry_run must produce a preview for every server."""
         from unittest.mock import AsyncMock, patch
