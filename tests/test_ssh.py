@@ -680,6 +680,74 @@ class TestExpandedSensitiveAllowlist:
 # ---------------------------------------------------------------------------
 
 
+class TestDangerousCommandR4Extensions:
+    """Red Team R4 bypasses: case-insensitivity, flag combos, $HOME, more verbs."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # R4-F1: regex was case-sensitive, uppercase bypassed
+            "rm -RF /",
+            "rm -RF ~",
+            "RM -rf /",
+            "Rm -rF ~",
+            "rm -rF /",
+            # R4-F2: flag combinations beyond -rf
+            "rm -rfv /",
+            "rm -rfv ~",
+            "rm -rvf ~",
+            "rm -vrf /",
+            "rm -rfi /",
+            "rm -rfI ~",
+            # R4-F3: env-var home expansion
+            "rm -rf $HOME",
+            "rm -rf ${HOME}",
+            "rm -rf $USER",
+            "rm -rf ${USER}",
+            "find $HOME -delete",
+            "find ${HOME} -delete",
+            # R4-F5: additional destructive verbs
+            "> /etc/passwd",
+            "> /etc/shadow",
+            "> /etc/sudoers",
+            ">/etc/gshadow",  # no space
+            "blkdiscard /dev/sda",
+            "sgdisk -Z /dev/sda",
+            "sgdisk -z /dev/nvme0n1",
+            "parted /dev/sda mklabel gpt",
+            "fdisk /dev/sda",
+            "fdisk /dev/sdb",
+        ],
+    )
+    def test_r4_bypass_attempts_blocked(self, command: str) -> None:
+        assert _is_dangerous_command(command) is True, (
+            f"R4 regex must block: {command!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Must remain allowed — common admin commands
+            "shred --help",
+            "wipefs --help",
+            "parted --version",
+            "fdisk --help",
+            "find /var/log -mtime +30",
+            "find . -name '*.py'",
+            "> /var/log/app.log",
+            "> /tmp/output.txt",
+            "rm file.txt",
+            "rm -f file.txt",
+            "rm -rf ./build",
+            "rm -rf ../dist",
+        ],
+    )
+    def test_r4_safe_commands_allowed(self, command: str) -> None:
+        assert _is_dangerous_command(command) is False, (
+            f"R4 regex over-matched: {command!r}"
+        )
+
+
 class TestDangerousCommandR3Extensions:
     """Red Team R3 regex extensions: home-wipe, find-delete, shred, wipefs, spaced fork bomb."""
 

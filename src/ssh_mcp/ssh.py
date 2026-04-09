@@ -94,29 +94,52 @@ def _safe_log_value(value: Any) -> str:
 # patterns below catch the highest-frequency mistakes — they are NOT
 # expected to resist a motivated adversary. Operators who need real
 # isolation must sandbox at a lower layer (containers, SELinux, etc.).
+# Red Team R4 hardening: every pattern is compiled with ``re.IGNORECASE``
+# so ``rm -RF /`` / ``RM -rf /`` don't bypass. The rm-flag patterns use
+# lookaheads instead of ordered character classes so `-rfv`, `-vfr`,
+# `-rfvi` (any order with extra flags) all match.
 _DANGEROUS_PATTERNS = [
-    # Filesystem root wipe via rm -rf — catches both `/` and `~` (home)
-    # forms. The original R1/R2 regex only caught `/`; `rm -rf ~` was a
-    # trivial bypass fixed in R3.
-    re.compile(r"rm\s+-[rRfI]*r[rRfI]*f[rRfI]*\s+/"),
-    re.compile(r"rm\s+-[rRfI]*r[rRfI]*f[rRfI]*\s+~"),
+    # Filesystem root wipe via rm -rf — catches `/`, `~`, `$HOME`, `$USER`
+    # forms. Flag cluster must contain BOTH `r` and `f` anywhere, plus
+    # optional `v`, `i`, `I`, `d`, `h`, `n`, `N` flags in any order.
+    re.compile(
+        r"rm\s+-(?=[rfvhidIn]*r)(?=[rfvhidIn]*f)[rfvhidIn]+"
+        r"\s+(?:/|~|\$\{?HOME\}?|\$\{?USER\}?)",
+        re.IGNORECASE,
+    ),
     # Filesystem creation over raw devices
-    re.compile(r"mkfs"),
+    re.compile(r"mkfs", re.IGNORECASE),
     # dd to/from a block device
-    re.compile(r"dd\s+if="),
-    # Redirect into a block device
-    re.compile(r">\s*/dev/sd"),
-    re.compile(r">\s*/dev/nvme"),
+    re.compile(r"dd\s+if=", re.IGNORECASE),
+    # Redirect into a block device or system auth database
+    re.compile(r">\s*/dev/sd", re.IGNORECASE),
+    re.compile(r">\s*/dev/nvme", re.IGNORECASE),
+    re.compile(r">\s*/dev/hd", re.IGNORECASE),
+    re.compile(
+        r">\s*/etc/(passwd|shadow|gshadow|sudoers)\b",
+        re.IGNORECASE,
+    ),
     # chmod / chown on root or home
-    re.compile(r"chmod\s+-?R?\s*777\s+/"),
-    # find-based recursive delete — equivalent destructive power
-    re.compile(r"find\s+[/~][\w/~.-]*\s+.*-delete"),
-    re.compile(r"find\s+[/~][\w/~.-]*\s+.*-exec\s+rm\b"),
+    re.compile(r"chmod\s+-?R?\s*777\s+/", re.IGNORECASE),
+    # find-based recursive delete — equivalent destructive power. Match
+    # /, ~, $HOME roots; tolerate any expression between root and -delete.
+    re.compile(
+        r"find\s+(?:/|~|\$\{?HOME\}?)(?:\S*)?\s+.*-delete",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"find\s+(?:/|~|\$\{?HOME\}?)(?:\S*)?\s+.*-exec\s+rm\b",
+        re.IGNORECASE,
+    ),
     # Block-level wipes
-    re.compile(r"shred\s+(-\w*\s+)*/dev/"),
-    re.compile(r"wipefs\s+(-\w+\s+|--\w+\s+)*/dev/"),
-    # Classic fork bomb — original required adjacent (){ which missed
-    # the spaced variant. Tolerant regex handles both.
+    re.compile(r"shred\s+(-\w*\s+)*/dev/", re.IGNORECASE),
+    re.compile(r"wipefs\s+(-\w+\s+|--\w+\s+)*/dev/", re.IGNORECASE),
+    re.compile(r"blkdiscard\s+/dev/", re.IGNORECASE),
+    re.compile(r"sgdisk\s+-[Zz]\s+/dev/", re.IGNORECASE),
+    # Partition-table destruction
+    re.compile(r"parted\s+/dev/\S+\s+mklabel", re.IGNORECASE),
+    re.compile(r"fdisk\s+/dev/sd", re.IGNORECASE),
+    # Classic fork bomb — tolerates spaced variants.
     re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
 ]
 
