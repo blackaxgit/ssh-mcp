@@ -474,6 +474,12 @@ async def download_file(
     return await ssh.download(server, remote_path, local_path)
 
 
+# Minimum acceptable length for a bearer token. 16 chars ≈ 80 bits of
+# entropy if the source is random. Shorter values are rejected at startup
+# as likely to be typos, placeholders, or human-chosen weak secrets.
+_MIN_TOKEN_LENGTH: int = 16
+
+
 def _wrap_with_bearer_auth(inner_app: Any, token: str) -> Any:
     """Wrap an ASGI ``inner_app`` in a bearer-token auth Starlette wrapper.
 
@@ -482,13 +488,29 @@ def _wrap_with_bearer_auth(inner_app: Any, token: str) -> Any:
     full MCP session-manager lifespan.
 
     The middleware:
-      * Requires ``Authorization: Bearer <token>`` header on every request
+      * Requires ``Authorization: <scheme> <token>`` header on every request
+        where ``<scheme>`` is ``Bearer`` (case-insensitive per RFC 7235)
       * Uses ``hmac.compare_digest`` to prevent timing attacks on the secret
       * Returns 401 with ``WWW-Authenticate`` on missing/invalid credentials
       * Does NOT exempt any path — ssh-mcp exposes no OAuth discovery, and
         an unauthenticated health probe would leak server presence to
         scanners anyway
+
+    Red Team R3 hardening:
+      * Refuses empty or very short tokens — ``hmac.compare_digest('','')``
+        returns True, so an empty ``expected`` would bypass auth for any
+        ``Authorization: Bearer `` request.
+      * Accepts case-insensitive scheme per RFC 7235 §2.1.
+
+    Raises:
+        ValueError: if ``token`` is empty or shorter than ``_MIN_TOKEN_LENGTH``.
     """
+    if not token or len(token) < _MIN_TOKEN_LENGTH:
+        raise ValueError(
+            f"bearer token must be at least {_MIN_TOKEN_LENGTH} characters "
+            f"(got {len(token)}) — a short or empty token is a security risk"
+        )
+
     from starlette.applications import Starlette
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request
@@ -504,13 +526,17 @@ def _wrap_with_bearer_auth(inner_app: Any, token: str) -> Any:
             import hmac
 
             auth = request.headers.get("authorization", "")
-            if not auth.startswith("Bearer "):
+            # Case-insensitive scheme match per RFC 7235 §2.1. We split
+            # on the first whitespace so tab/multi-space between scheme
+            # and token is tolerated.
+            parts = auth.split(maxsplit=1)
+            if len(parts) != 2 or parts[0].lower() != "bearer":
                 return JSONResponse(
                     {"error": "missing bearer token"},
                     status_code=401,
                     headers={"WWW-Authenticate": 'Bearer realm="ssh-mcp"'},
                 )
-            supplied = auth[len("Bearer ") :]
+            supplied = parts[1]
             if not hmac.compare_digest(supplied, self._expected):
                 return JSONResponse(
                     {"error": "invalid bearer token"},
@@ -565,7 +591,9 @@ def _run_http() -> None:
 
     host = os.environ.get("SSH_MCP_HTTP_HOST", "127.0.0.1")
     port = int(os.environ.get("SSH_MCP_HTTP_PORT", "8000"))
-    token = os.environ.get("SSH_MCP_HTTP_TOKEN") or None
+    # M4: strip whitespace so env-file tokens with a trailing newline work
+    raw_token = os.environ.get("SSH_MCP_HTTP_TOKEN", "").strip()
+    token = raw_token or None
     stateless = os.environ.get("SSH_MCP_HTTP_STATELESS", "false").lower() == "true"
     allowed_hosts_env = os.environ.get("SSH_MCP_HTTP_ALLOWED_HOSTS", "").strip()
 
@@ -589,6 +617,20 @@ def _run_http() -> None:
         from mcp.server.transport_security import TransportSecuritySettings
 
         extra_hosts = [h.strip() for h in allowed_hosts_env.split(",") if h.strip()]
+        # H4: reject wildcards — they silently disable DNS-rebinding
+        # protection. An operator setting "*" almost certainly means
+        # "match my specific hostname" and doesn't realize the security
+        # implication. Fail loud instead of silently letting it through.
+        for entry in extra_hosts:
+            bare = entry.replace(":*", "").replace("*", "")
+            if not bare or entry in {"*", "*:*", "*.*"} or entry.startswith("*."):
+                if entry.startswith("*."):
+                    continue  # wildcard suffixes like *.internal.example.com are OK
+                raise RuntimeError(
+                    f"SSH_MCP_HTTP_ALLOWED_HOSTS wildcard entry {entry!r} "
+                    "would disable DNS-rebinding protection. "
+                    "Use a concrete hostname (e.g. 'ssh-mcp.internal:*') instead."
+                )
         existing = mcp.settings.transport_security
         default_origins = [
             "http://127.0.0.1:*",

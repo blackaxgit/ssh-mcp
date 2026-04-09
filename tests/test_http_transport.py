@@ -80,7 +80,7 @@ class TestBuildHttpApp:
 
     def test_with_token_wraps_app(self) -> None:
         """When token is set, middleware is registered on the wrapper."""
-        app = _build_http_app(token="secret-xyz")
+        app = _build_http_app(token="secret-xyz-abcdefghij")
         # The wrapper must expose user_middleware with at least one entry
         assert hasattr(app, "user_middleware")
         assert len(app.user_middleware) > 0
@@ -89,6 +89,87 @@ class TestBuildHttpApp:
 # ---------------------------------------------------------------------------
 # Bearer-token middleware behavior (Starlette TestClient)
 # ---------------------------------------------------------------------------
+
+
+class TestBearerAuthR3Hardening:
+    """Red Team R3 HIGH findings H2, H3, H4, M4."""
+
+    def test_wrap_rejects_empty_expected_token(self) -> None:
+        """H2: _wrap_with_bearer_auth must refuse empty string as expected.
+
+        Otherwise hmac.compare_digest('', '') returns True and any client
+        sending 'Authorization: Bearer ' authenticates.
+        """
+        dummy = _make_dummy_asgi_app()
+        with pytest.raises(ValueError, match="token"):
+            _wrap_with_bearer_auth(dummy, "")
+
+    def test_wrap_rejects_very_short_tokens(self) -> None:
+        """H2 follow-up: tokens under a reasonable minimum are suspicious."""
+        dummy = _make_dummy_asgi_app()
+        with pytest.raises(ValueError, match="token"):
+            _wrap_with_bearer_auth(dummy, "abc")
+
+    def test_bearer_scheme_is_case_insensitive(self) -> None:
+        """H3: RFC 7235 says scheme is case-insensitive. Accept any casing."""
+        wrapped = _wrap_with_bearer_auth(
+            _make_dummy_asgi_app(), "correct-token-longenough"
+        )
+        client = TestClient(wrapped)
+        for scheme in ("Bearer", "bearer", "BEARER", "BeArEr"):
+            resp = client.get(
+                "/mcp", headers={"Authorization": f"{scheme} correct-token-longenough"}
+            )
+            assert resp.status_code == 200, f"Scheme {scheme!r} must authenticate"
+
+    def test_wildcard_allowed_hosts_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """H4: SSH_MCP_HTTP_ALLOWED_HOSTS=* silently disables DNS rebinding.
+
+        Reject at startup with a clear error so operators can't neutralize
+        the protection by accident.
+        """
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_ALLOWED_HOSTS", "*")
+        with pytest.raises(RuntimeError, match="wildcard"):
+            _run_http()
+
+    def test_wildcard_in_list_also_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A wildcard anywhere in the comma list disables protection."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_ALLOWED_HOSTS", "ssh-mcp.internal:*,*:*")
+        with pytest.raises(RuntimeError, match="wildcard"):
+            _run_http()
+
+    def test_token_whitespace_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """M4: SSH_MCP_HTTP_TOKEN with trailing whitespace (common from .env
+        files that append ``\\n``) must be stripped before being handed to
+        the middleware, or the server will never authenticate requests.
+
+        Verified by patching ``_build_http_app`` so we can capture the
+        token that was actually passed through.
+        """
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN", "  secret-token-longenough\n\t ")
+
+        from unittest.mock import patch
+
+        captured: list[str | None] = []
+
+        def fake_build(token):  # type: ignore[no-untyped-def]
+            captured.append(token)
+            return _make_dummy_asgi_app()
+
+        with patch("ssh_mcp.server._build_http_app", side_effect=fake_build):
+            with patch("uvicorn.run"):
+                _run_http()
+
+        assert captured == ["secret-token-longenough"], (
+            f"Token not stripped: got {captured!r}"
+        )
 
 
 class TestBearerTokenMiddleware:
@@ -108,7 +189,7 @@ class TestBearerTokenMiddleware:
 
     def test_missing_auth_returns_401(self) -> None:
         """No Authorization header → 401 with WWW-Authenticate challenge."""
-        client = self._make_client_with_token("correct-token")
+        client = self._make_client_with_token("correct-token-longenough")
         resp = client.get("/mcp")
         assert resp.status_code == 401
         assert "bearer" in resp.headers.get("www-authenticate", "").lower()
@@ -116,36 +197,39 @@ class TestBearerTokenMiddleware:
 
     def test_wrong_scheme_returns_401(self) -> None:
         """Basic auth or other schemes must be rejected."""
-        client = self._make_client_with_token("correct-token")
+        client = self._make_client_with_token("correct-token-longenough")
         resp = client.get("/mcp", headers={"Authorization": "Basic dXNlcjpwYXNz"})
         assert resp.status_code == 401
 
     def test_wrong_token_returns_401(self) -> None:
         """Correct scheme but wrong value → 401, NOT 200."""
-        client = self._make_client_with_token("correct-token")
+        client = self._make_client_with_token("correct-token-longenough")
         resp = client.get("/mcp", headers={"Authorization": "Bearer wrong-token"})
         assert resp.status_code == 401
         assert "invalid" in resp.json()["error"].lower()
 
     def test_correct_token_reaches_downstream(self) -> None:
         """Correct bearer token must pass the auth gate AND hit downstream."""
-        client = self._make_client_with_token("correct-token")
+        client = self._make_client_with_token("correct-token-longenough")
         resp = client.get(
             "/mcp",
-            headers={"Authorization": "Bearer correct-token"},
+            headers={"Authorization": "Bearer correct-token-longenough"},
         )
         assert resp.status_code == 200
         assert resp.text == "downstream ok"
 
     def test_case_sensitive_token_comparison(self) -> None:
         """Token mismatch by case must fail — we use hmac.compare_digest."""
-        client = self._make_client_with_token("CorrectToken")
-        resp = client.get("/mcp", headers={"Authorization": "Bearer correcttoken"})
+        client = self._make_client_with_token("CorrectTokenLongEnough")
+        resp = client.get(
+            "/mcp",
+            headers={"Authorization": "Bearer correcttokenlongenough"},
+        )
         assert resp.status_code == 401
 
     def test_empty_token_value_rejected(self) -> None:
         """``Authorization: Bearer `` (empty) must be rejected."""
-        client = self._make_client_with_token("secret")
+        client = self._make_client_with_token("secret-long-token-val")
         resp = client.get("/mcp", headers={"Authorization": "Bearer "})
         assert resp.status_code == 401
 
@@ -191,7 +275,7 @@ class TestRunHttpSafetyGate:
     ) -> None:
         """With a token, non-localhost binds are allowed (uvicorn mocked)."""
         monkeypatch.setenv("SSH_MCP_HTTP_HOST", "0.0.0.0")
-        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN", "s3cret")
+        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN", "s3cret-long-token-val")
         with patch("uvicorn.run") as mock_run:
             _run_http()
         mock_run.assert_called_once()
