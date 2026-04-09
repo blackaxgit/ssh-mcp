@@ -884,9 +884,7 @@ class SSHManager:
             try:
                 conn.close()
                 await conn.wait_closed()
-                logger.info(
-                    "Closed connection to %s", _safe_log_value(server_name)
-                )
+                logger.info("Closed connection to %s", _safe_log_value(server_name))
             except Exception as e:
                 logger.warning(
                     "Error closing connection to %s: %s",

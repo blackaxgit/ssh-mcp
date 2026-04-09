@@ -545,9 +545,7 @@ t = {{ description = "t" }}
 description = "t"
 groups = ["t"]
 """
-        f = tempfile.NamedTemporaryFile(
-            suffix=".toml", mode="w", delete=False
-        )
+        f = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
         f.write(toml)
         f.close()
         return ServerRegistry(f.name)
