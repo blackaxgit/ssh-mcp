@@ -292,6 +292,56 @@ class TestRunHttpSafetyGate:
             _run_http()
         mock_run.assert_called_once()
 
+    @pytest.mark.parametrize(
+        "host",
+        [
+            # Canonical IPv4/IPv6 loopback
+            "127.0.0.1",
+            "::1",
+            # Green Team H5: non-canonical but still loopback
+            "127.0.0.2",  # anywhere in 127.0.0.0/8
+            "127.1.2.3",
+            "0:0:0:0:0:0:0:1",  # expanded IPv6 ::1
+            "0000:0000:0000:0000:0000:0000:0000:0001",  # full expansion
+            "::ffff:127.0.0.1",  # IPv4-mapped IPv6 loopback
+            "::ffff:127.5.5.5",
+        ],
+    )
+    def test_loopback_variants_allowed_without_token(
+        self, monkeypatch: pytest.MonkeyPatch, host: str
+    ) -> None:
+        """Green Team H5: all loopback IP forms must be treated as localhost."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", host)
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        with patch("uvicorn.run") as mock_run:
+            _run_http()
+        mock_run.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            # Non-loopback IPs that must require a token
+            "0.0.0.0",
+            "10.0.0.5",
+            "192.168.1.10",
+            "8.8.8.8",
+            "::",  # IPv6 unspecified — binds to all
+            "fe80::1",  # link-local
+            "2001:db8::1",  # documentation range
+            # Hostnames that aren't "localhost"
+            "example.com",
+            "server.internal",
+        ],
+    )
+    def test_non_loopback_hosts_require_token(
+        self, monkeypatch: pytest.MonkeyPatch, host: str
+    ) -> None:
+        """Green Team H5: every non-loopback address must fail-secure."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", host)
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        with pytest.raises(RuntimeError, match="SSH_MCP_HTTP_TOKEN must be set"):
+            _run_http()
+
     def test_port_env_var_honored(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
         monkeypatch.setenv("SSH_MCP_HTTP_PORT", "9001")

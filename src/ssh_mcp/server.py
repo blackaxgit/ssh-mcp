@@ -600,7 +600,18 @@ def _run_http() -> None:
     # Security gate: refuse to expose the server to non-localhost traffic
     # without a token. Localhost binds remain unauthenticated because they
     # match the historical stdio deployment model (single-user workstation).
-    is_localhost = host in {"127.0.0.1", "localhost", "::1"}
+    #
+    # Green Team Round 1 finding H5: use ``ipaddress.ip_address().is_loopback``
+    # so non-canonical forms (``::ffff:127.0.0.1``, ``0:0:0:0:0:0:0:1``,
+    # entire 127.0.0.0/8 block) are correctly classified. Fall back to a
+    # string match for hostnames that aren't valid IP literals.
+    import ipaddress
+
+    try:
+        is_localhost = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # Hostname (not an IP literal) — fall back to the known-safe names
+        is_localhost = host.lower() in {"localhost"}
     if not is_localhost and token is None:
         raise RuntimeError(
             f"SSH_MCP_HTTP_TOKEN must be set when binding to {host!r}. "
