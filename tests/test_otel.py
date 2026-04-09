@@ -12,6 +12,8 @@ from collections.abc import Iterator
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -134,6 +136,63 @@ class TestSSHExecuteTracing:
             )
         # But the length IS recorded
         assert span.attributes["ssh.command_length"] == len(secret_cmd)
+
+
+class TestOTelCommandPrivacyFuzz:
+    """Green Team H4: Hypothesis fuzz test for command-content privacy.
+
+    The substring-based check above only catches two literal tokens —
+    a mutation that accidentally added a ``span.set_attribute("ssh.cmd",
+    command)`` line would pass the above test for any command not
+    containing ``hunter2`` or ``password=``. This property-based test
+    generates arbitrary command strings and verifies that NONE of the
+    characters in the command appear in any span attribute value.
+    """
+
+    @given(
+        st.text(
+            alphabet=st.characters(
+                # Printable ASCII including symbols, plus a handful of
+                # common Unicode control characters. Excludes null and
+                # other bytes that would break asyncssh regardless.
+                min_codepoint=0x21,
+                max_codepoint=0x7E,
+            ),
+            min_size=16,
+            max_size=100,
+        )
+    )
+    def test_no_command_characters_in_spans(self, secret: str) -> None:
+        """Property: a secret long enough to be unique must NEVER appear
+        verbatim in any span attribute value.
+
+        Generating secrets of length ≥16 with printable ASCII makes them
+        statistically impossible to occur as substrings of the hardcoded
+        attribute names or status strings — so any match is a real leak.
+        """
+        import asyncio
+
+        import ssh_mcp.ssh as ssh_module
+
+        _exporter.clear()
+
+        with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
+            manager = SSHManager(_make_registry(), Settings())
+            with patch.object(
+                manager,
+                "_get_connection",
+                AsyncMock(side_effect=OSError("no net")),
+            ):
+                asyncio.run(manager.execute("test-host", secret))
+
+        spans = _exporter.get_finished_spans()
+        assert len(spans) >= 1
+        for span in spans:
+            for key, value in span.attributes.items():
+                assert secret not in str(value), (
+                    f"Command leaked: secret={secret!r} in "
+                    f"attribute {key}={value!r}"
+                )
 
 
 class TestNoOpWhenTracerUnavailable:
