@@ -76,16 +76,112 @@ _DANGEROUS_PATTERNS = [
     re.compile(r":\(\)\{\s*:\|:&\s*\};:"),  # fork bomb
 ]
 
-# Sensitive paths that should be blocked in SFTP operations
+# Sensitive paths that should be blocked in SFTP operations.
+#
+# Matches are substring-based AFTER path normalization (see _normalize_path).
+# Normalization collapses double slashes and dot components so that
+# ``/etc//shadow`` and ``/etc/./shadow`` are caught. Entries without a
+# leading ``/`` match anywhere in the normalized path (e.g. ``.aws/credentials``
+# catches both ``/home/alice/.aws/credentials`` and ``/root/.aws/credentials``).
+#
+# SSH public keys (``*.pub``) are explicitly exempted in ``_is_sensitive_path``
+# because publishing public keys via SFTP is a legitimate operation.
 _SENSITIVE_PATHS = [
+    # Unix system secrets
     "/etc/shadow",
+    "/etc/gshadow",
     "/etc/passwd",
+    "/etc/sudoers",
+    "/etc/ssh/ssh_host_",  # private host keys
+    # SSH key material (relative match — catches any home dir)
     ".ssh/authorized_keys",
     ".ssh/id_rsa",
     ".ssh/id_ed25519",
     ".ssh/id_ecdsa",
     ".ssh/id_dsa",
+    ".ssh/identity",
+    # Cloud provider credentials
+    ".aws/credentials",
+    ".aws/config",
+    ".azure/accesstokens.json",
+    ".config/gcloud/credentials.db",
+    ".config/gcloud/access_tokens.db",
+    # Kubernetes secrets
+    ".kube/config",
+    "/etc/kubernetes/admin.conf",
+    "/etc/kubernetes/kubelet.conf",
+    "/var/lib/kubelet/pki/",
+    # Shell credential caches and developer secrets
+    ".netrc",
+    ".pgpass",
+    ".git-credentials",
+    ".docker/config.json",
+    # Kernel / process memory
+    "/proc/self/mem",
+    "/proc/self/environ",
+    "/proc/kcore",
+    "/proc/kallsyms",
+    # Database data files
+    "/var/lib/mysql/",
+    "/var/lib/postgresql/",
+    "/var/lib/mongodb/",
+    # Windows (OpenSSH Windows server)
+    "\\windows\\system32\\config\\sam",
+    "\\windows\\system32\\config\\security",
+    "\\users\\administrator\\.ssh\\",
 ]
+
+
+def _normalize_path(path: str) -> str:
+    """Normalize a path for substring-based sensitive-path matching.
+
+    Uses ``posixpath.normpath`` which collapses ``//`` → ``/`` and removes
+    ``./`` components, so ``/etc//shadow`` and ``/etc/./shadow`` both
+    normalize to ``/etc/shadow``. Lowercases the result so matching is
+    case-insensitive (defends against ``/ETC/SHADOW`` on case-insensitive
+    filesystems and caseless-hostname shells).
+
+    Does NOT resolve ``..`` components (path traversal is caught earlier
+    by a separate check) and does NOT follow symlinks (those require
+    filesystem access).
+
+    Args:
+        path: Raw path as supplied by the caller.
+
+    Returns:
+        Lowercased, normalized path suitable for substring matching.
+    """
+    import posixpath
+
+    return posixpath.normpath(path).lower()
+
+
+# Regex guard for ``/proc/<pid>/{environ,mem,cmdline,maps,stack}`` which
+# can reveal secrets from any running process. Covers ``/proc/self/...``
+# AND arbitrary numeric PIDs. Kept separate from ``_SENSITIVE_PATHS`` because
+# substring matching can't express "digits here".
+_PROC_SENSITIVE_RE = re.compile(
+    r"/proc/(self|\d+)/(environ|mem|cmdline|maps|stack|status)",
+    re.IGNORECASE,
+)
+
+
+def _is_sensitive_path(path: str) -> bool:
+    """Return True if ``path`` resolves to a sensitive location.
+
+    Normalizes before matching so obfuscations like ``/etc//shadow`` and
+    ``/etc/./shadow`` are caught. Exempts ``*.pub`` files so legitimate
+    SSH public-key uploads work.
+    """
+    if path.endswith(".pub"):
+        return False
+    normalized = _normalize_path(path)
+    if _PROC_SENSITIVE_RE.search(normalized):
+        return True
+    for sensitive in _SENSITIVE_PATHS:
+        if sensitive.lower() in normalized:
+            return True
+    return False
 
 
 def _is_dangerous_command(command: str) -> bool:
@@ -114,6 +210,9 @@ def _is_dangerous_command(command: str) -> bool:
 def _validate_remote_path(path: str) -> None:
     """Validate remote path for SFTP operations.
 
+    Normalizes the path before checking so obfuscations like ``/etc//shadow``
+    and ``/etc/./shadow`` are caught.
+
     Args:
         path: Remote path to validate
 
@@ -122,19 +221,17 @@ def _validate_remote_path(path: str) -> None:
     """
     # Block parent directory traversal
     if ".." in path:
-        raise ValueError(f"Path traversal detected: {path}")
+        raise ValueError(f"Path traversal detected: {path!r}")
 
-    # Block access to sensitive paths
-    normalized_path = path.lower()
-    for sensitive in _SENSITIVE_PATHS:
-        if sensitive in normalized_path:
-            raise ValueError(f"Access to sensitive path blocked: {path}")
+    if _is_sensitive_path(path):
+        raise ValueError(f"Access to sensitive path blocked: {path!r}")
 
 
 def _validate_local_path(path: str) -> None:
     """Validate local path for SFTP operations.
 
-    Prevents reading/writing arbitrary files on the MCP host.
+    Prevents reading/writing arbitrary files on the MCP host. Same
+    normalization rules as ``_validate_remote_path``.
 
     Args:
         path: Local path to validate
@@ -144,13 +241,10 @@ def _validate_local_path(path: str) -> None:
     """
     # Block parent directory traversal
     if ".." in path:
-        raise ValueError(f"Path traversal detected: {path}")
+        raise ValueError(f"Path traversal detected: {path!r}")
 
-    # Block access to sensitive paths
-    normalized_path = path.lower()
-    for sensitive in _SENSITIVE_PATHS:
-        if sensitive in normalized_path:
-            raise ValueError(f"Access to sensitive path blocked: {path}")
+    if _is_sensitive_path(path):
+        raise ValueError(f"Access to sensitive path blocked: {path!r}")
 
 
 class SSHManager:

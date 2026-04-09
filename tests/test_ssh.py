@@ -288,9 +288,12 @@ class TestValidateRemotePath:
             "/opt/app/config.yaml",
             "/srv/www/index.html",
             "/etc/nginx/nginx.conf",
-            "/var/lib/mysql/data",
+            # NOTE: /var/lib/mysql/ is deliberately NOT in this list — Red Team
+            # R3 added it to _SENSITIVE_PATHS because direct filesystem access
+            # to database data files can exfiltrate tables/secrets.
             "/usr/local/bin/script.sh",
-            "/backups/2024-01-01/dump.sql",
+            "/backups/2026-01-01/dump.sql",
+            "/home/user/.ssh/id_ed25519.pub",  # public keys are legitimate
         ],
         ids=lambda p: p.replace("/", "_")[:50],
     )
@@ -319,9 +322,26 @@ class TestValidateRemotePath:
             _validate_remote_path("/tmp/my..file")
 
     def test_sensitive_paths_list_coverage(self) -> None:
-        """Every entry in _SENSITIVE_PATHS triggers a ValueError."""
+        """Every entry in _SENSITIVE_PATHS triggers a ValueError.
+
+        Directory-style entries (ending with ``/``) are tested by appending
+        a child filename. File-style absolute entries are tested as-is.
+        Relative entries (``.ssh/id_rsa``) are prepended with a home dir.
+        Windows ``\\...`` entries are covered separately since substring
+        matching on backslashes is awkward inside test strings.
+        """
         for sensitive in _SENSITIVE_PATHS:
-            path = f"/home/user/{sensitive}"
+            if sensitive.startswith("\\"):
+                continue  # Windows entries — covered by TestExpandedSensitiveAllowlist
+            if sensitive.endswith("/"):
+                # Directory — test with a file inside
+                path = sensitive + "secret.txt"
+            elif sensitive.startswith("/"):
+                # Absolute file — test as-is
+                path = sensitive
+            else:
+                # Relative — prepend a home
+                path = f"/home/user/{sensitive}"
             with pytest.raises(ValueError, match="sensitive"):
                 _validate_remote_path(path)
 
@@ -494,13 +514,116 @@ class TestValidateLocalPath:
 
     def test_sensitive_local_paths_list_coverage(self) -> None:
         for sensitive in _SENSITIVE_PATHS:
-            path = (
-                f"/home/user/{sensitive}"
-                if not sensitive.startswith("/")
-                else sensitive
-            )
+            if sensitive.startswith("\\"):
+                continue
+            if sensitive.endswith("/"):
+                path = sensitive + "secret.txt"
+            elif sensitive.startswith("/"):
+                path = sensitive
+            else:
+                path = f"/home/user/{sensitive}"
             with pytest.raises(ValueError):
                 _validate_local_path(path)
+
+
+# ---------------------------------------------------------------------------
+# Red-team hardening: path normalization + expanded allowlist (RT-Fix 1)
+# ---------------------------------------------------------------------------
+
+
+class TestPathNormalizationBypasses:
+    """Paths that resolve to sensitive files must be blocked after normalization.
+
+    Red Team R3 finding C1: ``/etc//shadow`` and ``/etc/./shadow`` are both
+    valid Unix paths that resolve to ``/etc/shadow``, but the naive substring
+    check in the original implementation missed them.
+    """
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/etc//shadow",
+            "/etc/./shadow",
+            "/etc/././shadow",
+            "/etc//./shadow",
+            "//etc/shadow",
+            "/etc///shadow",
+            "/./etc/shadow",
+            "/./etc/./shadow",
+        ],
+    )
+    def test_double_slash_bypass_blocked(self, path: str) -> None:
+        """Double-slash and dot-slash obfuscations of /etc/shadow must fail."""
+        with pytest.raises(ValueError):
+            _validate_remote_path(path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/etc//shadow",
+            "/etc/./shadow",
+        ],
+    )
+    def test_double_slash_bypass_blocked_local(self, path: str) -> None:
+        """Same protection for local SFTP paths."""
+        with pytest.raises(ValueError):
+            _validate_local_path(path)
+
+
+class TestExpandedSensitiveAllowlist:
+    """Cloud credentials, k8s secrets, proc memory, Windows paths all blocked.
+
+    Red Team R3 finding C2: the original allowlist only covered classic Unix
+    system files and SSH keys. Modern infrastructure hosts cloud tokens and
+    k8s kubeconfigs that are equally sensitive.
+    """
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Cloud credentials
+            "/home/user/.aws/credentials",
+            "/home/user/.aws/config",
+            "/home/user/.azure/accessTokens.json",
+            "/home/user/.config/gcloud/credentials.db",
+            # Kubernetes
+            "/home/user/.kube/config",
+            "/var/lib/kubelet/pki/kubelet-client.key",
+            "/etc/kubernetes/admin.conf",
+            # Shell credential caches
+            "/home/user/.netrc",
+            "/home/user/.pgpass",
+            "/home/user/.git-credentials",
+            "/home/user/.docker/config.json",
+            # Process memory / kernel
+            "/proc/self/mem",
+            "/proc/self/environ",
+            "/proc/1234/environ",
+            "/proc/kcore",
+            # Database data files
+            "/var/lib/mysql/mysql/user.MYD",
+            "/var/lib/postgresql/16/main/base/1/",
+            # Additional Unix secrets
+            "/etc/sudoers",
+            "/etc/gshadow",
+        ],
+    )
+    def test_sensitive_path_blocked(self, path: str) -> None:
+        with pytest.raises(ValueError):
+            _validate_remote_path(path)
+
+    def test_ssh_pub_key_allowed(self) -> None:
+        """.pub keys are NOT secret — allow SFTP upload/download of public keys.
+
+        Red Team R3 finding H5: the previous substring match blocked
+        ``id_ed25519.pub`` because it contains the substring ``id_ed25519``.
+        This broke legitimate public-key distribution via SFTP.
+        """
+        _validate_remote_path("/home/user/.ssh/id_ed25519.pub")
+        _validate_remote_path("/home/user/.ssh/id_rsa.pub")
+        _validate_remote_path("/home/user/.ssh/id_ecdsa.pub")
+        _validate_remote_path("/home/user/.ssh/id_dsa.pub")
+        _validate_local_path("/tmp/deploy_key.pub")
 
 
 # ---------------------------------------------------------------------------
