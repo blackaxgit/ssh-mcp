@@ -139,7 +139,9 @@ claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx ssh-mcp
 | `SSH_MCP_TRANSPORT` | `stdio` | MCP transport. `stdio` = classic subprocess transport (default, used by Claude Desktop / Claude Code via `uvx ssh-mcp`). `http` or `streamable-http` = run as a network service over MCP streamable HTTP. |
 | `SSH_MCP_HTTP_HOST` | `127.0.0.1` | Bind address for HTTP transport. **Binding to any non-localhost value (e.g. `0.0.0.0`) REQUIRES `SSH_MCP_HTTP_TOKEN` — startup aborts otherwise.** |
 | `SSH_MCP_HTTP_PORT` | `8000` | TCP port for HTTP transport. |
-| `SSH_MCP_HTTP_TOKEN` | — | Shared bearer secret. When set, every request must carry `Authorization: Bearer <token>` (scheme case-insensitive per RFC 7235) or receive HTTP 401. Mandatory for non-localhost binds. Minimum length 16 characters — shorter tokens are rejected at startup. Leading/trailing whitespace is stripped so `.env` files with trailing newlines work as expected. |
+| `SSH_MCP_HTTP_TOKEN` | — | Shared bearer secret. When set, every request must carry `Authorization: Bearer <token>` (scheme case-insensitive per RFC 7235) or receive HTTP 401. Mandatory for non-localhost binds (unless `SSH_MCP_HTTP_AUTH=none`). Minimum length 16 characters — shorter tokens are rejected at startup. Leading/trailing whitespace is stripped so `.env` files with trailing newlines work as expected. |
+| `SSH_MCP_HTTP_AUTH` | `bearer` | Authentication mode. `bearer` (default) enables the built-in middleware. `none` disables it entirely — useful when ssh-mcp sits behind a trusted reverse proxy that handles auth at the edge. Combining `none` with a non-localhost bind REQUIRES the explicit acknowledgement env var below. |
+| `SSH_MCP_HTTP_NETWORK_NO_AUTH` | — | Magic-string escape hatch. Must equal literal `I_ACCEPT_RCE_RISK` to allow `SSH_MCP_HTTP_AUTH=none` + non-localhost bind. Intentionally verbose so nobody sets it by accident. |
 | `SSH_MCP_HTTP_STATELESS` | `false` | Set to `true` for stateless sessions (recommended for load-balanced or serverless deployments). Default is stateful with server-side sessions. |
 | `SSH_MCP_HTTP_ALLOWED_HOSTS` | — | Comma-separated extra Host-header values the SDK's DNS-rebinding protection should permit (e.g. `ssh-mcp.internal:*,api.example.com:8000`). Localhost aliases are always permitted. |
 | `HYPOTHESIS_PROFILE` | `dev` | For local development / CI only. Set to `ci` to run property-based tests with `max_examples=200` instead of `50`. |
@@ -187,6 +189,32 @@ Host: ssh-mcp.internal
 ```
 
 For stateful sessions (default), FastMCP maintains per-client context across requests. For stateless deployments behind a load balancer, set `SSH_MCP_HTTP_STATELESS=true` — each request is handled independently with no server-side session.
+
+### Reverse proxy deployment (auth at the edge)
+
+If your reverse proxy (Caddy, nginx, Traefik, Envoy, Cloudflare Access, etc.) already authenticates requests before they reach ssh-mcp, you can disable the built-in bearer middleware with `SSH_MCP_HTTP_AUTH=none`. This mode is deliberately hard to enable on a public bind — you must also set a verbose acknowledgement env var:
+
+```bash
+docker run -d \
+  --network internal \
+  -e SSH_MCP_TRANSPORT=http \
+  -e SSH_MCP_HTTP_HOST=0.0.0.0 \
+  -e SSH_MCP_HTTP_AUTH=none \
+  -e SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK \
+  -e SSH_MCP_HTTP_ALLOWED_HOSTS='ssh-mcp.internal:*' \
+  -v ~/.ssh:/home/sshmcp/.ssh:ro \
+  -v ./servers.toml:/config/servers.toml:ro \
+  -e SSH_MCP_CONFIG=/config/servers.toml \
+  ghcr.io/blackaxgit/ssh-mcp:latest
+```
+
+**WARNING:** `SSH_MCP_HTTP_AUTH=none` + `SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK` is a remote code execution surface. The magic-string acknowledgement exists so operators physically type the words "I ACCEPT RCE RISK" before opting in. Every tool call reaches a shell on every managed SSH server. Use this only when:
+
+1. ssh-mcp is on a **private Docker network** not reachable from the host's public interface, AND
+2. The reverse proxy fronting it enforces authentication (basic auth, OAuth, mTLS, Cloudflare Access, etc.), AND
+3. You have audit logging on the proxy that's immutable to the ssh-mcp process.
+
+For localhost binds without auth, no acknowledgement is needed — that matches the historical stdio deployment model.
 
 ### Config file location
 
