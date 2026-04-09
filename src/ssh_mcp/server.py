@@ -552,70 +552,121 @@ def _wrap_with_bearer_auth(inner_app: Any, token: str) -> Any:
 def _build_http_app(token: str | None) -> Any:
     """Return the Starlette ASGI app for streamable HTTP transport.
 
-    When ``token`` is provided, wraps the FastMCP app in a bearer-token
-    authentication middleware via ``_wrap_with_bearer_auth``. ``ssh-mcp``
-    executes shell commands on remote servers, so running the HTTP
-    transport without authentication is a serious risk — the CLI entry
-    point enforces this for non-local binds before reaching this function.
+    Assembles a SINGLE outer Starlette app containing:
 
-    Adds a Starlette lifespan handler (Green Team H1 fix) that closes
-    the pooled SSH manager on shutdown. Without this, SIGTERM to uvicorn
-    would exit the process without draining connections — in-flight tool
-    calls return 500s mid-stream and SSH sessions are left dangling for
-    the OS to reap.
+    1. The FastMCP streamable HTTP app mounted under ``/``
+    2. A ``lifespan`` that chains the FastMCP session-manager lifespan
+       so its internal task group is initialized — without this every
+       request returns HTTP 500 with ``RuntimeError('Task group is
+       not initialized')``.
+    3. On shutdown, drains the pooled SSH manager BEFORE exiting the
+       inner lifespan so ``_ssh.close_all()`` can still dispatch
+       traffic on a live event loop.
+    4. If ``token`` is provided, a bearer-auth middleware is attached
+       to THIS outer app (not a separate wrapper) so the middleware
+       runs inside the same lifespan context as the FastMCP app.
 
-    Returns a Starlette app (either the raw FastMCP one or a wrapper).
-    """
-    app = mcp.streamable_http_app()
-    if token is None:
-        wrapped = _install_shutdown_lifespan(app)
-        return wrapped
-    return _wrap_with_bearer_auth(_install_shutdown_lifespan(app), token)
+    Earlier versions (v0.3.0) built three nested Starlette apps:
+    bearer wrapper → shutdown-lifespan wrapper → FastMCP. Only the
+    outermost lifespan ran, so the FastMCP task group was never
+    initialized. This single-app approach fixes that regression.
 
-
-def _install_shutdown_lifespan(inner_app: Any) -> Any:
-    """Mount ``inner_app`` inside a Starlette wrapper with a shutdown hook.
-
-    The FastMCP streamable HTTP app already has its own lifespan (the
-    session-manager task group), so we can't simply replace it. Instead
-    we mount the FastMCP app under ``/`` and attach a separate lifespan
-    to the outer wrapper. Starlette runs both lifespans in order, so
-    the FastMCP session manager starts first and our shutdown hook
-    runs after ours on the way down.
+    Returns a ``Starlette`` instance ready to hand to ``uvicorn.run``.
     """
     from contextlib import asynccontextmanager
 
     from starlette.applications import Starlette
     from starlette.routing import Mount
 
+    inner_app = mcp.streamable_http_app()
+
     @asynccontextmanager
     async def _lifespan(_app: Starlette) -> Any:
-        # Startup: nothing to do — SSH manager is lazy-initialized on
-        # first tool call. We COULD eagerly call _init() here to surface
-        # config errors at boot time instead of first-request, but that
-        # changes the operator-observable behavior. Leaving as-is.
-        yield
-        # Shutdown: close the SSH manager if it was initialized. The
-        # ``atexit`` handler in ``_init()`` is still registered as a
-        # belt-and-suspenders backup, but this lifespan path runs
-        # inside the event loop so it can ``await`` cleanly.
-        global _ssh
-        if _ssh is not None:
-            logger.info("Draining SSH connections on HTTP shutdown")
+        # Step 1: start the FastMCP session manager's task group via
+        # its own lifespan context.
+        async with inner_app.router.lifespan_context(inner_app):
             try:
-                await _ssh.close_all()
-                logger.info("SSH connections drained cleanly")
-            except Exception as e:
-                logger.warning(
-                    "Error draining SSH connections: %s",
-                    e,
-                    exc_info=True,
-                )
+                yield
+            finally:
+                # Step 2: drain SSH BEFORE exiting the inner lifespan
+                # so close_all() can still dispatch on a live event loop.
+                global _ssh
+                if _ssh is not None:
+                    logger.info("Draining SSH connections on HTTP shutdown")
+                    try:
+                        await _ssh.close_all()
+                        logger.info("SSH connections drained cleanly")
+                    except Exception as e:
+                        logger.warning(
+                            "Error draining SSH connections: %s",
+                            e,
+                            exc_info=True,
+                        )
 
-    return Starlette(
+    app = Starlette(
         routes=[Mount("/", app=inner_app)],
         lifespan=_lifespan,
     )
+
+    if token is not None:
+        # Validate token before attaching so bad tokens fail fast at
+        # ``_build_http_app`` call time, not on the first request.
+        _assert_valid_bearer_token(token)
+        _BearerAuth = _make_bearer_auth_middleware()
+        app.add_middleware(_BearerAuth, expected=token)
+
+    return app
+
+
+def _assert_valid_bearer_token(token: str) -> None:
+    """Raise ValueError if ``token`` is too short or empty.
+
+    Same guard that ``_wrap_with_bearer_auth`` uses. Extracted so
+    ``_build_http_app`` can validate BEFORE installing middleware.
+    """
+    if not token or len(token) < _MIN_TOKEN_LENGTH:
+        raise ValueError(
+            f"bearer token must be at least {_MIN_TOKEN_LENGTH} characters "
+            f"(got {len(token)}) — a short or empty token is a security risk"
+        )
+
+
+def _make_bearer_auth_middleware() -> Any:
+    """Return the ``_BearerAuth`` middleware class.
+
+    Factored out of ``_wrap_with_bearer_auth`` so ``_build_http_app``
+    can attach it via ``app.add_middleware`` without constructing a
+    second Starlette wrapper.
+    """
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    class _BearerAuth(BaseHTTPMiddleware):
+        def __init__(self, wrapped_app: Any, expected: str) -> None:
+            super().__init__(wrapped_app)
+            self._expected = expected
+
+        async def dispatch(self, request: Request, call_next: Any) -> Any:
+            import hmac
+
+            auth = request.headers.get("authorization", "")
+            parts = auth.split(maxsplit=1)
+            if len(parts) != 2 or parts[0].lower() != "bearer":
+                return JSONResponse(
+                    {"error": "missing bearer token"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": 'Bearer realm="ssh-mcp"'},
+                )
+            supplied = parts[1]
+            if not hmac.compare_digest(supplied, self._expected):
+                return JSONResponse(
+                    {"error": "invalid bearer token"},
+                    status_code=401,
+                )
+            return await call_next(request)
+
+    return _BearerAuth
 
 
 def _run_http() -> None:

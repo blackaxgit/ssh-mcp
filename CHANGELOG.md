@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-09
+
+### Fixed
+
+- **CRITICAL: HTTP transport returned 500 on every authenticated request** — the graceful-shutdown lifespan wrapper introduced in v0.3.0 mounted the FastMCP streamable HTTP app as a sub-app and added its own Starlette lifespan. Starlette only runs top-level lifespans, so the FastMCP session manager's task group was never initialized and every request to `/mcp` failed with `RuntimeError('Task group is not initialized. Make sure to use run().')`. Fixed by collapsing the bearer middleware + shutdown-lifespan + FastMCP mount into a **single outer Starlette app** whose lifespan explicitly chains the FastMCP session-manager lifespan via `inner_app.router.lifespan_context(inner_app)`.
+- Regression test `test_authenticated_request_reaches_initialized_session_manager` drives an authenticated request through the real FastMCP app and asserts the task-group error does not appear in the response body.
+- Test-isolation fixture resets `mcp._session_manager` between tests so `StreamableHTTPSessionManager.run()` (which can only be called once per instance) works across multiple `TestClient` invocations.
+
 ## [0.3.0] - 2026-04-09
 
 ### Added
@@ -134,7 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.1.0...v0.1.1
