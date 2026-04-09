@@ -38,20 +38,30 @@ def _make_dummy_asgi_app():
 
 @pytest.fixture(autouse=True)
 def _reset_server_globals() -> Iterator[None]:
-    """Restore module-level FastMCP settings after each test.
+    """Restore module-level FastMCP settings and session manager between tests.
 
     ``_run_http`` mutates ``mcp.settings`` in place; without this fixture
     a test setting ``host = "0.0.0.0"`` would poison the next one.
+
+    Additionally, FastMCP caches a single ``StreamableHTTPSessionManager``
+    on ``mcp._session_manager`` and that manager's ``.run()`` context
+    manager raises on second entry. Multiple tests that drive the real
+    HTTP app through ``TestClient`` would collide on this singleton. We
+    reset it to ``None`` before each test so the next ``streamable_http_app``
+    call mints a fresh manager.
     """
     saved_host = server_module.mcp.settings.host
     saved_port = server_module.mcp.settings.port
     saved_stateless = server_module.mcp.settings.stateless_http
     saved_security = server_module.mcp.settings.transport_security
+    # Force a fresh session manager for this test
+    server_module.mcp._session_manager = None
     yield
     server_module.mcp.settings.host = saved_host
     server_module.mcp.settings.port = saved_port
     server_module.mcp.settings.stateless_http = saved_stateless
     server_module.mcp.settings.transport_security = saved_security
+    server_module.mcp._session_manager = None
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +158,42 @@ class TestBuildHttpApp:
         resp = client.get("/mcp")
         assert resp.status_code == 401
         assert "bearer" in resp.headers.get("www-authenticate", "").lower()
+
+    def test_authenticated_request_reaches_initialized_session_manager(
+        self,
+    ) -> None:
+        """Red Team R5 regression: production bug v0.3.0 where
+        ``_install_shutdown_lifespan`` mounted the FastMCP app as a sub-app
+        and added its OWN lifespan — Starlette only runs top-level
+        lifespans, so the FastMCP session manager's task group was never
+        initialized and every authenticated request returned HTTP 500 with
+        ``RuntimeError('Task group is not initialized. Make sure to use
+        run().')``.
+
+        An authenticated request may return any 4xx/5xx for MCP protocol
+        reasons (wrong Accept header, unknown method, etc.) — but it
+        MUST NOT return the "Task group is not initialized" error.
+
+        This test ALSO covers the ``token=None`` path by parametrizing
+        over both branches — but because the FastMCP session manager is
+        a module-level singleton that cannot be re-run once started, we
+        reset its ``_has_started`` flag between the two subtests by
+        recreating the server module attribute. If that reset breaks in
+        a future SDK version, drop the ``token=None`` subtest — the
+        ``token`` branch alone is sufficient to catch the regression.
+        """
+        token = "auth-reaches-session-manager-ok"
+        app = _build_http_app(token=token)
+        with TestClient(app) as client:
+            resp = client.get(
+                "/mcp",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        body = resp.text
+        assert "Task group is not initialized" not in body, (
+            f"FastMCP session manager never started: "
+            f"status={resp.status_code} body={body!r}"
+        )
 
 
 class TestUvicornLogRouting:
