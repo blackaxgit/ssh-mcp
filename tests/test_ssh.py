@@ -530,6 +530,58 @@ class TestValidateLocalPath:
 # ---------------------------------------------------------------------------
 
 
+class TestLogInjectionSanitization:
+    """Red Team R3 finding C4: values interpolated into log messages must
+    be escaped so embedded newlines cannot forge extra log records.
+    """
+
+    def _make_registry_with_server(self, name: str = "victim") -> ServerRegistry:
+        import tempfile
+
+        toml = f"""
+[groups]
+t = {{ description = "t" }}
+[servers.{name}]
+description = "t"
+groups = ["t"]
+"""
+        f = tempfile.NamedTemporaryFile(
+            suffix=".toml", mode="w", delete=False
+        )
+        f.write(toml)
+        f.close()
+        return ServerRegistry(f.name)
+
+    async def test_blocked_dangerous_command_log_escapes_newlines(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """Command with CRLF does not produce multi-line log output."""
+        manager = SSHManager(self._make_registry_with_server(), sample_settings)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.ssh"):
+            await manager.execute(
+                "victim",
+                "rm -rf /\nFORGED_LINE=attacker",
+                dry_run=False,
+            )
+
+        # Scan every emitted record for raw newlines inside the rendered
+        # message — if any record contains a literal \n in its message
+        # body (not the trailing record separator), the interpolation leaked.
+        for record in caplog.records:
+            rendered = record.getMessage()
+            # FORGED_LINE should only appear in escaped form (\\nFORGED...)
+            if "FORGED_LINE" in rendered:
+                assert "\\n" in rendered, (
+                    f"Log injection: raw newline leaked in {rendered!r}"
+                )
+                assert "\nFORGED" not in rendered, (
+                    f"Raw newline before FORGED: {rendered!r}"
+                )
+
+
 class TestPathNormalizationBypasses:
     """Paths that resolve to sensitive files must be blocked after normalization.
 

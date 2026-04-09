@@ -66,6 +66,26 @@ def _make_connection_id(server_name: str) -> str:
     return f"{server_name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
+def _safe_log_value(value: Any) -> str:
+    """Escape a potentially attacker-controlled value for safe log interpolation.
+
+    Red Team R3 finding C4: a valid MCP client can set ``server_name`` or
+    ``command`` to a value containing embedded newlines or CR/LF sequences.
+    When the default console log format interpolates such a value, SIEM
+    parsers treating each line as a separate event see forged log records.
+
+    This helper converts the value to its ``repr()`` form, which escapes
+    ``\\n``, ``\\r``, ``\\t``, and other control characters as literal
+    backslash sequences. The quoted output is slightly noisier for normal
+    values but impossible to misparse as a separate log line.
+
+    Using ``repr()`` is preferable to ``json.dumps()`` because it preserves
+    the visual identity of the value for operators reading console logs
+    while still escaping every ASCII control character.
+    """
+    return repr(value)
+
+
 # Dangerous command patterns that could be destructive.
 #
 # This list is a TRIPWIRE for obvious accidents, NOT a security boundary.
@@ -388,7 +408,9 @@ class SSHManager:
             # rejection without connecting.
             if not force and _is_dangerous_command(command):
                 logger.warning(
-                    f"Blocked potentially destructive command on {server_name}: {command}"
+                    "Blocked potentially destructive command on %s: %s",
+                    _safe_log_value(server_name),
+                    _safe_log_value(command),
                 )
                 return ExecResult(
                     server=server_name,
@@ -478,7 +500,11 @@ class SSHManager:
 
             except asyncio.TimeoutError as e:
                 duration_ms = int((time.monotonic() - start_time) * 1000)
-                logger.error(f"Command timeout on {server_name}: {command}")
+                logger.error(
+                    "Command timeout on %s: %s",
+                    _safe_log_value(server_name),
+                    _safe_log_value(command),
+                )
                 exec_result = ExecResult(
                     server=server_name,
                     command=command,
@@ -501,7 +527,7 @@ class SSHManager:
                 return exec_result
 
         except KeyError as e:
-            logger.error(f"Server not found: {server_name}")
+            logger.error("Server not found: %s", _safe_log_value(server_name))
             return ExecResult(
                 server=server_name,
                 command=command,
@@ -516,7 +542,11 @@ class SSHManager:
             asyncssh.PermissionDenied,
             OSError,
         ) as e:
-            logger.error(f"SSH error on {server_name}: {e}")
+            logger.error(
+                "SSH error on %s: %s",
+                _safe_log_value(server_name),
+                _safe_log_value(str(e)),
+            )
             return ExecResult(
                 server=server_name,
                 command=command,
@@ -527,7 +557,11 @@ class SSHManager:
             )
 
         except Exception as e:
-            logger.error(f"Unexpected error on {server_name}: {e}")
+            logger.error(
+                "Unexpected error on %s: %s",
+                _safe_log_value(server_name),
+                _safe_log_value(str(e)),
+            )
             return ExecResult(
                 server=server_name,
                 command=command,
@@ -719,8 +753,8 @@ class SSHManager:
                 "sftp.upload.failed error=file_not_found duration_ms=%s",
                 duration_ms,
             )
-            error_msg = f"Local file not found: {e}"
-            logger.error(error_msg)
+            error_msg = f"Local file not found: {_safe_log_value(str(e))}"
+            logger.error("%s", error_msg)
             raise ValueError(error_msg) from e
 
         except (
@@ -735,8 +769,11 @@ class SSHManager:
                 type(e).__name__,
                 duration_ms,
             )
-            error_msg = f"Upload failed to {server_name}: {e}"
-            logger.error(error_msg)
+            error_msg = (
+                f"Upload failed to {_safe_log_value(server_name)}: "
+                f"{_safe_log_value(str(e))}"
+            )
+            logger.error("%s", error_msg)
             raise RuntimeError(error_msg) from e
 
         finally:
@@ -810,8 +847,11 @@ class SSHManager:
                 type(e).__name__,
                 duration_ms,
             )
-            error_msg = f"Download failed from {server_name}: {e}"
-            logger.error(error_msg)
+            error_msg = (
+                f"Download failed from {_safe_log_value(server_name)}: "
+                f"{_safe_log_value(str(e))}"
+            )
+            logger.error("%s", error_msg)
             raise RuntimeError(error_msg) from e
 
         finally:
@@ -832,9 +872,15 @@ class SSHManager:
             try:
                 conn.close()
                 await conn.wait_closed()
-                logger.info(f"Closed connection to {server_name}")
+                logger.info(
+                    "Closed connection to %s", _safe_log_value(server_name)
+                )
             except Exception as e:
-                logger.warning(f"Error closing connection to {server_name}: {e}")
+                logger.warning(
+                    "Error closing connection to %s: %s",
+                    _safe_log_value(server_name),
+                    _safe_log_value(str(e)),
+                )
 
         self._connections.clear()
         self._last_used.clear()
@@ -888,7 +934,10 @@ class SSHManager:
                     return conn
                 else:
                     # Connection is stale, remove it
-                    logger.info(f"Connection to {server_name} is closed, reconnecting")
+                    logger.info(
+                        "Connection to %s is closed, reconnecting",
+                        _safe_log_value(server_name),
+                    )
                     del self._connections[server_name]
                     del self._last_used[server_name]
 
