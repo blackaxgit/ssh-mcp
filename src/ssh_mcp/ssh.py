@@ -707,7 +707,9 @@ class SSHManager:
         Emits three-stage audit logs (start → complete | failed) with the
         ``connection_id`` and a monotonic ``duration_ms`` bound into the
         structlog context so every log line from a single transfer is
-        grep-correlatable.
+        grep-correlatable. Also opens an OpenTelemetry ``ssh.upload`` span
+        (Green Team H2 fix) with ``ssh.host`` and path-length attributes —
+        lengths not contents so nothing sensitive leaks into trace backends.
 
         Args:
             server_name: Server name from registry
@@ -716,6 +718,31 @@ class SSHManager:
 
         Returns:
             Confirmation message with file size
+        """
+        if _ssh_tracer is None:
+            return await self._upload_impl(server_name, local_path, remote_path)
+        with _ssh_tracer.start_as_current_span("ssh.upload") as span:
+            span.set_attribute("ssh.host", server_name)
+            span.set_attribute("ssh.local_path_length", len(local_path))
+            span.set_attribute("ssh.remote_path_length", len(remote_path))
+            try:
+                return await self._upload_impl(
+                    server_name, local_path, remote_path
+                )
+            except Exception as e:
+                span.set_attribute("ssh.error_type", type(e).__name__)
+                span.set_status(
+                    _otel_trace.Status(_otel_trace.StatusCode.ERROR)
+                )
+                raise
+
+    async def _upload_impl(
+        self, server_name: str, local_path: str, remote_path: str
+    ) -> str:
+        """Internal upload implementation without tracing.
+
+        See ``upload`` for the public contract. Separated so the span
+        wrapper stays thin.
         """
         # Validate paths BEFORE logging so audit logs do not contain
         # sensitive values when validation blocks the call.
@@ -799,7 +826,8 @@ class SSHManager:
         Emits three-stage audit logs (start → complete | failed) with the
         ``connection_id`` and a monotonic ``duration_ms`` bound into the
         structlog context so every log line from a single transfer is
-        grep-correlatable.
+        grep-correlatable. Also opens an OpenTelemetry ``ssh.download``
+        span (Green Team H2 fix).
 
         Args:
             server_name: Server name from registry
@@ -809,6 +837,29 @@ class SSHManager:
         Returns:
             Confirmation message with file size
         """
+        if _ssh_tracer is None:
+            return await self._download_impl(
+                server_name, remote_path, local_path
+            )
+        with _ssh_tracer.start_as_current_span("ssh.download") as span:
+            span.set_attribute("ssh.host", server_name)
+            span.set_attribute("ssh.remote_path_length", len(remote_path))
+            span.set_attribute("ssh.local_path_length", len(local_path))
+            try:
+                return await self._download_impl(
+                    server_name, remote_path, local_path
+                )
+            except Exception as e:
+                span.set_attribute("ssh.error_type", type(e).__name__)
+                span.set_status(
+                    _otel_trace.Status(_otel_trace.StatusCode.ERROR)
+                )
+                raise
+
+    async def _download_impl(
+        self, server_name: str, remote_path: str, local_path: str
+    ) -> str:
+        """Internal download implementation without tracing."""
         _validate_remote_path(remote_path)
         _validate_local_path(local_path)
 

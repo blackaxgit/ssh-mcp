@@ -9,6 +9,7 @@ invocations.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -193,6 +194,116 @@ class TestOTelCommandPrivacyFuzz:
                     f"Command leaked: secret={secret!r} in "
                     f"attribute {key}={value!r}"
                 )
+
+
+class TestSFTPTracing:
+    """Green Team H2: SFTP upload/download must produce OTel spans.
+
+    Previously only ``execute`` was wrapped. Lack of SFTP spans meant
+    operators couldn't see file transfers in their trace backend and
+    distributed trace correlation broke for any tool call that combined
+    exec + upload/download.
+    """
+
+    async def test_upload_creates_span_on_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """A failing upload still produces a span with error status."""
+        import ssh_mcp.ssh as ssh_module
+        from opentelemetry.trace.status import StatusCode
+
+        local = tmp_path / "payload.txt"
+        local.write_bytes(b"hello")
+
+        with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
+            manager = SSHManager(_make_registry(), Settings())
+            with patch.object(
+                manager,
+                "_get_connection",
+                AsyncMock(side_effect=OSError("no net")),
+            ):
+                from contextlib import suppress
+
+                with suppress(Exception):
+                    await manager.upload(
+                        "test-host", str(local), "/tmp/target.txt"
+                    )
+
+        spans = [
+            s for s in _exporter.get_finished_spans() if s.name == "ssh.upload"
+        ]
+        assert len(spans) == 1, "Exactly one ssh.upload span expected"
+        span = spans[0]
+        assert span.attributes["ssh.host"] == "test-host"
+        assert span.attributes["ssh.local_path_length"] == len(str(local))
+        assert (
+            span.attributes["ssh.remote_path_length"] == len("/tmp/target.txt")
+        )
+        # Inner _upload_impl catches OSError and re-raises as RuntimeError,
+        # so the outer span sees the wrapped exception class.
+        assert span.attributes.get("ssh.error_type") == "RuntimeError"
+        assert span.status.status_code == StatusCode.ERROR
+
+    async def test_download_creates_span_on_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """A failing download still produces a span with error status."""
+        import ssh_mcp.ssh as ssh_module
+        from opentelemetry.trace.status import StatusCode
+
+        local = tmp_path / "downloaded.txt"
+
+        with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
+            manager = SSHManager(_make_registry(), Settings())
+            with patch.object(
+                manager,
+                "_get_connection",
+                AsyncMock(side_effect=OSError("no net")),
+            ):
+                from contextlib import suppress
+
+                with suppress(Exception):
+                    await manager.download(
+                        "test-host", "/tmp/source.txt", str(local)
+                    )
+
+        spans = [
+            s for s in _exporter.get_finished_spans() if s.name == "ssh.download"
+        ]
+        assert len(spans) == 1
+        span = spans[0]
+        assert span.attributes["ssh.host"] == "test-host"
+        assert span.status.status_code == StatusCode.ERROR
+
+    async def test_sftp_spans_not_created_when_tracer_none(
+        self, tmp_path: Path
+    ) -> None:
+        """Soft-import fallback: no tracer → no spans, but upload still runs."""
+        import ssh_mcp.ssh as ssh_module
+        from contextlib import suppress
+
+        local = tmp_path / "payload.txt"
+        local.write_bytes(b"data")
+
+        with patch.object(ssh_module, "_ssh_tracer", None):
+            manager = SSHManager(_make_registry(), Settings())
+            with patch.object(
+                manager,
+                "_get_connection",
+                AsyncMock(side_effect=OSError("no net")),
+            ):
+                with suppress(Exception):
+                    await manager.upload(
+                        "test-host", str(local), "/tmp/target.txt"
+                    )
+
+        # No SFTP spans should exist
+        sftp_spans = [
+            s
+            for s in _exporter.get_finished_spans()
+            if s.name in ("ssh.upload", "ssh.download")
+        ]
+        assert sftp_spans == []
 
 
 class TestNoOpWhenTracerUnavailable:
