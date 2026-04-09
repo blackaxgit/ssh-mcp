@@ -90,12 +90,55 @@ services:
   #   env_file:
   #     - .env.ssh-mcp
   #   restart: unless-stopped
-  #   # Healthcheck: probe the /mcp endpoint with auth, fall back to import check
+  #   # Healthcheck: a proper MCP ``initialize`` POST request.
+  #   #
+  #   # We send the minimum valid JSON-RPC ``initialize`` payload with the
+  #   # required Accept header and a valid bearer token. The healthcheck
+  #   # passes on any 2xx/4xx response (the MCP server is processing
+  #   # requests) and fails only on 5xx, timeout, or connection refused.
+  #   #
+  #   # Why we can't just use GET:
+  #   #   * MCP streamable HTTP rejects GET with 406 Not Acceptable unless
+  #   #     the client sends ``Accept: application/json, text/event-stream``.
+  #   #   * 406 is still a sign the server is alive, so technically any
+  #   #     non-5xx is "healthy" — but a real ``initialize`` POST gives
+  #   #     a much stronger signal that the MCP protocol is working.
   #   healthcheck:
   #     test:
   #       - CMD-SHELL
-  #       - python -c "import ssh_mcp; import urllib.request, os; req = urllib.request.Request(f'http://127.0.0.1:{os.environ.get(\"SSH_MCP_HTTP_PORT\", \"8000\")}/mcp', headers={'Authorization': 'Bearer ' + os.environ['SSH_MCP_HTTP_TOKEN']}); urllib.request.urlopen(req, timeout=3)"
+  #       - |
+  #         python3 -c "
+  #         import json, os, sys, urllib.request
+  #         port = os.environ.get('SSH_MCP_HTTP_PORT', '8000')
+  #         token = os.environ.get('SSH_MCP_HTTP_TOKEN', '')
+  #         payload = json.dumps({
+  #             'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+  #             'params': {
+  #                 'protocolVersion': '2025-03-26',
+  #                 'capabilities': {},
+  #                 'clientInfo': {'name': 'healthcheck', 'version': '1'},
+  #             },
+  #         }).encode()
+  #         req = urllib.request.Request(
+  #             f'http://127.0.0.1:{port}/mcp',
+  #             data=payload,
+  #             method='POST',
+  #             headers={
+  #                 'Authorization': f'Bearer {token}',
+  #                 'Content-Type': 'application/json',
+  #                 'Accept': 'application/json, text/event-stream',
+  #             },
+  #         )
+  #         try:
+  #             urllib.request.urlopen(req, timeout=3).read()
+  #             sys.exit(0)
+  #         except urllib.error.HTTPError as e:
+  #             # Any non-5xx means the MCP app processed the request
+  #             sys.exit(0 if e.code < 500 else 1)
+  #         except Exception:
+  #             sys.exit(1)
+  #         "
   #     interval: 30s
   #     timeout: 5s
   #     retries: 3
-  #     start_period: 5s
+  #     start_period: 10s
