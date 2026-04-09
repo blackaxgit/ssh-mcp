@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-09
+
+### Added
+
+- **MCP streamable HTTP transport** — set `SSH_MCP_TRANSPORT=http` (or `streamable-http`) to run ssh-mcp as a network service over the official MCP streamable HTTP transport instead of the default stdio subprocess transport. Includes bearer-token authentication, DNS-rebinding protection via the SDK's `TransportSecuritySettings`, and a Starlette lifespan handler that drains pooled SSH connections on graceful shutdown (SIGTERM).
+- **Bearer-token authentication middleware** — `SSH_MCP_HTTP_TOKEN` configures a shared secret. Uses `hmac.compare_digest` for constant-time comparison. Scheme is case-insensitive per RFC 7235. Minimum token length 16 chars enforced at startup. Trailing whitespace stripped so `.env` files with newlines work as expected.
+- **Safety gate** — non-localhost binds (`0.0.0.0`, LAN IPs, public IPs, `::`, link-local) raise `RuntimeError` at startup unless `SSH_MCP_HTTP_TOKEN` is set. Loopback detection uses `ipaddress.ip_address().is_loopback` so all IPv4/IPv6 loopback forms (including `::ffff:127.0.0.1`, `0:0:0:0:0:0:0:1`, and the entire `127.0.0.0/8` block) are correctly classified.
+- **Wildcard rejection** — `SSH_MCP_HTTP_ALLOWED_HOSTS=*` or entries like `*:*` are rejected at startup so operators can't silently disable DNS-rebinding protection by accident.
+- **OpenTelemetry tracing** — `ssh-mcp[otel]` extra installs the API; spans created for `mcp.tool.*`, `ssh.execute`, `ssh.upload`, and `ssh.download`. Attributes carry host, command/path lengths (never raw content), exit code, duration, and error type. Soft import via `try/except ImportError` means operators without the extra installed pay zero cost.
+- **`dry_run` parameter** on `execute` and `execute_on_group` — returns a preview of what would run (server, command, working_dir, timeout, force) without connecting. Dangerous-command detection still runs so rejection can be previewed. When `force=True` bypasses a dangerous match, the preview includes an explicit warning banner.
+- **Extended dangerous-command regex** — `rm -rf ~`, `rm -rf $HOME`, `rm -rf ${HOME}`, `rm -rf $USER`, `find / -delete`, `find / -exec rm`, `shred /dev/*`, `wipefs /dev/*`, `blkdiscard /dev/*`, `sgdisk -Z /dev/*`, `parted /dev/* mklabel`, `fdisk /dev/sd*`, `> /etc/passwd`, `> /etc/shadow`, `> /etc/sudoers`, spaced fork-bomb variants. All patterns compiled with `re.IGNORECASE` so `rm -RF /` and `RM -rf /` don't bypass. Flag matchers use lookaheads to tolerate arbitrary orders (`-rfv`, `-vfr`, `-rfvi`).
+- **Expanded SFTP sensitive-path allowlist** — blocks AWS/Azure/GCP credential files, Kubernetes configs (`~/.kube/config`, `/etc/kubernetes/`, `/var/lib/kubelet/pki/`), shell credential caches (`.netrc`, `.pgpass`, `.git-credentials`, `.docker/config.json`), `/proc/<pid>/{environ,mem,cmdline,maps,stack,status}`, database data directories, Windows registry files (OpenSSH Windows server). Path normalization via `posixpath.normpath` catches obfuscations like `/etc//shadow` and `/etc/./shadow`.
+- **Public key exemption** — `.pub` files are allowed through SFTP validation so public-key distribution works.
+- **Connection IDs** — every pooled SSH connection gets a stable `{server}-{pid}-{hex}` identifier bound via structlog contextvars so all log lines from a single session are grep-correlatable.
+- **SFTP audit lifecycle logs** — three-stage events (`sftp.{upload,download}.{start,complete,failed}`) per transfer with bytes + duration.
+- **Hypothesis property tests** — fuzz `_is_dangerous_command` regex (6 properties, 50 examples dev / 200 CI) and OTel span privacy (verifies arbitrary 16-100 char secrets never appear in span attributes).
+- Runtime dependencies: `structlog>=25.5,<26.0`, `orjson>=3.10,<4.0`, `pydantic>=2.10,<3.0`. Optional extra: `ssh-mcp[otel]` → `opentelemetry-api>=1.30,<2.0`.
+
+### Changed
+
+- **`max_parallel_hosts` setting** — `execute_on_group` concurrency cap is configurable (default 10, range 1–100). Previously hardcoded to 10.
+- **Structured logging** — `SSH_MCP_LOG_FORMAT=json` emits single-line JSON events via structlog; default is colorized console output. stdlib logger records (including `uvicorn.access`) propagate to root and are formatted by `structlog.stdlib.ProcessorFormatter`.
+- **Pydantic v2 config validation** — `Settings`/`ServerConfig`/`GroupConfig` migrated to `pydantic.dataclasses.dataclass` with `extra='forbid'`. Unknown TOML keys surface actionable `ConfigError` messages naming the offending key and the valid keys for the section.
+- **MCP tool error handling** consolidated into a single `@_mcp_tool` decorator. Eliminates ~90 lines of duplicated try/except across the 6 tools.
+- **Log interpolation sanitization** — all user-controlled values (server names, commands, paths, error messages) are wrapped with `repr()` before interpolation so embedded newlines and control characters can't forge additional log records.
+- **Dangerous-command detection documented as a TRIPWIRE, not a security boundary** — README security section explicitly lists known bypass classes (base64, hex escapes, Unicode homoglyphs, subshell indirection) and recommends sandboxing at a lower layer for real isolation.
+- `mcp[cli]` lower bound bumped from `>=1.2.0` to `>=1.27.0` — aligns with the April 2026 MCP Dev Summit release.
+
+### Fixed
+
+- **SFTP path validation bypass via `/etc//shadow` and `/etc/./shadow`** — `posixpath.normpath` is now applied before substring matching.
+- **Safety gate edge cases** — `::ffff:127.0.0.1`, `0:0:0:0:0:0:0:1`, `127.0.0.2` now correctly classified as loopback via `ipaddress.is_loopback`.
+- **Log injection via `server_name` / `command` parameters** with embedded `\n` / `\r\n` — all log interpolations of user-controlled values now go through a sanitizer.
+- **Graceful shutdown of HTTP transport** — Starlette lifespan closes the SSH connection pool on shutdown so in-flight tool calls aren't abandoned.
+- **Public SSH key files blocked from SFTP** — `.pub` files now exempted from the sensitive-path allowlist.
+- **Empty / short bearer tokens silently accepted** — `_wrap_with_bearer_auth` now raises `ValueError` for tokens under 16 chars, closing the latent `hmac.compare_digest("","")` → `True` bypass.
+
+### Security
+
+- **Red Team R3 + R4 + Green Team Round 1** — multiple rounds of adversarial review found and fixed: path normalization bypasses, narrow sensitive-path allowlist, dangerous-command regex case-sensitivity and flag-combination bypasses, `$HOME` / `${HOME}` expansion bypasses, log injection via user values, dry_run+force missing warning, empty/short token bypass, wildcard `ALLOWED_HOSTS` silent disable, safety gate narrow loopback coverage.
+
 ## [0.2.0] - 2026-04-08
 
 ### Added
@@ -93,7 +134,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/blackaxgit/ssh-mcp/releases/tag/v0.1.0
