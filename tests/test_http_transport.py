@@ -59,6 +59,50 @@ def _reset_server_globals() -> Iterator[None]:
 # ---------------------------------------------------------------------------
 
 
+class TestGracefulShutdown:
+    """Green Team H1: lifespan must close SSH connections on shutdown."""
+
+    async def test_lifespan_closes_ssh_manager_on_shutdown(self) -> None:
+        """A simulated shutdown event must invoke SSHManager.close_all().
+
+        Uses an ``AsyncExitStack`` + the Starlette lifespan context to
+        step the ASGI lifespan through ``startup -> shutdown``, capturing
+        whether ``_ssh.close_all()`` was awaited during the shutdown phase.
+        """
+        from unittest.mock import AsyncMock
+
+        import ssh_mcp.server as server_module
+
+        # Install a mock SSH manager so we can observe close_all being called
+        mock_ssh = AsyncMock()
+        mock_ssh.close_all = AsyncMock()
+        original_ssh = server_module._ssh
+        server_module._ssh = mock_ssh
+        try:
+            app = server_module._build_http_app(token=None)
+            # Starlette's TestClient drives the lifespan via context manager
+            with TestClient(app):
+                pass  # entering/exiting the context runs startup/shutdown
+        finally:
+            server_module._ssh = original_ssh
+
+        mock_ssh.close_all.assert_awaited_once()
+
+    async def test_lifespan_shutdown_when_ssh_never_initialized(self) -> None:
+        """If _ssh is None at shutdown, lifespan must not raise."""
+        import ssh_mcp.server as server_module
+
+        original_ssh = server_module._ssh
+        server_module._ssh = None
+        try:
+            app = server_module._build_http_app(token=None)
+            # Simply entering and exiting the lifespan should not raise
+            with TestClient(app):
+                pass
+        finally:
+            server_module._ssh = original_ssh
+
+
 class TestBuildHttpApp:
     """Verify _build_http_app wraps auth middleware exactly when expected."""
 

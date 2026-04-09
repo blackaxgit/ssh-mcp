@@ -558,12 +558,64 @@ def _build_http_app(token: str | None) -> Any:
     transport without authentication is a serious risk — the CLI entry
     point enforces this for non-local binds before reaching this function.
 
+    Adds a Starlette lifespan handler (Green Team H1 fix) that closes
+    the pooled SSH manager on shutdown. Without this, SIGTERM to uvicorn
+    would exit the process without draining connections — in-flight tool
+    calls return 500s mid-stream and SSH sessions are left dangling for
+    the OS to reap.
+
     Returns a Starlette app (either the raw FastMCP one or a wrapper).
     """
     app = mcp.streamable_http_app()
     if token is None:
-        return app
-    return _wrap_with_bearer_auth(app, token)
+        wrapped = _install_shutdown_lifespan(app)
+        return wrapped
+    return _wrap_with_bearer_auth(_install_shutdown_lifespan(app), token)
+
+
+def _install_shutdown_lifespan(inner_app: Any) -> Any:
+    """Mount ``inner_app`` inside a Starlette wrapper with a shutdown hook.
+
+    The FastMCP streamable HTTP app already has its own lifespan (the
+    session-manager task group), so we can't simply replace it. Instead
+    we mount the FastMCP app under ``/`` and attach a separate lifespan
+    to the outer wrapper. Starlette runs both lifespans in order, so
+    the FastMCP session manager starts first and our shutdown hook
+    runs after ours on the way down.
+    """
+    from contextlib import asynccontextmanager
+
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    @asynccontextmanager
+    async def _lifespan(_app: Starlette) -> Any:
+        # Startup: nothing to do — SSH manager is lazy-initialized on
+        # first tool call. We COULD eagerly call _init() here to surface
+        # config errors at boot time instead of first-request, but that
+        # changes the operator-observable behavior. Leaving as-is.
+        yield
+        # Shutdown: close the SSH manager if it was initialized. The
+        # ``atexit`` handler in ``_init()`` is still registered as a
+        # belt-and-suspenders backup, but this lifespan path runs
+        # inside the event loop so it can ``await`` cleanly.
+        global _ssh
+        if _ssh is not None:
+            logger.info("Draining SSH connections on HTTP shutdown")
+            try:
+                await _ssh.close_all()
+                logger.info("SSH connections drained cleanly")
+            except Exception as e:
+                logger.warning(
+                    "Error draining SSH connections: %s",
+                    e,
+                    exc_info=True,
+                )
+
+    return Starlette(
+        routes=[Mount("/", app=inner_app)],
+        lifespan=_lifespan,
+    )
 
 
 def _run_http() -> None:
