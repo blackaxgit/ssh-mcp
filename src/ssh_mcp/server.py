@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import functools
 import logging
 import os
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -33,6 +34,56 @@ from ssh_mcp.formatting import (
     format_server_table,
 )
 from ssh_mcp.ssh import SSHManager
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry tracing — soft-imported so ssh_mcp[otel] is genuinely optional.
+#
+# When `opentelemetry-api` is installed, every MCP tool call gets a span
+# named ``mcp.tool.{name}`` with attributes for the tool name and (on
+# failure) the exception type. Inner SSH operations create child spans
+# inside this one via automatic context propagation. Operators bring their
+# own SDK + exporter (Jaeger, Tempo, OTLP collector, etc).
+#
+# When `opentelemetry-api` is NOT installed, the helper ``_span`` below is a
+# no-op context manager — zero runtime cost, zero import errors.
+# ---------------------------------------------------------------------------
+try:
+    from opentelemetry import trace as _otel_trace
+
+    _tracer: Any = _otel_trace.get_tracer("ssh_mcp")
+    _otel_available: bool = True
+except ImportError:  # pragma: no cover - exercised by env without extras
+    _tracer = None
+    _otel_available = False
+
+
+@contextlib.contextmanager
+def _span(name: str, **attributes: Any) -> Iterator[Any]:
+    """Start an OTel span if the API is available, else a no-op.
+
+    Usage::
+
+        with _span("mcp.tool.execute", **{"mcp.tool.name": "execute"}) as span:
+            ...
+            if span is not None:
+                span.set_attribute("ssh.exit_code", result.exit_code)
+
+    The yielded span is ``None`` when OTel is not installed so caller code
+    must null-check before calling ``set_attribute``.
+    """
+    if _tracer is None:
+        yield None
+        return
+    with _tracer.start_as_current_span(name) as span:
+        for k, v in attributes.items():
+            if v is not None:
+                span.set_attribute(k, v)
+        try:
+            yield span
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
+            raise
 
 
 def _configure_logging() -> None:
@@ -209,7 +260,8 @@ F = TypeVar("F", bound=Callable[..., Awaitable[str]])
 
 
 def _mcp_tool(func: F) -> F:
-    """Decorator: ensure server is initialized, log+raise ToolError on failure.
+    """Decorator: ensure server is initialized, log+raise ToolError on failure,
+    and open an OpenTelemetry span around every tool invocation.
 
     Collapses the duplicated try/except boilerplate from each MCP tool into a
     single declarative wrapper. Preserves ToolError passthrough so structured
@@ -217,18 +269,26 @@ def _mcp_tool(func: F) -> F:
     logged with a traceback and re-raised as a ToolError so the MCP client
     receives `isError=true` with a useful message.
 
+    The surrounding OTel span is named ``mcp.tool.{name}`` and carries the
+    ``mcp.tool.name`` attribute. On failure it is marked with exception info
+    and ``StatusCode.ERROR`` via ``_span``'s error path. When OTel is not
+    installed, the span is a no-op.
+
     Apply BELOW ``@mcp.tool()`` so FastMCP registers the wrapped function.
     """
+
+    tool_name = func.__name__
 
     @functools.wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> str:
         try:
-            await _init()
-            return await func(*args, **kwargs)
+            with _span(f"mcp.tool.{tool_name}", **{"mcp.tool.name": tool_name}):
+                await _init()
+                return await func(*args, **kwargs)
         except ToolError:
             raise
         except Exception as e:
-            logger.error("%s failed: %s", func.__name__, e, exc_info=True)
+            logger.error("%s failed: %s", tool_name, e, exc_info=True)
             raise ToolError(str(e)) from e
 
     return cast(F, wrapper)
@@ -295,6 +355,7 @@ async def execute(
     timeout: int = 30,
     working_dir: str | None = None,
     force: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Execute a shell command on a single SSH server.
 
@@ -310,13 +371,18 @@ async def execute(
         force: If True, bypass the dangerous-command detection regex. Use only
                 for audited bulk operations — the block list catches rm -rf /,
                 mkfs, dd-to-disk, chmod 777 /, and fork bombs. Default False.
+        dry_run: If True, do NOT connect or execute. Return a preview describing
+                what would run (server, command, working_dir, timeout, force).
+                Dangerous-command detection still runs so rejection can be
+                previewed. Useful for LLM plans that want to validate intent
+                before committing. Default False.
 
     Returns:
         Formatted command execution result with stdout, stderr, and exit code.
         Long output is truncated at ``max_output_bytes`` (default 50 KiB).
     """
     ssh = _get_ssh()
-    result = await ssh.execute(server, command, timeout, working_dir, force)
+    result = await ssh.execute(server, command, timeout, working_dir, force, dry_run)
     return format_exec_result(result)
 
 
@@ -329,6 +395,7 @@ async def execute_on_group(
     working_dir: str | None = None,
     fail_fast: bool = False,
     force: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Execute a shell command on all servers in a group in parallel.
 
@@ -349,6 +416,10 @@ async def execute_on_group(
                 run all servers to completion and report each result.
         force: If True, bypass the dangerous-command detection regex. Use only
                 for audited bulk operations. Default False.
+        dry_run: If True, do NOT connect or execute anywhere. Return a
+                per-server preview describing what would run. Dangerous-
+                command detection still applies. Useful for previewing
+                fleet-wide rollouts before committing. Default False.
 
     Returns:
         Formatted summary showing per-server results, success/failure counts,
@@ -356,7 +427,7 @@ async def execute_on_group(
     """
     ssh = _get_ssh()
     results = await ssh.execute_on_group(
-        group, command, timeout, working_dir, fail_fast, force
+        group, command, timeout, working_dir, fail_fast, force, dry_run
     )
     return format_group_results(results, group)
 
@@ -403,9 +474,306 @@ async def download_file(
     return await ssh.download(server, remote_path, local_path)
 
 
-def main() -> None:
-    """Entry point for console script (uvx ssh-mcp)."""
+# Minimum acceptable length for a bearer token. 16 chars ≈ 80 bits of
+# entropy if the source is random. Shorter values are rejected at startup
+# as likely to be typos, placeholders, or human-chosen weak secrets.
+_MIN_TOKEN_LENGTH: int = 16
+
+
+def _wrap_with_bearer_auth(inner_app: Any, token: str) -> Any:
+    """Wrap an ASGI ``inner_app`` in a bearer-token auth Starlette wrapper.
+
+    Extracted from ``_build_http_app`` so the middleware can be unit-tested
+    in isolation against a trivial downstream app, without needing the
+    full MCP session-manager lifespan.
+
+    The middleware:
+      * Requires ``Authorization: <scheme> <token>`` header on every request
+        where ``<scheme>`` is ``Bearer`` (case-insensitive per RFC 7235)
+      * Uses ``hmac.compare_digest`` to prevent timing attacks on the secret
+      * Returns 401 with ``WWW-Authenticate`` on missing/invalid credentials
+      * Does NOT exempt any path — ssh-mcp exposes no OAuth discovery, and
+        an unauthenticated health probe would leak server presence to
+        scanners anyway
+
+    Red Team R3 hardening:
+      * Refuses empty or very short tokens — ``hmac.compare_digest('','')``
+        returns True, so an empty ``expected`` would bypass auth for any
+        ``Authorization: Bearer `` request.
+      * Accepts case-insensitive scheme per RFC 7235 §2.1.
+
+    Raises:
+        ValueError: if ``token`` is empty or shorter than ``_MIN_TOKEN_LENGTH``.
+    """
+    if not token or len(token) < _MIN_TOKEN_LENGTH:
+        raise ValueError(
+            f"bearer token must be at least {_MIN_TOKEN_LENGTH} characters "
+            f"(got {len(token)}) — a short or empty token is a security risk"
+        )
+
+    from starlette.applications import Starlette
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from starlette.routing import Mount
+
+    class _BearerAuth(BaseHTTPMiddleware):
+        def __init__(self, wrapped_app: Any, expected: str) -> None:
+            super().__init__(wrapped_app)
+            self._expected = expected
+
+        async def dispatch(self, request: Request, call_next: Any) -> Any:
+            import hmac
+
+            auth = request.headers.get("authorization", "")
+            # Case-insensitive scheme match per RFC 7235 §2.1. We split
+            # on the first whitespace so tab/multi-space between scheme
+            # and token is tolerated.
+            parts = auth.split(maxsplit=1)
+            if len(parts) != 2 or parts[0].lower() != "bearer":
+                return JSONResponse(
+                    {"error": "missing bearer token"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": 'Bearer realm="ssh-mcp"'},
+                )
+            supplied = parts[1]
+            if not hmac.compare_digest(supplied, self._expected):
+                return JSONResponse(
+                    {"error": "invalid bearer token"},
+                    status_code=401,
+                )
+            return await call_next(request)
+
+    wrapper = Starlette(routes=[Mount("/", app=inner_app)])
+    wrapper.add_middleware(_BearerAuth, expected=token)
+    return wrapper
+
+
+def _build_http_app(token: str | None) -> Any:
+    """Return the Starlette ASGI app for streamable HTTP transport.
+
+    When ``token`` is provided, wraps the FastMCP app in a bearer-token
+    authentication middleware via ``_wrap_with_bearer_auth``. ``ssh-mcp``
+    executes shell commands on remote servers, so running the HTTP
+    transport without authentication is a serious risk — the CLI entry
+    point enforces this for non-local binds before reaching this function.
+
+    Adds a Starlette lifespan handler (Green Team H1 fix) that closes
+    the pooled SSH manager on shutdown. Without this, SIGTERM to uvicorn
+    would exit the process without draining connections — in-flight tool
+    calls return 500s mid-stream and SSH sessions are left dangling for
+    the OS to reap.
+
+    Returns a Starlette app (either the raw FastMCP one or a wrapper).
+    """
+    app = mcp.streamable_http_app()
+    if token is None:
+        wrapped = _install_shutdown_lifespan(app)
+        return wrapped
+    return _wrap_with_bearer_auth(_install_shutdown_lifespan(app), token)
+
+
+def _install_shutdown_lifespan(inner_app: Any) -> Any:
+    """Mount ``inner_app`` inside a Starlette wrapper with a shutdown hook.
+
+    The FastMCP streamable HTTP app already has its own lifespan (the
+    session-manager task group), so we can't simply replace it. Instead
+    we mount the FastMCP app under ``/`` and attach a separate lifespan
+    to the outer wrapper. Starlette runs both lifespans in order, so
+    the FastMCP session manager starts first and our shutdown hook
+    runs after ours on the way down.
+    """
+    from contextlib import asynccontextmanager
+
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    @asynccontextmanager
+    async def _lifespan(_app: Starlette) -> Any:
+        # Startup: nothing to do — SSH manager is lazy-initialized on
+        # first tool call. We COULD eagerly call _init() here to surface
+        # config errors at boot time instead of first-request, but that
+        # changes the operator-observable behavior. Leaving as-is.
+        yield
+        # Shutdown: close the SSH manager if it was initialized. The
+        # ``atexit`` handler in ``_init()`` is still registered as a
+        # belt-and-suspenders backup, but this lifespan path runs
+        # inside the event loop so it can ``await`` cleanly.
+        global _ssh
+        if _ssh is not None:
+            logger.info("Draining SSH connections on HTTP shutdown")
+            try:
+                await _ssh.close_all()
+                logger.info("SSH connections drained cleanly")
+            except Exception as e:
+                logger.warning(
+                    "Error draining SSH connections: %s",
+                    e,
+                    exc_info=True,
+                )
+
+    return Starlette(
+        routes=[Mount("/", app=inner_app)],
+        lifespan=_lifespan,
+    )
+
+
+def _run_http() -> None:
+    """Run ssh-mcp over MCP streamable HTTP transport.
+
+    Configured via environment variables:
+
+    * ``SSH_MCP_HTTP_HOST`` — bind address, default ``127.0.0.1``.
+      Using any non-localhost value (``0.0.0.0``, a LAN IP, etc.) REQUIRES
+      ``SSH_MCP_HTTP_TOKEN`` to be set, otherwise startup aborts.
+    * ``SSH_MCP_HTTP_PORT`` — TCP port, default ``8000``.
+    * ``SSH_MCP_HTTP_TOKEN`` — shared bearer secret. When set, every
+      request must carry ``Authorization: Bearer <token>`` or receive 401.
+      Clients use this to authenticate to the MCP server over HTTP.
+    * ``SSH_MCP_HTTP_STATELESS`` — if ``true``, FastMCP runs in stateless
+      mode (no server-side sessions). Recommended for load-balanced or
+      serverless deployments. Default ``false`` (stateful sessions with
+      streaming support).
+    * ``SSH_MCP_HTTP_ALLOWED_HOSTS`` — comma-separated list of Host headers
+      permitted by the SDK's DNS-rebinding protection. Defaults to
+      ``127.0.0.1:*,localhost:*,[::1]:*``. Expand when serving remote
+      clients: e.g. ``ssh-mcp.internal:*``.
+    """
+    import uvicorn
+
+    host = os.environ.get("SSH_MCP_HTTP_HOST", "127.0.0.1")
+    port = int(os.environ.get("SSH_MCP_HTTP_PORT", "8000"))
+    # M4: strip whitespace so env-file tokens with a trailing newline work
+    raw_token = os.environ.get("SSH_MCP_HTTP_TOKEN", "").strip()
+    token = raw_token or None
+    stateless = os.environ.get("SSH_MCP_HTTP_STATELESS", "false").lower() == "true"
+    allowed_hosts_env = os.environ.get("SSH_MCP_HTTP_ALLOWED_HOSTS", "").strip()
+
+    # Security gate: refuse to expose the server to non-localhost traffic
+    # without a token. Localhost binds remain unauthenticated because they
+    # match the historical stdio deployment model (single-user workstation).
+    #
+    # Green Team Round 1 finding H5: use ``ipaddress.ip_address().is_loopback``
+    # so non-canonical forms (``::ffff:127.0.0.1``, ``0:0:0:0:0:0:0:1``,
+    # entire 127.0.0.0/8 block) are correctly classified. Fall back to a
+    # string match for hostnames that aren't valid IP literals.
+    import ipaddress
+
+    try:
+        is_localhost = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # Hostname (not an IP literal) — fall back to the known-safe names
+        is_localhost = host.lower() in {"localhost"}
+    if not is_localhost and token is None:
+        raise RuntimeError(
+            f"SSH_MCP_HTTP_TOKEN must be set when binding to {host!r}. "
+            "Refusing to expose SSH command execution over the network "
+            "without bearer-token authentication."
+        )
+
+    # Apply settings to the module-level FastMCP instance. The SDK reads
+    # these fields at ``streamable_http_app()`` construction time.
+    mcp.settings.host = host
+    mcp.settings.port = port
+    mcp.settings.stateless_http = stateless
+    if allowed_hosts_env:
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        extra_hosts = [h.strip() for h in allowed_hosts_env.split(",") if h.strip()]
+        # H4: reject wildcards — they silently disable DNS-rebinding
+        # protection. An operator setting "*" almost certainly means
+        # "match my specific hostname" and doesn't realize the security
+        # implication. Fail loud instead of silently letting it through.
+        for entry in extra_hosts:
+            bare = entry.replace(":*", "").replace("*", "")
+            if not bare or entry in {"*", "*:*", "*.*"} or entry.startswith("*."):
+                if entry.startswith("*."):
+                    continue  # wildcard suffixes like *.internal.example.com are OK
+                raise RuntimeError(
+                    f"SSH_MCP_HTTP_ALLOWED_HOSTS wildcard entry {entry!r} "
+                    "would disable DNS-rebinding protection. "
+                    "Use a concrete hostname (e.g. 'ssh-mcp.internal:*') instead."
+                )
+        existing = mcp.settings.transport_security
+        default_origins = [
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*",
+        ]
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[
+                "127.0.0.1:*",
+                "localhost:*",
+                "[::1]:*",
+                *extra_hosts,
+            ],
+            allowed_origins=(
+                list(existing.allowed_origins)
+                if existing is not None
+                else default_origins
+            ),
+        )
+
     from ssh_mcp import __version__
+
+    logger.info(
+        "Starting ssh-mcp v%s (streamable-http) on %s:%s stateless=%s auth=%s",
+        __version__,
+        host,
+        port,
+        stateless,
+        "bearer" if token else "NONE",
+    )
+    if token is None and is_localhost:
+        logger.warning(
+            "HTTP transport is running WITHOUT authentication on %s. "
+            "Do NOT forward this port beyond the loopback interface.",
+            host,
+        )
+
+    app = _build_http_app(token)
+
+    # Run the ASGI server. uvicorn's own access logs go to stdout by
+    # default — route them to stderr to preserve the MCP convention that
+    # protocol output and operational logs are on separate channels.
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_config=None,  # use the root logger we configured above
+    )
+
+
+def main() -> None:
+    """Entry point for console script (uvx ssh-mcp).
+
+    Dispatches on ``SSH_MCP_TRANSPORT``:
+
+    * ``stdio`` (default) — classic MCP stdio subprocess transport,
+      used by Claude Desktop / Claude Code via ``uvx ssh-mcp``.
+    * ``http`` or ``streamable-http`` — MCP streamable HTTP transport on
+      a TCP port. Requires ``SSH_MCP_HTTP_TOKEN`` for non-localhost binds.
+      See ``_run_http`` for the full list of env vars.
+    """
+    from ssh_mcp import __version__
+
+    transport = os.environ.get("SSH_MCP_TRANSPORT", "stdio").strip().lower()
+
+    if transport in ("http", "streamable-http"):
+        try:
+            config_path = _get_config_path()
+            logger.info(f"Config will be loaded from {config_path} on first tool call")
+        except FileNotFoundError as e:
+            logger.warning(f"No config file found yet: {e}")
+        _run_http()
+        return
+
+    if transport != "stdio":
+        raise ValueError(
+            f"Unknown SSH_MCP_TRANSPORT={transport!r}. "
+            "Valid values: stdio, http, streamable-http."
+        )
 
     logger.info(
         f"Starting ssh-mcp v{__version__} (stdio transport) - "

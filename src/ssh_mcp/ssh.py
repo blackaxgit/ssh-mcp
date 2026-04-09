@@ -25,6 +25,15 @@ from ssh_mcp.models import ExecResult, ServerConfig, Settings
 
 logger = logging.getLogger(__name__)
 
+# Soft OTel import — see server.py for rationale. When the extras aren't
+# installed, ``_ssh_tracer`` is None and inner ops skip span creation.
+try:
+    from opentelemetry import trace as _otel_trace
+
+    _ssh_tracer: Any = _otel_trace.get_tracer("ssh_mcp.ssh")
+except ImportError:  # pragma: no cover - exercised by env without extras
+    _ssh_tracer = None
+
 # ---------------------------------------------------------------------------
 # Tunable constants — promoted from inline literals for discoverability.
 #
@@ -57,26 +66,189 @@ def _make_connection_id(server_name: str) -> str:
     return f"{server_name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
-# Dangerous command patterns that could be destructive
+def _safe_log_value(value: Any) -> str:
+    """Escape a potentially attacker-controlled value for safe log interpolation.
+
+    Red Team R3 finding C4: a valid MCP client can set ``server_name`` or
+    ``command`` to a value containing embedded newlines or CR/LF sequences.
+    When the default console log format interpolates such a value, SIEM
+    parsers treating each line as a separate event see forged log records.
+
+    This helper converts the value to its ``repr()`` form, which escapes
+    ``\\n``, ``\\r``, ``\\t``, and other control characters as literal
+    backslash sequences. The quoted output is slightly noisier for normal
+    values but impossible to misparse as a separate log line.
+
+    Using ``repr()`` is preferable to ``json.dumps()`` because it preserves
+    the visual identity of the value for operators reading console logs
+    while still escaping every ASCII control character.
+    """
+    return repr(value)
+
+
+# Dangerous command patterns that could be destructive.
+#
+# This list is a TRIPWIRE for obvious accidents, NOT a security boundary.
+# Sophisticated attackers can bypass it with base64-encoded payloads,
+# shell hex escapes, Unicode homoglyphs, or subshell indirection. The
+# patterns below catch the highest-frequency mistakes — they are NOT
+# expected to resist a motivated adversary. Operators who need real
+# isolation must sandbox at a lower layer (containers, SELinux, etc.).
+# Red Team R4 hardening: every pattern is compiled with ``re.IGNORECASE``
+# so ``rm -RF /`` / ``RM -rf /`` don't bypass. The rm-flag patterns use
+# lookaheads instead of ordered character classes so `-rfv`, `-vfr`,
+# `-rfvi` (any order with extra flags) all match.
 _DANGEROUS_PATTERNS = [
-    re.compile(r"rm\s+-rf\s+/"),
-    re.compile(r"mkfs"),
-    re.compile(r"dd\s+if="),
-    re.compile(r">\s*/dev/sd"),
-    re.compile(r"chmod\s+777\s+/"),
-    re.compile(r":\(\)\{\s*:\|:&\s*\};:"),  # fork bomb
+    # Filesystem root wipe via rm -rf — catches `/`, `~`, `$HOME`, `$USER`
+    # forms. Flag cluster must contain BOTH `r` and `f` anywhere, plus
+    # optional `v`, `i`, `I`, `d`, `h`, `n`, `N` flags in any order.
+    re.compile(
+        r"rm\s+-(?=[rfvhidIn]*r)(?=[rfvhidIn]*f)[rfvhidIn]+"
+        r"\s+(?:/|~|\$\{?HOME\}?|\$\{?USER\}?)",
+        re.IGNORECASE,
+    ),
+    # Filesystem creation over raw devices
+    re.compile(r"mkfs", re.IGNORECASE),
+    # dd to/from a block device
+    re.compile(r"dd\s+if=", re.IGNORECASE),
+    # Redirect into a block device or system auth database
+    re.compile(r">\s*/dev/sd", re.IGNORECASE),
+    re.compile(r">\s*/dev/nvme", re.IGNORECASE),
+    re.compile(r">\s*/dev/hd", re.IGNORECASE),
+    re.compile(
+        r">\s*/etc/(passwd|shadow|gshadow|sudoers)\b",
+        re.IGNORECASE,
+    ),
+    # chmod / chown on root or home
+    re.compile(r"chmod\s+-?R?\s*777\s+/", re.IGNORECASE),
+    # find-based recursive delete — equivalent destructive power. Match
+    # /, ~, $HOME roots; tolerate any expression between root and -delete.
+    re.compile(
+        r"find\s+(?:/|~|\$\{?HOME\}?)(?:\S*)?\s+.*-delete",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"find\s+(?:/|~|\$\{?HOME\}?)(?:\S*)?\s+.*-exec\s+rm\b",
+        re.IGNORECASE,
+    ),
+    # Block-level wipes
+    re.compile(r"shred\s+(-\w*\s+)*/dev/", re.IGNORECASE),
+    re.compile(r"wipefs\s+(-\w+\s+|--\w+\s+)*/dev/", re.IGNORECASE),
+    re.compile(r"blkdiscard\s+/dev/", re.IGNORECASE),
+    re.compile(r"sgdisk\s+-[Zz]\s+/dev/", re.IGNORECASE),
+    # Partition-table destruction
+    re.compile(r"parted\s+/dev/\S+\s+mklabel", re.IGNORECASE),
+    re.compile(r"fdisk\s+/dev/sd", re.IGNORECASE),
+    # Classic fork bomb — tolerates spaced variants.
+    re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
 ]
 
-# Sensitive paths that should be blocked in SFTP operations
+# Sensitive paths that should be blocked in SFTP operations.
+#
+# Matches are substring-based AFTER path normalization (see _normalize_path).
+# Normalization collapses double slashes and dot components so that
+# ``/etc//shadow`` and ``/etc/./shadow`` are caught. Entries without a
+# leading ``/`` match anywhere in the normalized path (e.g. ``.aws/credentials``
+# catches both ``/home/alice/.aws/credentials`` and ``/root/.aws/credentials``).
+#
+# SSH public keys (``*.pub``) are explicitly exempted in ``_is_sensitive_path``
+# because publishing public keys via SFTP is a legitimate operation.
 _SENSITIVE_PATHS = [
+    # Unix system secrets
     "/etc/shadow",
+    "/etc/gshadow",
     "/etc/passwd",
+    "/etc/sudoers",
+    "/etc/ssh/ssh_host_",  # private host keys
+    # SSH key material (relative match — catches any home dir)
     ".ssh/authorized_keys",
     ".ssh/id_rsa",
     ".ssh/id_ed25519",
     ".ssh/id_ecdsa",
     ".ssh/id_dsa",
+    ".ssh/identity",
+    # Cloud provider credentials
+    ".aws/credentials",
+    ".aws/config",
+    ".azure/accesstokens.json",
+    ".config/gcloud/credentials.db",
+    ".config/gcloud/access_tokens.db",
+    # Kubernetes secrets
+    ".kube/config",
+    "/etc/kubernetes/admin.conf",
+    "/etc/kubernetes/kubelet.conf",
+    "/var/lib/kubelet/pki/",
+    # Shell credential caches and developer secrets
+    ".netrc",
+    ".pgpass",
+    ".git-credentials",
+    ".docker/config.json",
+    # Kernel / process memory
+    "/proc/self/mem",
+    "/proc/self/environ",
+    "/proc/kcore",
+    "/proc/kallsyms",
+    # Database data files
+    "/var/lib/mysql/",
+    "/var/lib/postgresql/",
+    "/var/lib/mongodb/",
+    # Windows (OpenSSH Windows server)
+    "\\windows\\system32\\config\\sam",
+    "\\windows\\system32\\config\\security",
+    "\\users\\administrator\\.ssh\\",
 ]
+
+
+def _normalize_path(path: str) -> str:
+    """Normalize a path for substring-based sensitive-path matching.
+
+    Uses ``posixpath.normpath`` which collapses ``//`` → ``/`` and removes
+    ``./`` components, so ``/etc//shadow`` and ``/etc/./shadow`` both
+    normalize to ``/etc/shadow``. Lowercases the result so matching is
+    case-insensitive (defends against ``/ETC/SHADOW`` on case-insensitive
+    filesystems and caseless-hostname shells).
+
+    Does NOT resolve ``..`` components (path traversal is caught earlier
+    by a separate check) and does NOT follow symlinks (those require
+    filesystem access).
+
+    Args:
+        path: Raw path as supplied by the caller.
+
+    Returns:
+        Lowercased, normalized path suitable for substring matching.
+    """
+    import posixpath
+
+    return posixpath.normpath(path).lower()
+
+
+# Regex guard for ``/proc/<pid>/{environ,mem,cmdline,maps,stack}`` which
+# can reveal secrets from any running process. Covers ``/proc/self/...``
+# AND arbitrary numeric PIDs. Kept separate from ``_SENSITIVE_PATHS`` because
+# substring matching can't express "digits here".
+_PROC_SENSITIVE_RE = re.compile(
+    r"/proc/(self|\d+)/(environ|mem|cmdline|maps|stack|status)",
+    re.IGNORECASE,
+)
+
+
+def _is_sensitive_path(path: str) -> bool:
+    """Return True if ``path`` resolves to a sensitive location.
+
+    Normalizes before matching so obfuscations like ``/etc//shadow`` and
+    ``/etc/./shadow`` are caught. Exempts ``*.pub`` files so legitimate
+    SSH public-key uploads work.
+    """
+    if path.endswith(".pub"):
+        return False
+    normalized = _normalize_path(path)
+    if _PROC_SENSITIVE_RE.search(normalized):
+        return True
+    for sensitive in _SENSITIVE_PATHS:
+        if sensitive.lower() in normalized:
+            return True
+    return False
 
 
 def _is_dangerous_command(command: str) -> bool:
@@ -105,6 +277,9 @@ def _is_dangerous_command(command: str) -> bool:
 def _validate_remote_path(path: str) -> None:
     """Validate remote path for SFTP operations.
 
+    Normalizes the path before checking so obfuscations like ``/etc//shadow``
+    and ``/etc/./shadow`` are caught.
+
     Args:
         path: Remote path to validate
 
@@ -113,19 +288,17 @@ def _validate_remote_path(path: str) -> None:
     """
     # Block parent directory traversal
     if ".." in path:
-        raise ValueError(f"Path traversal detected: {path}")
+        raise ValueError(f"Path traversal detected: {path!r}")
 
-    # Block access to sensitive paths
-    normalized_path = path.lower()
-    for sensitive in _SENSITIVE_PATHS:
-        if sensitive in normalized_path:
-            raise ValueError(f"Access to sensitive path blocked: {path}")
+    if _is_sensitive_path(path):
+        raise ValueError(f"Access to sensitive path blocked: {path!r}")
 
 
 def _validate_local_path(path: str) -> None:
     """Validate local path for SFTP operations.
 
-    Prevents reading/writing arbitrary files on the MCP host.
+    Prevents reading/writing arbitrary files on the MCP host. Same
+    normalization rules as ``_validate_remote_path``.
 
     Args:
         path: Local path to validate
@@ -135,13 +308,10 @@ def _validate_local_path(path: str) -> None:
     """
     # Block parent directory traversal
     if ".." in path:
-        raise ValueError(f"Path traversal detected: {path}")
+        raise ValueError(f"Path traversal detected: {path!r}")
 
-    # Block access to sensitive paths
-    normalized_path = path.lower()
-    for sensitive in _SENSITIVE_PATHS:
-        if sensitive in normalized_path:
-            raise ValueError(f"Access to sensitive path blocked: {path}")
+    if _is_sensitive_path(path):
+        raise ValueError(f"Access to sensitive path blocked: {path!r}")
 
 
 class SSHManager:
@@ -191,8 +361,16 @@ class SSHManager:
         timeout: int = 30,
         working_dir: str | None = None,
         force: bool = False,
+        dry_run: bool = False,
     ) -> ExecResult:
         """Execute command on a remote server.
+
+        Thin tracing wrapper around ``_execute_impl``. When OTel is
+        available it opens a ``ssh.execute`` span with ``ssh.host``,
+        ``ssh.command_length`` (NOT the raw command — avoids leaking
+        secrets into traces), ``ssh.force``, and ``ssh.dry_run`` attributes
+        at entry, and populates ``ssh.exit_code`` / ``ssh.duration_ms`` /
+        ``ssh.error`` from the final ExecResult before returning.
 
         Args:
             server_name: Server name from registry
@@ -200,17 +378,62 @@ class SSHManager:
             timeout: Command timeout in seconds
             working_dir: Working directory for command execution
             force: Bypass dangerous command detection (use with caution)
+            dry_run: If True, skip connection and execution — return a
+                preview describing what WOULD run. Dangerous-command detection
+                still applies so rejection can be previewed.
 
         Returns:
             ExecResult with command output and metadata
         """
+        if _ssh_tracer is None:
+            return await self._execute_impl(
+                server_name, command, timeout, working_dir, force, dry_run
+            )
+        with _ssh_tracer.start_as_current_span("ssh.execute") as span:
+            span.set_attribute("ssh.host", server_name)
+            span.set_attribute("ssh.command_length", len(command))
+            span.set_attribute("ssh.force", force)
+            span.set_attribute("ssh.dry_run", dry_run)
+            result = await self._execute_impl(
+                server_name, command, timeout, working_dir, force, dry_run
+            )
+            if result.exit_code is not None:
+                span.set_attribute("ssh.exit_code", result.exit_code)
+            if result.duration_ms:
+                span.set_attribute("ssh.duration_ms", result.duration_ms)
+            if result.error:
+                # Truncate error messages into spans — some operators ingest
+                # traces into cost-sensitive backends.
+                span.set_attribute("ssh.error", result.error[:200])
+                span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
+            return result
+
+    async def _execute_impl(
+        self,
+        server_name: str,
+        command: str,
+        timeout: int = 30,
+        working_dir: str | None = None,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> ExecResult:
+        """Internal implementation of execute without tracing.
+
+        See ``execute`` for public contract. Separated so the span wrapper
+        stays thin and the complex exit-path logic below does not need
+        per-branch tracing glue.
+        """
         try:
             server = self.registry.get_server(server_name)
 
-            # Check for dangerous commands unless force is enabled
+            # Check for dangerous commands unless force is enabled. Dangerous-
+            # command detection ALSO runs in dry_run mode so users can preview
+            # rejection without connecting.
             if not force and _is_dangerous_command(command):
                 logger.warning(
-                    f"Blocked potentially destructive command on {server_name}: {command}"
+                    "Blocked potentially destructive command on %s: %s",
+                    _safe_log_value(server_name),
+                    _safe_log_value(command),
                 )
                 return ExecResult(
                     server=server_name,
@@ -219,6 +442,40 @@ class SSHManager:
                     stderr="",
                     exit_code=None,
                     error="Blocked: potentially destructive command detected. Review and use with caution.",
+                )
+
+            # Dry-run mode: don't connect, don't execute — just describe
+            # what WOULD happen. Useful for LLM-driven plans that want to
+            # preview destructive cascades before committing.
+            if dry_run:
+                effective_wd = working_dir or server.default_dir or "<login dir>"
+                effective_to = server.timeout or timeout
+                # Red Team R3 finding H1: when force=True bypasses a
+                # dangerous-command match, the dry_run preview must surface
+                # a visible warning so LLM planners can't overlook it.
+                dangerous_banner = ""
+                if force and _is_dangerous_command(command):
+                    dangerous_banner = (
+                        "\n"
+                        "  ⚠️  DANGEROUS: matched the destructive-command tripwire.\n"
+                        "      force=True would bypass the block on real execution.\n"
+                        "      Review carefully before removing dry_run=True."
+                    )
+                preview = (
+                    f"[DRY RUN] Would execute on {server_name}\n"
+                    f"  command:     {command}\n"
+                    f"  working_dir: {effective_wd}\n"
+                    f"  timeout:     {effective_to}s\n"
+                    f"  force:       {force}"
+                    f"{dangerous_banner}"
+                )
+                return ExecResult(
+                    server=server_name,
+                    command=command,
+                    stdout=preview,
+                    stderr="",
+                    exit_code=0,
+                    duration_ms=0,
                 )
 
             # Use server-specific timeout if configured
@@ -278,7 +535,11 @@ class SSHManager:
 
             except asyncio.TimeoutError as e:
                 duration_ms = int((time.monotonic() - start_time) * 1000)
-                logger.error(f"Command timeout on {server_name}: {command}")
+                logger.error(
+                    "Command timeout on %s: %s",
+                    _safe_log_value(server_name),
+                    _safe_log_value(command),
+                )
                 exec_result = ExecResult(
                     server=server_name,
                     command=command,
@@ -301,7 +562,7 @@ class SSHManager:
                 return exec_result
 
         except KeyError as e:
-            logger.error(f"Server not found: {server_name}")
+            logger.error("Server not found: %s", _safe_log_value(server_name))
             return ExecResult(
                 server=server_name,
                 command=command,
@@ -316,7 +577,11 @@ class SSHManager:
             asyncssh.PermissionDenied,
             OSError,
         ) as e:
-            logger.error(f"SSH error on {server_name}: {e}")
+            logger.error(
+                "SSH error on %s: %s",
+                _safe_log_value(server_name),
+                _safe_log_value(str(e)),
+            )
             return ExecResult(
                 server=server_name,
                 command=command,
@@ -327,7 +592,11 @@ class SSHManager:
             )
 
         except Exception as e:
-            logger.error(f"Unexpected error on {server_name}: {e}")
+            logger.error(
+                "Unexpected error on %s: %s",
+                _safe_log_value(server_name),
+                _safe_log_value(str(e)),
+            )
             return ExecResult(
                 server=server_name,
                 command=command,
@@ -345,6 +614,7 @@ class SSHManager:
         working_dir: str | None = None,
         fail_fast: bool = False,
         force: bool = False,
+        dry_run: bool = False,
     ) -> list[ExecResult]:
         """Execute command on all servers in a group in parallel.
 
@@ -355,6 +625,8 @@ class SSHManager:
             working_dir: Working directory for command execution
             fail_fast: Cancel remaining tasks on first failure
             force: Bypass dangerous command detection (use with caution)
+            dry_run: If True, preview what WOULD run on each server without
+                connecting. Dangerous-command detection still applies.
 
         Returns:
             List of ExecResult, one per server in the group
@@ -372,7 +644,12 @@ class SSHManager:
             async def execute_with_semaphore(server: ServerConfig) -> ExecResult:
                 async with semaphore:
                     return await self.execute(
-                        server.name, command, timeout, working_dir, force
+                        server.name,
+                        command,
+                        timeout,
+                        working_dir,
+                        force,
+                        dry_run,
                     )
 
             # Execute in parallel
@@ -453,7 +730,9 @@ class SSHManager:
         Emits three-stage audit logs (start → complete | failed) with the
         ``connection_id`` and a monotonic ``duration_ms`` bound into the
         structlog context so every log line from a single transfer is
-        grep-correlatable.
+        grep-correlatable. Also opens an OpenTelemetry ``ssh.upload`` span
+        (Green Team H2 fix) with ``ssh.host`` and path-length attributes —
+        lengths not contents so nothing sensitive leaks into trace backends.
 
         Args:
             server_name: Server name from registry
@@ -462,6 +741,27 @@ class SSHManager:
 
         Returns:
             Confirmation message with file size
+        """
+        if _ssh_tracer is None:
+            return await self._upload_impl(server_name, local_path, remote_path)
+        with _ssh_tracer.start_as_current_span("ssh.upload") as span:
+            span.set_attribute("ssh.host", server_name)
+            span.set_attribute("ssh.local_path_length", len(local_path))
+            span.set_attribute("ssh.remote_path_length", len(remote_path))
+            try:
+                return await self._upload_impl(server_name, local_path, remote_path)
+            except Exception as e:
+                span.set_attribute("ssh.error_type", type(e).__name__)
+                span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
+                raise
+
+    async def _upload_impl(
+        self, server_name: str, local_path: str, remote_path: str
+    ) -> str:
+        """Internal upload implementation without tracing.
+
+        See ``upload`` for the public contract. Separated so the span
+        wrapper stays thin.
         """
         # Validate paths BEFORE logging so audit logs do not contain
         # sensitive values when validation blocks the call.
@@ -511,8 +811,8 @@ class SSHManager:
                 "sftp.upload.failed error=file_not_found duration_ms=%s",
                 duration_ms,
             )
-            error_msg = f"Local file not found: {e}"
-            logger.error(error_msg)
+            error_msg = f"Local file not found: {_safe_log_value(str(e))}"
+            logger.error("%s", error_msg)
             raise ValueError(error_msg) from e
 
         except (
@@ -527,8 +827,11 @@ class SSHManager:
                 type(e).__name__,
                 duration_ms,
             )
-            error_msg = f"Upload failed to {server_name}: {e}"
-            logger.error(error_msg)
+            error_msg = (
+                f"Upload failed to {_safe_log_value(server_name)}: "
+                f"{_safe_log_value(str(e))}"
+            )
+            logger.error("%s", error_msg)
             raise RuntimeError(error_msg) from e
 
         finally:
@@ -542,7 +845,8 @@ class SSHManager:
         Emits three-stage audit logs (start → complete | failed) with the
         ``connection_id`` and a monotonic ``duration_ms`` bound into the
         structlog context so every log line from a single transfer is
-        grep-correlatable.
+        grep-correlatable. Also opens an OpenTelemetry ``ssh.download``
+        span (Green Team H2 fix).
 
         Args:
             server_name: Server name from registry
@@ -552,6 +856,23 @@ class SSHManager:
         Returns:
             Confirmation message with file size
         """
+        if _ssh_tracer is None:
+            return await self._download_impl(server_name, remote_path, local_path)
+        with _ssh_tracer.start_as_current_span("ssh.download") as span:
+            span.set_attribute("ssh.host", server_name)
+            span.set_attribute("ssh.remote_path_length", len(remote_path))
+            span.set_attribute("ssh.local_path_length", len(local_path))
+            try:
+                return await self._download_impl(server_name, remote_path, local_path)
+            except Exception as e:
+                span.set_attribute("ssh.error_type", type(e).__name__)
+                span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
+                raise
+
+    async def _download_impl(
+        self, server_name: str, remote_path: str, local_path: str
+    ) -> str:
+        """Internal download implementation without tracing."""
         _validate_remote_path(remote_path)
         _validate_local_path(local_path)
 
@@ -602,8 +923,11 @@ class SSHManager:
                 type(e).__name__,
                 duration_ms,
             )
-            error_msg = f"Download failed from {server_name}: {e}"
-            logger.error(error_msg)
+            error_msg = (
+                f"Download failed from {_safe_log_value(server_name)}: "
+                f"{_safe_log_value(str(e))}"
+            )
+            logger.error("%s", error_msg)
             raise RuntimeError(error_msg) from e
 
         finally:
@@ -624,9 +948,13 @@ class SSHManager:
             try:
                 conn.close()
                 await conn.wait_closed()
-                logger.info(f"Closed connection to {server_name}")
+                logger.info("Closed connection to %s", _safe_log_value(server_name))
             except Exception as e:
-                logger.warning(f"Error closing connection to {server_name}: {e}")
+                logger.warning(
+                    "Error closing connection to %s: %s",
+                    _safe_log_value(server_name),
+                    _safe_log_value(str(e)),
+                )
 
         self._connections.clear()
         self._last_used.clear()
@@ -680,7 +1008,10 @@ class SSHManager:
                     return conn
                 else:
                     # Connection is stale, remove it
-                    logger.info(f"Connection to {server_name} is closed, reconnecting")
+                    logger.info(
+                        "Connection to %s is closed, reconnecting",
+                        _safe_log_value(server_name),
+                    )
                     del self._connections[server_name]
                     del self._last_used[server_name]
 

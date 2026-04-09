@@ -44,6 +44,14 @@ dev = [
     "mypy>=1.15",
     "pip-audit>=2.9",
     "hypothesis>=6.151.0,<7.0.0",
+    # OTel SDK is needed at test time for the in-memory exporter.
+    "opentelemetry-sdk>=1.30.0,<2.0.0",
+]
+# Optional runtime extras. `ssh-mcp[otel]` installs only the API layer — the
+# SDK + exporter are up to the operator (bring-your-own pipeline to Jaeger,
+# Tempo, OTLP collectors, etc). This keeps the default install lightweight.
+otel = [
+    "opentelemetry-api>=1.30.0,<2.0.0",
 ]
 
 [build-system]

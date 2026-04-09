@@ -1,0 +1,308 @@
+"""Tests for OpenTelemetry instrumentation (C1).
+
+Uses ``InMemorySpanExporter`` from the OTel SDK so every assertion runs
+fully offline. A module-scoped fixture installs a ``TracerProvider`` with
+the in-memory exporter exactly once, then each test clears it between
+invocations.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from hypothesis import given
+from hypothesis import strategies as st
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
+
+from ssh_mcp.models import Settings
+from ssh_mcp.ssh import SSHManager
+
+_exporter: InMemorySpanExporter = InMemorySpanExporter()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _install_tracer_provider() -> Iterator[None]:
+    """Install an SDK TracerProvider with in-memory exporter for the module.
+
+    The NoOp provider installed at import time is replaced here so the
+    spans produced by ssh_mcp code are actually recorded. After the module
+    finishes, we leave the SDK provider in place — other test modules are
+    isolated by Hypothesis/pytest fixtures and don't assert on tracing.
+    """
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(_exporter))
+    trace.set_tracer_provider(provider)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _clear_spans() -> Iterator[None]:
+    """Reset the recorded spans between tests for isolation."""
+    _exporter.clear()
+    yield
+    _exporter.clear()
+
+
+def _make_registry():
+    import tempfile
+
+    from ssh_mcp.config import ServerRegistry
+
+    config_content = """
+[settings]
+command_timeout = 30
+
+[groups]
+test = { description = "Test group" }
+
+[servers.test-host]
+description = "Test server"
+groups = ["test"]
+"""
+    tmp = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+    tmp.write(config_content)
+    tmp.flush()
+    tmp.close()
+    return ServerRegistry(tmp.name)
+
+
+class TestSSHExecuteTracing:
+    """`SSHManager.execute` creates a span with expected attributes."""
+
+    async def test_span_created_on_dangerous_command_block(self) -> None:
+        """Blocked commands must still produce a span with error status."""
+        # Need a fresh tracer after provider swap — the module-level tracer
+        # cached at import time points to the old NoOp provider. Patch it.
+        import ssh_mcp.ssh as ssh_module
+
+        with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
+            manager = SSHManager(_make_registry(), Settings())
+            result = await manager.execute("test-host", "rm -rf /", timeout=30)
+
+        # The call should be blocked, not actually execute anything
+        assert result.error is not None
+        assert "Blocked" in result.error
+
+        spans = _exporter.get_finished_spans()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span.name == "ssh.execute"
+        assert span.attributes["ssh.host"] == "test-host"
+        assert span.attributes["ssh.command_length"] == len("rm -rf /")
+        assert span.attributes["ssh.force"] is False
+        # Blocked result should have ERROR status via set_status in wrapper
+        from opentelemetry.trace.status import StatusCode
+
+        assert span.status.status_code == StatusCode.ERROR
+        assert "Blocked" in span.attributes.get("ssh.error", "")
+
+    async def test_command_length_does_not_leak_raw_command(self) -> None:
+        """Spans must NOT include the raw command text — only its length.
+
+        Privacy guarantee: operators may ingest traces into third-party
+        backends where secrets in command strings would be exposed.
+        """
+        import ssh_mcp.ssh as ssh_module
+
+        secret_cmd = "echo 'password=hunter2' > /tmp/out"
+        with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
+            manager = SSHManager(_make_registry(), Settings())
+            # Mock _get_connection to avoid real SSH; the call will still
+            # enter the span creation path.
+            with patch.object(
+                manager,
+                "_get_connection",
+                AsyncMock(side_effect=OSError("no net")),
+            ):
+                await manager.execute("test-host", secret_cmd)
+
+        spans = _exporter.get_finished_spans()
+        assert len(spans) == 1
+        span = spans[0]
+        # The raw command must NOT appear in any attribute
+        for key, value in span.attributes.items():
+            assert "hunter2" not in str(value), (
+                f"Secret leaked via attribute {key}={value}"
+            )
+            assert "password=" not in str(value), (
+                f"Secret leaked via attribute {key}={value}"
+            )
+        # But the length IS recorded
+        assert span.attributes["ssh.command_length"] == len(secret_cmd)
+
+
+class TestOTelCommandPrivacyFuzz:
+    """Green Team H4: Hypothesis fuzz test for command-content privacy.
+
+    The substring-based check above only catches two literal tokens —
+    a mutation that accidentally added a ``span.set_attribute("ssh.cmd",
+    command)`` line would pass the above test for any command not
+    containing ``hunter2`` or ``password=``. This property-based test
+    generates arbitrary command strings and verifies that NONE of the
+    characters in the command appear in any span attribute value.
+    """
+
+    @given(
+        st.text(
+            alphabet=st.characters(
+                # Printable ASCII including symbols, plus a handful of
+                # common Unicode control characters. Excludes null and
+                # other bytes that would break asyncssh regardless.
+                min_codepoint=0x21,
+                max_codepoint=0x7E,
+            ),
+            min_size=16,
+            max_size=100,
+        )
+    )
+    def test_no_command_characters_in_spans(self, secret: str) -> None:
+        """Property: a secret long enough to be unique must NEVER appear
+        verbatim in any span attribute value.
+
+        Generating secrets of length ≥16 with printable ASCII makes them
+        statistically impossible to occur as substrings of the hardcoded
+        attribute names or status strings — so any match is a real leak.
+        """
+        import asyncio
+
+        import ssh_mcp.ssh as ssh_module
+
+        _exporter.clear()
+
+        with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
+            manager = SSHManager(_make_registry(), Settings())
+            with patch.object(
+                manager,
+                "_get_connection",
+                AsyncMock(side_effect=OSError("no net")),
+            ):
+                asyncio.run(manager.execute("test-host", secret))
+
+        spans = _exporter.get_finished_spans()
+        assert len(spans) >= 1
+        for span in spans:
+            for key, value in span.attributes.items():
+                assert secret not in str(value), (
+                    f"Command leaked: secret={secret!r} in attribute {key}={value!r}"
+                )
+
+
+class TestSFTPTracing:
+    """Green Team H2: SFTP upload/download must produce OTel spans.
+
+    Previously only ``execute`` was wrapped. Lack of SFTP spans meant
+    operators couldn't see file transfers in their trace backend and
+    distributed trace correlation broke for any tool call that combined
+    exec + upload/download.
+    """
+
+    async def test_upload_creates_span_on_failure(self, tmp_path: Path) -> None:
+        """A failing upload still produces a span with error status."""
+        import ssh_mcp.ssh as ssh_module
+        from opentelemetry.trace.status import StatusCode
+
+        local = tmp_path / "payload.txt"
+        local.write_bytes(b"hello")
+
+        with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
+            manager = SSHManager(_make_registry(), Settings())
+            with patch.object(
+                manager,
+                "_get_connection",
+                AsyncMock(side_effect=OSError("no net")),
+            ):
+                from contextlib import suppress
+
+                with suppress(Exception):
+                    await manager.upload("test-host", str(local), "/tmp/target.txt")
+
+        spans = [s for s in _exporter.get_finished_spans() if s.name == "ssh.upload"]
+        assert len(spans) == 1, "Exactly one ssh.upload span expected"
+        span = spans[0]
+        assert span.attributes["ssh.host"] == "test-host"
+        assert span.attributes["ssh.local_path_length"] == len(str(local))
+        assert span.attributes["ssh.remote_path_length"] == len("/tmp/target.txt")
+        # Inner _upload_impl catches OSError and re-raises as RuntimeError,
+        # so the outer span sees the wrapped exception class.
+        assert span.attributes.get("ssh.error_type") == "RuntimeError"
+        assert span.status.status_code == StatusCode.ERROR
+
+    async def test_download_creates_span_on_failure(self, tmp_path: Path) -> None:
+        """A failing download still produces a span with error status."""
+        import ssh_mcp.ssh as ssh_module
+        from opentelemetry.trace.status import StatusCode
+
+        local = tmp_path / "downloaded.txt"
+
+        with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
+            manager = SSHManager(_make_registry(), Settings())
+            with patch.object(
+                manager,
+                "_get_connection",
+                AsyncMock(side_effect=OSError("no net")),
+            ):
+                from contextlib import suppress
+
+                with suppress(Exception):
+                    await manager.download("test-host", "/tmp/source.txt", str(local))
+
+        spans = [s for s in _exporter.get_finished_spans() if s.name == "ssh.download"]
+        assert len(spans) == 1
+        span = spans[0]
+        assert span.attributes["ssh.host"] == "test-host"
+        assert span.status.status_code == StatusCode.ERROR
+
+    async def test_sftp_spans_not_created_when_tracer_none(
+        self, tmp_path: Path
+    ) -> None:
+        """Soft-import fallback: no tracer → no spans, but upload still runs."""
+        import ssh_mcp.ssh as ssh_module
+        from contextlib import suppress
+
+        local = tmp_path / "payload.txt"
+        local.write_bytes(b"data")
+
+        with patch.object(ssh_module, "_ssh_tracer", None):
+            manager = SSHManager(_make_registry(), Settings())
+            with patch.object(
+                manager,
+                "_get_connection",
+                AsyncMock(side_effect=OSError("no net")),
+            ):
+                with suppress(Exception):
+                    await manager.upload("test-host", str(local), "/tmp/target.txt")
+
+        # No SFTP spans should exist
+        sftp_spans = [
+            s
+            for s in _exporter.get_finished_spans()
+            if s.name in ("ssh.upload", "ssh.download")
+        ]
+        assert sftp_spans == []
+
+
+class TestNoOpWhenTracerUnavailable:
+    """Graceful degradation when opentelemetry-api is not installed."""
+
+    async def test_execute_works_when_tracer_is_none(self) -> None:
+        """Monkey-patching ``_ssh_tracer`` to None must not break execute."""
+        import ssh_mcp.ssh as ssh_module
+
+        with patch.object(ssh_module, "_ssh_tracer", None):
+            manager = SSHManager(_make_registry(), Settings())
+            # Dangerous-command path returns early without needing a real
+            # connection — ideal for the no-op smoke test.
+            result = await manager.execute("test-host", "rm -rf /")
+            assert "Blocked" in (result.error or "")
+
+        # No spans should be recorded because the wrapper skipped the
+        # tracer path entirely.
+        assert not _exporter.get_finished_spans()

@@ -136,7 +136,57 @@ claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx ssh-mcp
 |---|---|---|
 | `SSH_MCP_CONFIG` | — | Absolute path to a TOML config file. Overrides the default search path. |
 | `SSH_MCP_LOG_FORMAT` | `console` | Log output format. Set to `json` to emit single-line JSON events (timestamp, level, event, contextvars) suitable for log aggregators like Loki, Datadog, or Splunk. Any other value falls back to the colorized console renderer. |
+| `SSH_MCP_TRANSPORT` | `stdio` | MCP transport. `stdio` = classic subprocess transport (default, used by Claude Desktop / Claude Code via `uvx ssh-mcp`). `http` or `streamable-http` = run as a network service over MCP streamable HTTP. |
+| `SSH_MCP_HTTP_HOST` | `127.0.0.1` | Bind address for HTTP transport. **Binding to any non-localhost value (e.g. `0.0.0.0`) REQUIRES `SSH_MCP_HTTP_TOKEN` — startup aborts otherwise.** |
+| `SSH_MCP_HTTP_PORT` | `8000` | TCP port for HTTP transport. |
+| `SSH_MCP_HTTP_TOKEN` | — | Shared bearer secret. When set, every request must carry `Authorization: Bearer <token>` (scheme case-insensitive per RFC 7235) or receive HTTP 401. Mandatory for non-localhost binds. Minimum length 16 characters — shorter tokens are rejected at startup. Leading/trailing whitespace is stripped so `.env` files with trailing newlines work as expected. |
+| `SSH_MCP_HTTP_STATELESS` | `false` | Set to `true` for stateless sessions (recommended for load-balanced or serverless deployments). Default is stateful with server-side sessions. |
+| `SSH_MCP_HTTP_ALLOWED_HOSTS` | — | Comma-separated extra Host-header values the SDK's DNS-rebinding protection should permit (e.g. `ssh-mcp.internal:*,api.example.com:8000`). Localhost aliases are always permitted. |
 | `HYPOTHESIS_PROFILE` | `dev` | For local development / CI only. Set to `ci` to run property-based tests with `max_examples=200` instead of `50`. |
+
+### Running over HTTP
+
+ssh-mcp exposes the MCP streamable HTTP transport as an alternative to stdio. This lets MCP-aware clients connect over the network instead of launching a subprocess, which is useful for containerized deployments, shared-team servers, or anything that needs to survive a client restart.
+
+**Security first.** ssh-mcp runs shell commands on remote servers. Exposing the HTTP endpoint without authentication is equivalent to exposing a root shell. The startup code enforces this:
+
+- Binding to `127.0.0.1` / `localhost` / `::1` without a token is allowed — this matches the single-user workstation model.
+- Binding to ANY other address without `SSH_MCP_HTTP_TOKEN` raises `RuntimeError` at startup and the process exits.
+- The MCP SDK's DNS-rebinding protection is enabled by default. Remote clients connecting via a hostname must have it listed in `SSH_MCP_HTTP_ALLOWED_HOSTS`.
+- Bearer-token comparison uses `hmac.compare_digest` to prevent timing attacks.
+
+Local loopback (no auth needed):
+
+```bash
+SSH_MCP_TRANSPORT=http ssh-mcp
+# → listening on http://127.0.0.1:8000/mcp
+```
+
+Container deployment with bearer auth:
+
+```bash
+TOKEN=$(openssl rand -hex 32)
+docker run -d \
+  -p 8000:8000 \
+  -e SSH_MCP_TRANSPORT=http \
+  -e SSH_MCP_HTTP_HOST=0.0.0.0 \
+  -e SSH_MCP_HTTP_TOKEN="$TOKEN" \
+  -e SSH_MCP_HTTP_STATELESS=true \
+  -e SSH_MCP_HTTP_ALLOWED_HOSTS='ssh-mcp.internal:*' \
+  -v ~/.ssh:/home/sshmcp/.ssh:ro \
+  -v ./servers.toml:/config/servers.toml:ro \
+  -e SSH_MCP_CONFIG=/config/servers.toml \
+  ghcr.io/blackaxgit/ssh-mcp:latest
+```
+
+Clients connect with:
+
+```
+Authorization: Bearer <TOKEN>
+Host: ssh-mcp.internal
+```
+
+For stateful sessions (default), FastMCP maintains per-client context across requests. For stateless deployments behind a load balancer, set `SSH_MCP_HTTP_STATELESS=true` — each request is handled independently with no server-side session.
 
 ### Config file location
 
@@ -197,7 +247,15 @@ chmod 600 ~/.config/ssh-mcp/servers.toml
 
 ## Security
 
-**Dangerous command blocking.** ssh-mcp rejects commands that match known destructive patterns (`rm -rf /`, disk wipes, fork bombs, `mkfs`, `chmod 777 /`, etc.) unless the tool caller passes `force=true`. ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normalized to spaces before pattern matching so `rm\x00-rf /` is caught just like `rm -rf /`. The regex is fuzz-tested with Hypothesis on every CI run.
+**Dangerous command blocking.** ssh-mcp rejects commands that match known destructive patterns — `rm -rf /`, `rm -rf ~`, `find / -delete`, `find / -exec rm`, `shred /dev/*`, `wipefs /dev/*`, `mkfs`, `dd if=...`, `> /dev/sd*`, `chmod 777 /`, fork bombs (spaced and adjacent variants) — unless the tool caller passes `force=true`. ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normalized to spaces before matching, so `rm\x00-rf /` is caught just like `rm -rf /`. The regex is fuzz-tested with Hypothesis on every CI run.
+
+> **This is a TRIPWIRE, not a security boundary.** The regex catches obvious accidents and shortcut destructive commands. It does NOT defend against a motivated attacker:
+> - Base64-encoded payloads (`echo <b64> | base64 -d | bash`) bypass by design
+> - Shell hex escapes (`$'\x72\x6d -rf /'`) are interpreted AFTER regex matching
+> - Unicode homoglyphs (Cyrillic `р`, Greek `ρ`) do not match Latin `r`
+> - Indirection via `$(...)`, `` `...` ``, `eval`, `python -c`, etc. can hide intent
+>
+> If you need real isolation for untrusted tool callers, sandbox at a lower layer: run ssh-mcp inside a container with a restricted SSH config, use `ForceCommand` on the managed servers, or audit `force=false` usage via the structured logs. The dangerous-command filter exists to stop LLM accidents and typos, not adversaries.
 
 When `force=true` is used, the audit log records the bypass explicitly so the operator has a clean paper trail. Do not grant `force=true` to untrusted MCP clients.
 

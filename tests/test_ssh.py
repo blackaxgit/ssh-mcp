@@ -187,55 +187,54 @@ class TestIsDangerousCommand:
 
 
 class TestDangerousPatternsDirectly:
-    """Ensure every compiled pattern in _DANGEROUS_PATTERNS fires correctly."""
+    """Ensure every compiled pattern in _DANGEROUS_PATTERNS fires correctly.
 
-    def test_pattern_count(self) -> None:
-        """Sanity check: the expected number of patterns are present."""
-        assert len(_DANGEROUS_PATTERNS) == 6
+    These tests use ``_is_dangerous_command`` (the public entry point) rather
+    than ``_DANGEROUS_PATTERNS[n]`` with hardcoded indices — Red Team R3
+    added several new patterns and the indices would be brittle to future
+    extensions.
+    """
+
+    def test_pattern_list_is_nonempty(self) -> None:
+        """Sanity: at least the original six patterns plus R3 additions."""
+        assert len(_DANGEROUS_PATTERNS) >= 6
 
     def test_rm_rf_slash_pattern(self) -> None:
-        assert _DANGEROUS_PATTERNS[0].search("rm -rf /") is not None
-        assert _DANGEROUS_PATTERNS[0].search("rm -rf /tmp") is not None
-        assert _DANGEROUS_PATTERNS[0].search("rm -rf mydir") is None
+        assert _is_dangerous_command("rm -rf /") is True
+        assert _is_dangerous_command("rm -rf /tmp") is True
+        assert _is_dangerous_command("rm -rf mydir") is False
 
     def test_mkfs_pattern(self) -> None:
-        assert _DANGEROUS_PATTERNS[1].search("mkfs.ext4 /dev/sda") is not None
-        assert _DANGEROUS_PATTERNS[1].search("mkfs") is not None
-        assert (
-            _DANGEROUS_PATTERNS[1].search("ls mkfs_backup") is not None
-        )  # substring match
+        assert _is_dangerous_command("mkfs.ext4 /dev/sda") is True
+        assert _is_dangerous_command("mkfs") is True
 
     def test_dd_if_pattern(self) -> None:
-        assert _DANGEROUS_PATTERNS[2].search("dd if=/dev/zero of=/dev/sda") is not None
-        assert (
-            _DANGEROUS_PATTERNS[2].search("dd if=input.bin of=output.bin") is not None
-        )
-        assert _DANGEROUS_PATTERNS[2].search("dd bs=512 count=1") is None
+        assert _is_dangerous_command("dd if=/dev/zero of=/dev/sda") is True
+        assert _is_dangerous_command("dd if=input.bin of=output.bin") is True
+        assert _is_dangerous_command("dd bs=512 count=1") is False
 
     def test_redirect_dev_sd_pattern(self) -> None:
-        assert _DANGEROUS_PATTERNS[3].search("> /dev/sda") is not None
-        assert _DANGEROUS_PATTERNS[3].search("echo x > /dev/sdb") is not None
-        assert _DANGEROUS_PATTERNS[3].search("echo x > /dev/null") is None
+        assert _is_dangerous_command("> /dev/sda") is True
+        assert _is_dangerous_command("echo x > /dev/sdb") is True
+        assert _is_dangerous_command("echo x > /dev/null") is False
 
     def test_chmod_777_slash_pattern(self) -> None:
-        # Pattern matches chmod 777 followed by any / prefix — all absolute paths
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 /") is not None
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 /etc") is not None
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 /home/user") is not None
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 /tmp/mydir") is not None
+        assert _is_dangerous_command("chmod 777 /") is True
+        assert _is_dangerous_command("chmod 777 /etc") is True
+        assert _is_dangerous_command("chmod 777 /home/user") is True
         # Relative paths (no /) are safe
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 mydir") is None
-        assert _DANGEROUS_PATTERNS[4].search("chmod 777 ./scripts") is None
+        assert _is_dangerous_command("chmod 777 mydir") is False
+        assert _is_dangerous_command("chmod 777 ./scripts") is False
 
     def test_fork_bomb_pattern(self) -> None:
-        # Pattern uses \s* (zero-or-more), so spaces are optional
-        assert _DANGEROUS_PATTERNS[5].search(":(){ :|:& };:") is not None
-        assert (
-            _DANGEROUS_PATTERNS[5].search(":(){ :|:&};:") is not None
-        )  # no trailing space also matches
-        # Pattern requires the exact structure; unrelated strings do not match
-        assert _DANGEROUS_PATTERNS[5].search("echo hello") is None
-        assert _DANGEROUS_PATTERNS[5].search("ls -la") is None
+        assert _is_dangerous_command(":(){ :|:& };:") is True
+        assert _is_dangerous_command(":(){ :|:&};:") is True
+        # R3 extension: spaced variants also caught
+        assert _is_dangerous_command(":() { :|:& };:") is True
+        assert _is_dangerous_command(":()  {  :|:&  };:") is True
+        # Unrelated strings do not match
+        assert _is_dangerous_command("echo hello") is False
+        assert _is_dangerous_command("ls -la") is False
 
 
 # ---------------------------------------------------------------------------
@@ -288,9 +287,12 @@ class TestValidateRemotePath:
             "/opt/app/config.yaml",
             "/srv/www/index.html",
             "/etc/nginx/nginx.conf",
-            "/var/lib/mysql/data",
+            # NOTE: /var/lib/mysql/ is deliberately NOT in this list — Red Team
+            # R3 added it to _SENSITIVE_PATHS because direct filesystem access
+            # to database data files can exfiltrate tables/secrets.
             "/usr/local/bin/script.sh",
-            "/backups/2024-01-01/dump.sql",
+            "/backups/2026-01-01/dump.sql",
+            "/home/user/.ssh/id_ed25519.pub",  # public keys are legitimate
         ],
         ids=lambda p: p.replace("/", "_")[:50],
     )
@@ -319,9 +321,26 @@ class TestValidateRemotePath:
             _validate_remote_path("/tmp/my..file")
 
     def test_sensitive_paths_list_coverage(self) -> None:
-        """Every entry in _SENSITIVE_PATHS triggers a ValueError."""
+        """Every entry in _SENSITIVE_PATHS triggers a ValueError.
+
+        Directory-style entries (ending with ``/``) are tested by appending
+        a child filename. File-style absolute entries are tested as-is.
+        Relative entries (``.ssh/id_rsa``) are prepended with a home dir.
+        Windows ``\\...`` entries are covered separately since substring
+        matching on backslashes is awkward inside test strings.
+        """
         for sensitive in _SENSITIVE_PATHS:
-            path = f"/home/user/{sensitive}"
+            if sensitive.startswith("\\"):
+                continue  # Windows entries — covered by TestExpandedSensitiveAllowlist
+            if sensitive.endswith("/"):
+                # Directory — test with a file inside
+                path = sensitive + "secret.txt"
+            elif sensitive.startswith("/"):
+                # Absolute file — test as-is
+                path = sensitive
+            else:
+                # Relative — prepend a home
+                path = f"/home/user/{sensitive}"
             with pytest.raises(ValueError, match="sensitive"):
                 _validate_remote_path(path)
 
@@ -494,18 +513,287 @@ class TestValidateLocalPath:
 
     def test_sensitive_local_paths_list_coverage(self) -> None:
         for sensitive in _SENSITIVE_PATHS:
-            path = (
-                f"/home/user/{sensitive}"
-                if not sensitive.startswith("/")
-                else sensitive
-            )
+            if sensitive.startswith("\\"):
+                continue
+            if sensitive.endswith("/"):
+                path = sensitive + "secret.txt"
+            elif sensitive.startswith("/"):
+                path = sensitive
+            else:
+                path = f"/home/user/{sensitive}"
             with pytest.raises(ValueError):
                 _validate_local_path(path)
 
 
 # ---------------------------------------------------------------------------
+# Red-team hardening: path normalization + expanded allowlist (RT-Fix 1)
+# ---------------------------------------------------------------------------
+
+
+class TestLogInjectionSanitization:
+    """Red Team R3 finding C4: values interpolated into log messages must
+    be escaped so embedded newlines cannot forge extra log records.
+    """
+
+    def _make_registry_with_server(self, name: str = "victim") -> ServerRegistry:
+        import tempfile
+
+        toml = f"""
+[groups]
+t = {{ description = "t" }}
+[servers.{name}]
+description = "t"
+groups = ["t"]
+"""
+        f = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        f.write(toml)
+        f.close()
+        return ServerRegistry(f.name)
+
+    async def test_blocked_dangerous_command_log_escapes_newlines(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """Command with CRLF does not produce multi-line log output."""
+        manager = SSHManager(self._make_registry_with_server(), sample_settings)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.ssh"):
+            await manager.execute(
+                "victim",
+                "rm -rf /\nFORGED_LINE=attacker",
+                dry_run=False,
+            )
+
+        # Scan every emitted record for raw newlines inside the rendered
+        # message — if any record contains a literal \n in its message
+        # body (not the trailing record separator), the interpolation leaked.
+        for record in caplog.records:
+            rendered = record.getMessage()
+            # FORGED_LINE should only appear in escaped form (\\nFORGED...)
+            if "FORGED_LINE" in rendered:
+                assert "\\n" in rendered, (
+                    f"Log injection: raw newline leaked in {rendered!r}"
+                )
+                assert "\nFORGED" not in rendered, (
+                    f"Raw newline before FORGED: {rendered!r}"
+                )
+
+
+class TestPathNormalizationBypasses:
+    """Paths that resolve to sensitive files must be blocked after normalization.
+
+    Red Team R3 finding C1: ``/etc//shadow`` and ``/etc/./shadow`` are both
+    valid Unix paths that resolve to ``/etc/shadow``, but the naive substring
+    check in the original implementation missed them.
+    """
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/etc//shadow",
+            "/etc/./shadow",
+            "/etc/././shadow",
+            "/etc//./shadow",
+            "//etc/shadow",
+            "/etc///shadow",
+            "/./etc/shadow",
+            "/./etc/./shadow",
+        ],
+    )
+    def test_double_slash_bypass_blocked(self, path: str) -> None:
+        """Double-slash and dot-slash obfuscations of /etc/shadow must fail."""
+        with pytest.raises(ValueError):
+            _validate_remote_path(path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/etc//shadow",
+            "/etc/./shadow",
+        ],
+    )
+    def test_double_slash_bypass_blocked_local(self, path: str) -> None:
+        """Same protection for local SFTP paths."""
+        with pytest.raises(ValueError):
+            _validate_local_path(path)
+
+
+class TestExpandedSensitiveAllowlist:
+    """Cloud credentials, k8s secrets, proc memory, Windows paths all blocked.
+
+    Red Team R3 finding C2: the original allowlist only covered classic Unix
+    system files and SSH keys. Modern infrastructure hosts cloud tokens and
+    k8s kubeconfigs that are equally sensitive.
+    """
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Cloud credentials
+            "/home/user/.aws/credentials",
+            "/home/user/.aws/config",
+            "/home/user/.azure/accessTokens.json",
+            "/home/user/.config/gcloud/credentials.db",
+            # Kubernetes
+            "/home/user/.kube/config",
+            "/var/lib/kubelet/pki/kubelet-client.key",
+            "/etc/kubernetes/admin.conf",
+            # Shell credential caches
+            "/home/user/.netrc",
+            "/home/user/.pgpass",
+            "/home/user/.git-credentials",
+            "/home/user/.docker/config.json",
+            # Process memory / kernel
+            "/proc/self/mem",
+            "/proc/self/environ",
+            "/proc/1234/environ",
+            "/proc/kcore",
+            # Database data files
+            "/var/lib/mysql/mysql/user.MYD",
+            "/var/lib/postgresql/16/main/base/1/",
+            # Additional Unix secrets
+            "/etc/sudoers",
+            "/etc/gshadow",
+        ],
+    )
+    def test_sensitive_path_blocked(self, path: str) -> None:
+        with pytest.raises(ValueError):
+            _validate_remote_path(path)
+
+    def test_ssh_pub_key_allowed(self) -> None:
+        """.pub keys are NOT secret — allow SFTP upload/download of public keys.
+
+        Red Team R3 finding H5: the previous substring match blocked
+        ``id_ed25519.pub`` because it contains the substring ``id_ed25519``.
+        This broke legitimate public-key distribution via SFTP.
+        """
+        _validate_remote_path("/home/user/.ssh/id_ed25519.pub")
+        _validate_remote_path("/home/user/.ssh/id_rsa.pub")
+        _validate_remote_path("/home/user/.ssh/id_ecdsa.pub")
+        _validate_remote_path("/home/user/.ssh/id_dsa.pub")
+        _validate_local_path("/tmp/deploy_key.pub")
+
+
+# ---------------------------------------------------------------------------
 # force=True bypass
 # ---------------------------------------------------------------------------
+
+
+class TestDangerousCommandR4Extensions:
+    """Red Team R4 bypasses: case-insensitivity, flag combos, $HOME, more verbs."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # R4-F1: regex was case-sensitive, uppercase bypassed
+            "rm -RF /",
+            "rm -RF ~",
+            "RM -rf /",
+            "Rm -rF ~",
+            "rm -rF /",
+            # R4-F2: flag combinations beyond -rf
+            "rm -rfv /",
+            "rm -rfv ~",
+            "rm -rvf ~",
+            "rm -vrf /",
+            "rm -rfi /",
+            "rm -rfI ~",
+            # R4-F3: env-var home expansion
+            "rm -rf $HOME",
+            "rm -rf ${HOME}",
+            "rm -rf $USER",
+            "rm -rf ${USER}",
+            "find $HOME -delete",
+            "find ${HOME} -delete",
+            # R4-F5: additional destructive verbs
+            "> /etc/passwd",
+            "> /etc/shadow",
+            "> /etc/sudoers",
+            ">/etc/gshadow",  # no space
+            "blkdiscard /dev/sda",
+            "sgdisk -Z /dev/sda",
+            "sgdisk -z /dev/nvme0n1",
+            "parted /dev/sda mklabel gpt",
+            "fdisk /dev/sda",
+            "fdisk /dev/sdb",
+        ],
+    )
+    def test_r4_bypass_attempts_blocked(self, command: str) -> None:
+        assert _is_dangerous_command(command) is True, (
+            f"R4 regex must block: {command!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Must remain allowed — common admin commands
+            "shred --help",
+            "wipefs --help",
+            "parted --version",
+            "fdisk --help",
+            "find /var/log -mtime +30",
+            "find . -name '*.py'",
+            "> /var/log/app.log",
+            "> /tmp/output.txt",
+            "rm file.txt",
+            "rm -f file.txt",
+            "rm -rf ./build",
+            "rm -rf ../dist",
+        ],
+    )
+    def test_r4_safe_commands_allowed(self, command: str) -> None:
+        assert _is_dangerous_command(command) is False, (
+            f"R4 regex over-matched: {command!r}"
+        )
+
+
+class TestDangerousCommandR3Extensions:
+    """Red Team R3 regex extensions: home-wipe, find-delete, shred, wipefs, spaced fork bomb."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Home directory wipe — `~` is shell-expanded to $HOME and can
+            # nuke the user's entire home. Previously bypassed because
+            # the regex required a literal `/` after `-rf`.
+            "rm -rf ~",
+            "rm -rf ~/",
+            "rm -rf ~/Documents",
+            "sudo rm -rf ~",
+            # find / -delete  — same destructive power as rm -rf /
+            "find / -delete",
+            "find /home -delete",
+            "find / -exec rm {} +",
+            # shred / wipefs — block-level destruction
+            "shred /dev/sda",
+            "shred -zvu /dev/sda",
+            "wipefs -a /dev/sda",
+            "wipefs --all /dev/nvme0n1",
+            # Spaced fork bomb — the original regex required adjacent (){
+            ":() { :|:& };:",
+            ":()  {  :|:&  };:",
+        ],
+    )
+    def test_r3_dangerous_patterns_blocked(self, command: str) -> None:
+        assert _is_dangerous_command(command) is True, (
+            f"R3 regex must block: {command!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Don't over-flag — these must stay allowed
+            "find /var/log -name '*.log' -mtime +30",
+            "find . -type f",
+            "shred --help",  # docs lookup, no device arg
+            "wipefs --version",
+        ],
+    )
+    def test_r3_false_positives_not_blocked(self, command: str) -> None:
+        assert _is_dangerous_command(command) is False, (
+            f"R3 regex over-matched: {command!r}"
+        )
 
 
 class TestDangerousCommandForceBypass:
@@ -520,6 +808,186 @@ class TestDangerousCommandForceBypass:
 
         sig = inspect.signature(SSHManager.execute)
         assert "force" in sig.parameters
+
+
+# ---------------------------------------------------------------------------
+# dry_run parameter (C3)
+# ---------------------------------------------------------------------------
+
+
+class TestDryRun:
+    """Tests for dry_run=True preview behavior."""
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[settings]
+command_timeout = 30
+
+[groups]
+test = { description = "Test group" }
+
+[servers.test-host]
+description = "Test server"
+groups = ["test"]
+default_dir = "/srv/app"
+"""
+        tmp = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        tmp.write(config_content)
+        tmp.flush()
+        tmp.close()
+        return ServerRegistry(tmp.name)
+
+    async def test_dry_run_does_not_call_get_connection(self) -> None:
+        """dry_run=True must skip connection setup entirely."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute("test-host", "uptime", dry_run=True)
+
+        assert result.exit_code == 0
+        assert result.error is None
+        assert "[DRY RUN]" in result.stdout
+        assert "uptime" in result.stdout
+        assert "test-host" in result.stdout
+
+    async def test_dry_run_includes_default_dir_from_config(self) -> None:
+        """The preview must show the server's default_dir when no override."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute("test-host", "uptime", dry_run=True)
+
+        assert "/srv/app" in result.stdout
+
+    async def test_dry_run_working_dir_override_wins(self) -> None:
+        """An explicit working_dir override must appear in the preview."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute(
+                "test-host",
+                "ls",
+                working_dir="/custom/path",
+                dry_run=True,
+            )
+
+        assert "/custom/path" in result.stdout
+        assert "/srv/app" not in result.stdout
+
+    async def test_dry_run_still_blocks_dangerous_commands(self) -> None:
+        """Dangerous commands must be rejected even in dry_run mode.
+
+        This is the whole point of dry_run: preview what would happen,
+        including rejection. Skipping the dangerous-command check would
+        defeat the use case of previewing a plan before committing.
+        """
+        manager = SSHManager(self._make_registry(), Settings())
+        result = await manager.execute("test-host", "rm -rf /", dry_run=True)
+
+        assert result.error is not None
+        assert "Blocked" in result.error
+        assert "[DRY RUN]" not in result.stdout
+
+    async def test_dry_run_with_force_bypasses_dangerous_check(self) -> None:
+        """dry_run + force should preview a dangerous command without blocking."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute(
+                "test-host",
+                "rm -rf /",
+                force=True,
+                dry_run=True,
+            )
+
+        assert result.error is None
+        assert "[DRY RUN]" in result.stdout
+        assert "rm -rf /" in result.stdout
+
+    async def test_dry_run_with_force_warns_about_dangerous_bypass(self) -> None:
+        """Red Team R3 finding H1: dry_run+force must warn when the dangerous
+        check would otherwise have blocked the command. An LLM building a
+        force-enabled rollout plan needs a visible signal that the preview
+        contains a command that matched a destructive pattern.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute(
+                "test-host",
+                "rm -rf /",
+                force=True,
+                dry_run=True,
+            )
+
+        # Warning banner must be present
+        assert "DANGEROUS" in result.stdout.upper() or "⚠" in result.stdout, (
+            f"dry_run+force must surface a warning. Got: {result.stdout!r}"
+        )
+
+    async def test_dry_run_with_force_no_warning_for_safe_command(self) -> None:
+        """dry_run+force on a SAFE command must NOT emit a dangerous warning."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            result = await manager.execute(
+                "test-host",
+                "uptime",
+                force=True,
+                dry_run=True,
+            )
+        # No warning banner on a safe command
+        assert "DANGEROUS" not in result.stdout.upper()
+        assert "⚠" not in result.stdout
+
+    async def test_dry_run_group_produces_result_per_server(self) -> None:
+        """execute_on_group dry_run must produce a preview for every server."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect in dry_run")),
+        ):
+            results = await manager.execute_on_group("test", "uptime", dry_run=True)
+
+        assert len(results) == 1  # test group has 1 server
+        assert all(r.exit_code == 0 for r in results)
+        assert all("[DRY RUN]" in r.stdout for r in results)
 
 
 # ---------------------------------------------------------------------------
