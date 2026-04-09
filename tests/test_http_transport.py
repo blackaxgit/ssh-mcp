@@ -69,6 +69,110 @@ def _reset_server_globals() -> Iterator[None]:
 # ---------------------------------------------------------------------------
 
 
+class TestOptionalAuthMode:
+    """SSH_MCP_HTTP_AUTH=none disables the bearer middleware.
+
+    Feature for operators who put ssh-mcp behind a trusted reverse proxy
+    that handles authentication. Requires explicit acknowledgement when
+    binding to a non-localhost address so accidental exposure is impossible.
+    """
+
+    def test_auth_none_on_localhost_allowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """auth=none + localhost bind → allowed (matches stdio model)."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_AUTH", "none")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        monkeypatch.delenv("SSH_MCP_HTTP_NETWORK_NO_AUTH", raising=False)
+        with patch("uvicorn.run") as mock_run:
+            _run_http()
+        mock_run.assert_called_once()
+
+    def test_auth_none_on_public_bind_refused_without_ack(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """auth=none + 0.0.0.0 → refuse without explicit acknowledgement."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "0.0.0.0")
+        monkeypatch.setenv("SSH_MCP_HTTP_AUTH", "none")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        monkeypatch.delenv("SSH_MCP_HTTP_NETWORK_NO_AUTH", raising=False)
+        with pytest.raises(RuntimeError, match="SSH_MCP_HTTP_NETWORK_NO_AUTH"):
+            _run_http()
+
+    def test_auth_none_on_public_bind_refused_with_wrong_ack(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ack env var must match a specific value, not any truthy."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "0.0.0.0")
+        monkeypatch.setenv("SSH_MCP_HTTP_AUTH", "none")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        monkeypatch.setenv("SSH_MCP_HTTP_NETWORK_NO_AUTH", "true")
+        with pytest.raises(RuntimeError, match="I_ACCEPT_RCE_RISK"):
+            _run_http()
+
+    def test_auth_none_on_public_bind_allowed_with_exact_ack(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exact magic-string ack unlocks the no-auth public bind."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "0.0.0.0")
+        monkeypatch.setenv("SSH_MCP_HTTP_AUTH", "none")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        monkeypatch.setenv("SSH_MCP_HTTP_NETWORK_NO_AUTH", "I_ACCEPT_RCE_RISK")
+        with patch("uvicorn.run") as mock_run:
+            _run_http()
+        mock_run.assert_called_once()
+
+    def test_auth_none_does_not_install_middleware(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When auth=none is active, no bearer middleware is attached."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_AUTH", "none")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+
+        captured: list[str | None] = []
+
+        def fake_build(token):  # type: ignore[no-untyped-def]
+            captured.append(token)
+            return _make_dummy_asgi_app()
+
+        with patch("ssh_mcp.server._build_http_app", side_effect=fake_build):
+            with patch("uvicorn.run"):
+                _run_http()
+
+        assert captured == [None], (
+            f"auth=none must pass token=None to _build_http_app, got {captured!r}"
+        )
+
+    def test_auth_bearer_is_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unset SSH_MCP_HTTP_AUTH defaults to bearer (backwards compatible).
+
+        Non-localhost bind without token still raises (no change from v0.3.1).
+        """
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "0.0.0.0")
+        monkeypatch.delenv("SSH_MCP_HTTP_AUTH", raising=False)
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        with pytest.raises(RuntimeError, match="SSH_MCP_HTTP_TOKEN must be set"):
+            _run_http()
+
+    def test_auth_mode_is_case_insensitive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_AUTH", "NONE")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        with patch("uvicorn.run") as mock_run:
+            _run_http()
+        mock_run.assert_called_once()
+
+    def test_unknown_auth_mode_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_AUTH", "oauth")
+        with pytest.raises(RuntimeError, match="SSH_MCP_HTTP_AUTH"):
+            _run_http()
+
+
 class TestGracefulShutdown:
     """Green Team H1: lifespan must close SSH connections on shutdown."""
 

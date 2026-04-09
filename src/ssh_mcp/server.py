@@ -678,17 +678,22 @@ def _run_http() -> None:
       Using any non-localhost value (``0.0.0.0``, a LAN IP, etc.) REQUIRES
       ``SSH_MCP_HTTP_TOKEN`` to be set, otherwise startup aborts.
     * ``SSH_MCP_HTTP_PORT`` — TCP port, default ``8000``.
-    * ``SSH_MCP_HTTP_TOKEN`` — shared bearer secret. When set, every
-      request must carry ``Authorization: Bearer <token>`` or receive 401.
-      Clients use this to authenticate to the MCP server over HTTP.
+    * ``SSH_MCP_HTTP_AUTH`` — authentication mode, default ``bearer``.
+      Set to ``none`` to skip the bearer middleware entirely (typical
+      when ssh-mcp sits behind a trusted reverse proxy that performs
+      authentication itself). When ``none`` is combined with a
+      non-localhost bind, ``SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK``
+      is ALSO required — this is a deliberately verbose escape hatch.
+    * ``SSH_MCP_HTTP_TOKEN`` — shared bearer secret (required when
+      ``SSH_MCP_HTTP_AUTH=bearer`` and bind is non-localhost). When set,
+      every request must carry ``Authorization: Bearer <token>`` or 401.
+    * ``SSH_MCP_HTTP_NETWORK_NO_AUTH`` — magic-string opt-out for the
+      ``auth=none`` + non-localhost combination. Must equal literal
+      ``I_ACCEPT_RCE_RISK`` to take effect.
     * ``SSH_MCP_HTTP_STATELESS`` — if ``true``, FastMCP runs in stateless
-      mode (no server-side sessions). Recommended for load-balanced or
-      serverless deployments. Default ``false`` (stateful sessions with
-      streaming support).
-    * ``SSH_MCP_HTTP_ALLOWED_HOSTS`` — comma-separated list of Host headers
-      permitted by the SDK's DNS-rebinding protection. Defaults to
-      ``127.0.0.1:*,localhost:*,[::1]:*``. Expand when serving remote
-      clients: e.g. ``ssh-mcp.internal:*``.
+      mode. Recommended for load-balanced or serverless deployments.
+    * ``SSH_MCP_HTTP_ALLOWED_HOSTS`` — comma-separated extra Host headers
+      for DNS-rebinding protection (in addition to localhost).
     """
     import uvicorn
 
@@ -699,6 +704,16 @@ def _run_http() -> None:
     token = raw_token or None
     stateless = os.environ.get("SSH_MCP_HTTP_STATELESS", "false").lower() == "true"
     allowed_hosts_env = os.environ.get("SSH_MCP_HTTP_ALLOWED_HOSTS", "").strip()
+
+    # Auth-mode dispatch. Default ``bearer`` preserves v0.3.1 behavior.
+    # ``none`` disables the bearer middleware entirely — useful when a
+    # reverse proxy handles authentication.
+    auth_mode = os.environ.get("SSH_MCP_HTTP_AUTH", "bearer").strip().lower()
+    if auth_mode not in {"bearer", "none"}:
+        raise RuntimeError(
+            f"Unknown SSH_MCP_HTTP_AUTH={auth_mode!r}. "
+            "Valid values: 'bearer' (default), 'none'."
+        )
 
     # Security gate: refuse to expose the server to non-localhost traffic
     # without a token. Localhost binds remain unauthenticated because they
@@ -715,12 +730,32 @@ def _run_http() -> None:
     except ValueError:
         # Hostname (not an IP literal) — fall back to the known-safe names
         is_localhost = host.lower() in {"localhost"}
-    if not is_localhost and token is None:
-        raise RuntimeError(
-            f"SSH_MCP_HTTP_TOKEN must be set when binding to {host!r}. "
-            "Refusing to expose SSH command execution over the network "
-            "without bearer-token authentication."
-        )
+
+    if auth_mode == "bearer":
+        if not is_localhost and token is None:
+            raise RuntimeError(
+                f"SSH_MCP_HTTP_TOKEN must be set when binding to {host!r}. "
+                "Refusing to expose SSH command execution over the network "
+                "without bearer-token authentication."
+            )
+    else:  # auth_mode == "none"
+        # Force token to None so the wrapper doesn't attach the middleware
+        # even if the operator left SSH_MCP_HTTP_TOKEN set by mistake.
+        token = None
+        if not is_localhost:
+            # Require the long-form escape hatch for network binds.
+            ack = os.environ.get("SSH_MCP_HTTP_NETWORK_NO_AUTH", "")
+            if ack != "I_ACCEPT_RCE_RISK":
+                raise RuntimeError(
+                    f"SSH_MCP_HTTP_AUTH=none with host={host!r} is refused. "
+                    "Binding an unauthenticated SSH command executor to a "
+                    "non-localhost address is equivalent to granting a "
+                    "remote root shell to anyone who can reach the port. "
+                    "If you understand the risk and handle authentication "
+                    "at a reverse proxy, set environment variable "
+                    "SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK to "
+                    "proceed."
+                )
 
     # Apply settings to the module-level FastMCP instance. The SDK reads
     # these fields at ``streamable_http_app()`` construction time.
@@ -768,20 +803,36 @@ def _run_http() -> None:
 
     from ssh_mcp import __version__
 
+    effective_auth = "bearer" if token else "none"
     logger.info(
         "Starting ssh-mcp v%s (streamable-http) on %s:%s stateless=%s auth=%s",
         __version__,
         host,
         port,
         stateless,
-        "bearer" if token else "NONE",
+        effective_auth,
     )
-    if token is None and is_localhost:
-        logger.warning(
-            "HTTP transport is running WITHOUT authentication on %s. "
-            "Do NOT forward this port beyond the loopback interface.",
-            host,
-        )
+    if token is None:
+        if is_localhost:
+            logger.warning(
+                "HTTP transport is running WITHOUT authentication on %s. "
+                "Do NOT forward this port beyond the loopback interface.",
+                host,
+            )
+        else:
+            # Loud banner for operators who opted into the no-auth escape
+            # hatch — they passed the long-form ack so they know, but the
+            # log stream should still scream about it.
+            logger.warning(
+                "⚠️  ssh-mcp is serving UNAUTHENTICATED HTTP on %s:%s. "
+                "You accepted SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK. "
+                "Every request that reaches /mcp can execute shell commands "
+                "on the configured remote servers. Terminate auth at your "
+                "reverse proxy and NEVER expose this port to an untrusted "
+                "network.",
+                host,
+                port,
+            )
 
     app = _build_http_app(token)
 

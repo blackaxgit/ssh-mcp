@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-09
+
+### Added
+
+- **Optional HTTP authentication mode (`SSH_MCP_HTTP_AUTH`)** — set to `none` to disable the built-in bearer middleware entirely. Intended for deployments where a trusted reverse proxy (Caddy, nginx, Traefik, Envoy, Cloudflare Access, etc.) handles authentication at the edge.
+- **`SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK` escape hatch** — required when combining `SSH_MCP_HTTP_AUTH=none` with a non-localhost bind. Deliberately verbose magic-string value so no operator sets it by accident. Without the exact match, `_run_http` raises with a detailed explanation of the risk.
+- Startup now logs a loud warning banner whenever ssh-mcp is running without authentication on a non-localhost bind.
+- README has a new "Reverse proxy deployment" subsection with a concrete Docker command and a three-point checklist before opting into no-auth mode.
+
+### Changed
+
+- `SSH_MCP_HTTP_TOKEN` is no longer always required for non-localhost binds — it's only required when `SSH_MCP_HTTP_AUTH` is `bearer` (the default). Existing deployments are unaffected because `bearer` is the default mode.
+- When `SSH_MCP_HTTP_AUTH=none` is set, any stray `SSH_MCP_HTTP_TOKEN` value is ignored so operators can't accidentally mix modes.
+
+### Security
+
+- The no-auth mode is safe by default: localhost binds work with a plain warning, but non-localhost binds refuse to start unless the operator explicitly sets `SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK`. This is a deliberate design: the escape hatch requires the operator to physically type the words "I ACCEPT RCE RISK" before ssh-mcp serves unauthenticated traffic to a network.
+
 ## [0.3.1] - 2026-04-09
 
 ### Fixed
@@ -142,7 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.1.1...v0.2.0
