@@ -474,9 +474,201 @@ async def download_file(
     return await ssh.download(server, remote_path, local_path)
 
 
-def main() -> None:
-    """Entry point for console script (uvx ssh-mcp)."""
+def _wrap_with_bearer_auth(inner_app: Any, token: str) -> Any:
+    """Wrap an ASGI ``inner_app`` in a bearer-token auth Starlette wrapper.
+
+    Extracted from ``_build_http_app`` so the middleware can be unit-tested
+    in isolation against a trivial downstream app, without needing the
+    full MCP session-manager lifespan.
+
+    The middleware:
+      * Requires ``Authorization: Bearer <token>`` header on every request
+      * Uses ``hmac.compare_digest`` to prevent timing attacks on the secret
+      * Returns 401 with ``WWW-Authenticate`` on missing/invalid credentials
+      * Does NOT exempt any path — ssh-mcp exposes no OAuth discovery, and
+        an unauthenticated health probe would leak server presence to
+        scanners anyway
+    """
+    from starlette.applications import Starlette
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from starlette.routing import Mount
+
+    class _BearerAuth(BaseHTTPMiddleware):
+        def __init__(self, wrapped_app: Any, expected: str) -> None:
+            super().__init__(wrapped_app)
+            self._expected = expected
+
+        async def dispatch(self, request: Request, call_next: Any) -> Any:
+            import hmac
+
+            auth = request.headers.get("authorization", "")
+            if not auth.startswith("Bearer "):
+                return JSONResponse(
+                    {"error": "missing bearer token"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": 'Bearer realm="ssh-mcp"'},
+                )
+            supplied = auth[len("Bearer ") :]
+            if not hmac.compare_digest(supplied, self._expected):
+                return JSONResponse(
+                    {"error": "invalid bearer token"},
+                    status_code=401,
+                )
+            return await call_next(request)
+
+    wrapper = Starlette(routes=[Mount("/", app=inner_app)])
+    wrapper.add_middleware(_BearerAuth, expected=token)
+    return wrapper
+
+
+def _build_http_app(token: str | None) -> Any:
+    """Return the Starlette ASGI app for streamable HTTP transport.
+
+    When ``token`` is provided, wraps the FastMCP app in a bearer-token
+    authentication middleware via ``_wrap_with_bearer_auth``. ``ssh-mcp``
+    executes shell commands on remote servers, so running the HTTP
+    transport without authentication is a serious risk — the CLI entry
+    point enforces this for non-local binds before reaching this function.
+
+    Returns a Starlette app (either the raw FastMCP one or a wrapper).
+    """
+    app = mcp.streamable_http_app()
+    if token is None:
+        return app
+    return _wrap_with_bearer_auth(app, token)
+
+
+def _run_http() -> None:
+    """Run ssh-mcp over MCP streamable HTTP transport.
+
+    Configured via environment variables:
+
+    * ``SSH_MCP_HTTP_HOST`` — bind address, default ``127.0.0.1``.
+      Using any non-localhost value (``0.0.0.0``, a LAN IP, etc.) REQUIRES
+      ``SSH_MCP_HTTP_TOKEN`` to be set, otherwise startup aborts.
+    * ``SSH_MCP_HTTP_PORT`` — TCP port, default ``8000``.
+    * ``SSH_MCP_HTTP_TOKEN`` — shared bearer secret. When set, every
+      request must carry ``Authorization: Bearer <token>`` or receive 401.
+      Clients use this to authenticate to the MCP server over HTTP.
+    * ``SSH_MCP_HTTP_STATELESS`` — if ``true``, FastMCP runs in stateless
+      mode (no server-side sessions). Recommended for load-balanced or
+      serverless deployments. Default ``false`` (stateful sessions with
+      streaming support).
+    * ``SSH_MCP_HTTP_ALLOWED_HOSTS`` — comma-separated list of Host headers
+      permitted by the SDK's DNS-rebinding protection. Defaults to
+      ``127.0.0.1:*,localhost:*,[::1]:*``. Expand when serving remote
+      clients: e.g. ``ssh-mcp.internal:*``.
+    """
+    import uvicorn
+
+    host = os.environ.get("SSH_MCP_HTTP_HOST", "127.0.0.1")
+    port = int(os.environ.get("SSH_MCP_HTTP_PORT", "8000"))
+    token = os.environ.get("SSH_MCP_HTTP_TOKEN") or None
+    stateless = os.environ.get("SSH_MCP_HTTP_STATELESS", "false").lower() == "true"
+    allowed_hosts_env = os.environ.get("SSH_MCP_HTTP_ALLOWED_HOSTS", "").strip()
+
+    # Security gate: refuse to expose the server to non-localhost traffic
+    # without a token. Localhost binds remain unauthenticated because they
+    # match the historical stdio deployment model (single-user workstation).
+    is_localhost = host in {"127.0.0.1", "localhost", "::1"}
+    if not is_localhost and token is None:
+        raise RuntimeError(
+            f"SSH_MCP_HTTP_TOKEN must be set when binding to {host!r}. "
+            "Refusing to expose SSH command execution over the network "
+            "without bearer-token authentication."
+        )
+
+    # Apply settings to the module-level FastMCP instance. The SDK reads
+    # these fields at ``streamable_http_app()`` construction time.
+    mcp.settings.host = host
+    mcp.settings.port = port
+    mcp.settings.stateless_http = stateless
+    if allowed_hosts_env:
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        extra_hosts = [h.strip() for h in allowed_hosts_env.split(",") if h.strip()]
+        existing = mcp.settings.transport_security
+        default_origins = [
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*",
+        ]
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[
+                "127.0.0.1:*",
+                "localhost:*",
+                "[::1]:*",
+                *extra_hosts,
+            ],
+            allowed_origins=(
+                list(existing.allowed_origins)
+                if existing is not None
+                else default_origins
+            ),
+        )
+
     from ssh_mcp import __version__
+
+    logger.info(
+        "Starting ssh-mcp v%s (streamable-http) on %s:%s stateless=%s auth=%s",
+        __version__,
+        host,
+        port,
+        stateless,
+        "bearer" if token else "NONE",
+    )
+    if token is None and is_localhost:
+        logger.warning(
+            "HTTP transport is running WITHOUT authentication on %s. "
+            "Do NOT forward this port beyond the loopback interface.",
+            host,
+        )
+
+    app = _build_http_app(token)
+
+    # Run the ASGI server. uvicorn's own access logs go to stdout by
+    # default — route them to stderr to preserve the MCP convention that
+    # protocol output and operational logs are on separate channels.
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_config=None,  # use the root logger we configured above
+    )
+
+
+def main() -> None:
+    """Entry point for console script (uvx ssh-mcp).
+
+    Dispatches on ``SSH_MCP_TRANSPORT``:
+
+    * ``stdio`` (default) — classic MCP stdio subprocess transport,
+      used by Claude Desktop / Claude Code via ``uvx ssh-mcp``.
+    * ``http`` or ``streamable-http`` — MCP streamable HTTP transport on
+      a TCP port. Requires ``SSH_MCP_HTTP_TOKEN`` for non-localhost binds.
+      See ``_run_http`` for the full list of env vars.
+    """
+    from ssh_mcp import __version__
+
+    transport = os.environ.get("SSH_MCP_TRANSPORT", "stdio").strip().lower()
+
+    if transport in ("http", "streamable-http"):
+        try:
+            config_path = _get_config_path()
+            logger.info(f"Config will be loaded from {config_path} on first tool call")
+        except FileNotFoundError as e:
+            logger.warning(f"No config file found yet: {e}")
+        _run_http()
+        return
+
+    if transport != "stdio":
+        raise ValueError(
+            f"Unknown SSH_MCP_TRANSPORT={transport!r}. "
+            "Valid values: stdio, http, streamable-http."
+        )
 
     logger.info(
         f"Starting ssh-mcp v{__version__} (stdio transport) - "

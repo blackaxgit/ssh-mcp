@@ -47,8 +47,16 @@ ENV PATH=/app/.venv/bin:$PATH \
 # Switch to non-root user
 USER sshmcp
 
+# Port 8000 is the default for SSH_MCP_TRANSPORT=http. Only relevant when
+# running the streamable-HTTP transport; stdio deployments ignore this.
+# Override via SSH_MCP_HTTP_PORT env var and republish with -p.
+EXPOSE 8000
+
 # HEALTHCHECK: Python-based import check (slim image has no `ps`)
-# Verifies the ssh_mcp package is importable — signals the runtime is healthy
+# Verifies the ssh_mcp package is importable — signals the runtime is healthy.
+# For HTTP transport, operators may prefer a curl-based probe against
+# http://127.0.0.1:${SSH_MCP_HTTP_PORT:-8000}/mcp but curl is not in the slim
+# image, so the import check is the portable default.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python -c "import ssh_mcp" || exit 1
 
