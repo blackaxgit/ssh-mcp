@@ -129,6 +129,108 @@ class TestBuildHttpApp:
         assert hasattr(app, "user_middleware")
         assert len(app.user_middleware) > 0
 
+    def test_middleware_blocks_unauth_requests_on_real_fastmcp_app(self) -> None:
+        """Green Team H6: stronger mutation-resistance check.
+
+        ``test_with_token_wraps_app`` only checks that SOME middleware is
+        registered. A mutation that swapped the middleware for a no-op
+        class or mounted it in the wrong order would pass that test.
+        This test drives an actual request through the real FastMCP
+        wrapper and verifies the 401 path is hit BEFORE reaching the
+        MCP session manager (which would otherwise raise a different
+        error due to its own lifespan requirement).
+        """
+        app = _build_http_app(token="middleware-integration-test-token")
+        client = TestClient(app)
+        # No Authorization header → middleware must 401 before the MCP
+        # session manager is reached. If the middleware was bypassed,
+        # we'd get a 500 from the missing task group instead.
+        resp = client.get("/mcp")
+        assert resp.status_code == 401
+        assert "bearer" in resp.headers.get("www-authenticate", "").lower()
+
+
+class TestUvicornLogRouting:
+    """Green Team H7: uvicorn access logs must flow through the structlog
+    ProcessorFormatter attached to the root logger.
+
+    We verify this by checking that the ``uvicorn`` logger hierarchy has
+    no handlers of its own (so records propagate to root) AND that the
+    root handler is the structlog ProcessorFormatter installed at import.
+    """
+
+    def test_uvicorn_loggers_propagate_to_root(self) -> None:
+        """No handlers on uvicorn loggers means records bubble to root."""
+        import logging
+
+        # After module import, _configure_logging() has attached exactly
+        # one handler on root. Uvicorn logs must reach THAT handler.
+        root = logging.getLogger()
+        assert len(root.handlers) >= 1, "structlog configured root handler must exist"
+
+        # uvicorn, uvicorn.access, uvicorn.error should NOT have their
+        # own handlers by default — if they did, their records would
+        # go to the default uvicorn stderr handler instead of ours.
+        for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+            lg = logging.getLogger(name)
+            # propagate must be True so messages reach the root handler
+            assert lg.propagate is True, f"{name} logger does not propagate to root"
+
+    def test_root_handler_is_structlog_processor_formatter(self) -> None:
+        """Structural check: the root logger's single handler must be
+        formatted by ``structlog.stdlib.ProcessorFormatter``.
+
+        This is the handler that uvicorn.access records reach when they
+        propagate from ``uvicorn.access`` → root. If the formatter is
+        anything else, JSON output via SSH_MCP_LOG_FORMAT=json would
+        silently break for HTTP transport.
+        """
+        import logging
+
+        import structlog.stdlib
+
+        import ssh_mcp.server  # noqa: F401  — trigger _configure_logging()
+
+        root = logging.getLogger()
+        # There may be a caplog-injected handler alongside ours; find the
+        # structlog one specifically.
+        structlog_handlers = [
+            h
+            for h in root.handlers
+            if isinstance(
+                getattr(h, "formatter", None),
+                structlog.stdlib.ProcessorFormatter,
+            )
+        ]
+        assert len(structlog_handlers) >= 1, (
+            "Root logger must have a structlog ProcessorFormatter handler "
+            "so uvicorn.access records get structured output. "
+            f"Handlers: {root.handlers}"
+        )
+
+    def test_uvicorn_access_log_record_reaches_root(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """uvicorn.access records must propagate to the root logger.
+
+        Verified via pytest caplog, which attaches to the root logger —
+        if propagation is broken, the record wouldn't appear in caplog.
+        """
+        import logging
+
+        import ssh_mcp.server  # noqa: F401
+
+        with caplog.at_level(logging.INFO, logger="uvicorn.access"):
+            logging.getLogger("uvicorn.access").info(
+                '127.0.0.1:54321 - "GET /mcp HTTP/1.1" 200'
+            )
+
+        access_records = [r for r in caplog.records if r.name == "uvicorn.access"]
+        assert len(access_records) >= 1, (
+            "uvicorn.access record did not reach root logger"
+        )
+        assert "GET /mcp" in access_records[0].getMessage()
+
 
 # ---------------------------------------------------------------------------
 # Bearer-token middleware behavior (Starlette TestClient)

@@ -191,8 +191,7 @@ class TestOTelCommandPrivacyFuzz:
         for span in spans:
             for key, value in span.attributes.items():
                 assert secret not in str(value), (
-                    f"Command leaked: secret={secret!r} in "
-                    f"attribute {key}={value!r}"
+                    f"Command leaked: secret={secret!r} in attribute {key}={value!r}"
                 )
 
 
@@ -205,9 +204,7 @@ class TestSFTPTracing:
     exec + upload/download.
     """
 
-    async def test_upload_creates_span_on_failure(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_upload_creates_span_on_failure(self, tmp_path: Path) -> None:
         """A failing upload still produces a span with error status."""
         import ssh_mcp.ssh as ssh_module
         from opentelemetry.trace.status import StatusCode
@@ -225,28 +222,20 @@ class TestSFTPTracing:
                 from contextlib import suppress
 
                 with suppress(Exception):
-                    await manager.upload(
-                        "test-host", str(local), "/tmp/target.txt"
-                    )
+                    await manager.upload("test-host", str(local), "/tmp/target.txt")
 
-        spans = [
-            s for s in _exporter.get_finished_spans() if s.name == "ssh.upload"
-        ]
+        spans = [s for s in _exporter.get_finished_spans() if s.name == "ssh.upload"]
         assert len(spans) == 1, "Exactly one ssh.upload span expected"
         span = spans[0]
         assert span.attributes["ssh.host"] == "test-host"
         assert span.attributes["ssh.local_path_length"] == len(str(local))
-        assert (
-            span.attributes["ssh.remote_path_length"] == len("/tmp/target.txt")
-        )
+        assert span.attributes["ssh.remote_path_length"] == len("/tmp/target.txt")
         # Inner _upload_impl catches OSError and re-raises as RuntimeError,
         # so the outer span sees the wrapped exception class.
         assert span.attributes.get("ssh.error_type") == "RuntimeError"
         assert span.status.status_code == StatusCode.ERROR
 
-    async def test_download_creates_span_on_failure(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_download_creates_span_on_failure(self, tmp_path: Path) -> None:
         """A failing download still produces a span with error status."""
         import ssh_mcp.ssh as ssh_module
         from opentelemetry.trace.status import StatusCode
@@ -263,13 +252,9 @@ class TestSFTPTracing:
                 from contextlib import suppress
 
                 with suppress(Exception):
-                    await manager.download(
-                        "test-host", "/tmp/source.txt", str(local)
-                    )
+                    await manager.download("test-host", "/tmp/source.txt", str(local))
 
-        spans = [
-            s for s in _exporter.get_finished_spans() if s.name == "ssh.download"
-        ]
+        spans = [s for s in _exporter.get_finished_spans() if s.name == "ssh.download"]
         assert len(spans) == 1
         span = spans[0]
         assert span.attributes["ssh.host"] == "test-host"
@@ -293,9 +278,7 @@ class TestSFTPTracing:
                 AsyncMock(side_effect=OSError("no net")),
             ):
                 with suppress(Exception):
-                    await manager.upload(
-                        "test-host", str(local), "/tmp/target.txt"
-                    )
+                    await manager.upload("test-host", str(local), "/tmp/target.txt")
 
         # No SFTP spans should exist
         sftp_spans = [

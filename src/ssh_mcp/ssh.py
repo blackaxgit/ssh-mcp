@@ -726,14 +726,10 @@ class SSHManager:
             span.set_attribute("ssh.local_path_length", len(local_path))
             span.set_attribute("ssh.remote_path_length", len(remote_path))
             try:
-                return await self._upload_impl(
-                    server_name, local_path, remote_path
-                )
+                return await self._upload_impl(server_name, local_path, remote_path)
             except Exception as e:
                 span.set_attribute("ssh.error_type", type(e).__name__)
-                span.set_status(
-                    _otel_trace.Status(_otel_trace.StatusCode.ERROR)
-                )
+                span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
                 raise
 
     async def _upload_impl(
@@ -838,22 +834,16 @@ class SSHManager:
             Confirmation message with file size
         """
         if _ssh_tracer is None:
-            return await self._download_impl(
-                server_name, remote_path, local_path
-            )
+            return await self._download_impl(server_name, remote_path, local_path)
         with _ssh_tracer.start_as_current_span("ssh.download") as span:
             span.set_attribute("ssh.host", server_name)
             span.set_attribute("ssh.remote_path_length", len(remote_path))
             span.set_attribute("ssh.local_path_length", len(local_path))
             try:
-                return await self._download_impl(
-                    server_name, remote_path, local_path
-                )
+                return await self._download_impl(server_name, remote_path, local_path)
             except Exception as e:
                 span.set_attribute("ssh.error_type", type(e).__name__)
-                span.set_status(
-                    _otel_trace.Status(_otel_trace.StatusCode.ERROR)
-                )
+                span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
                 raise
 
     async def _download_impl(
