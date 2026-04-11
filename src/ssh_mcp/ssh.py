@@ -186,9 +186,7 @@ def _build_credential_subs() -> list[tuple[re.Pattern[str], Any]]:
         #    so ``--password`` can't match ``-p`` at its second character.
         (
             re.compile(r"(?<![\w-])(-p)(['\"])([^'\"]*)(\2)"),
-            lambda m: (
-                f"{m.group(1)}{m.group(2)}{_REDACTION_PLACEHOLDER}{m.group(4)}"
-            ),
+            lambda m: f"{m.group(1)}{m.group(2)}{_REDACTION_PLACEHOLDER}{m.group(4)}",
         ),
         # 5. MySQL/MariaDB short password flag UNQUOTED form:
         #    ``-pSecretValue`` (no space between ``-p`` and the value).
@@ -217,9 +215,7 @@ def _build_credential_subs() -> list[tuple[re.Pattern[str], Any]]:
                 r"(--(?:password|pass|token|secret|api[_-]?key))(\s+)(\S+)",
                 re.IGNORECASE,
             ),
-            lambda m: (
-                f"{m.group(1)}{m.group(2)}{_REDACTION_PLACEHOLDER}"
-            ),
+            lambda m: f"{m.group(1)}{m.group(2)}{_REDACTION_PLACEHOLDER}",
         ),
     ]
 
