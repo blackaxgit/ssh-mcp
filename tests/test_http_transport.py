@@ -69,6 +69,80 @@ def _reset_server_globals() -> Iterator[None]:
 # ---------------------------------------------------------------------------
 
 
+class TestUvicornTuning:
+    """Production incident 2026-04-11: container hit OSError(24, 'Too many
+    open files') because uvicorn default ``timeout_keep_alive=5s`` + bursty
+    n8n traffic accumulated ~110 ESTABLISHED HTTP connections, eventually
+    exceeding the container's 1024 fd limit.
+
+    These tests pin the new ``SSH_MCP_HTTP_*`` knobs that ``_run_http``
+    forwards into ``uvicorn.run``. The defaults are chosen to survive
+    bursty keepalive traffic without tuning.
+    """
+
+    def test_default_keepalive_and_concurrency_passed_to_uvicorn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Defaults: timeout_keep_alive=2s, limit_concurrency=256."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.delenv("SSH_MCP_HTTP_KEEPALIVE_TIMEOUT", raising=False)
+        monkeypatch.delenv("SSH_MCP_HTTP_LIMIT_CONCURRENCY", raising=False)
+        monkeypatch.delenv("SSH_MCP_HTTP_BACKLOG", raising=False)
+        with patch("uvicorn.run") as mock_run:
+            _run_http()
+        _args, kwargs = mock_run.call_args
+        assert kwargs["timeout_keep_alive"] == 2
+        assert kwargs["limit_concurrency"] == 256
+
+    def test_custom_keepalive_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SSH_MCP_HTTP_KEEPALIVE_TIMEOUT=1 overrides the default."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_KEEPALIVE_TIMEOUT", "1")
+        with patch("uvicorn.run") as mock_run:
+            _run_http()
+        _args, kwargs = mock_run.call_args
+        assert kwargs["timeout_keep_alive"] == 1
+
+    def test_custom_limit_concurrency(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SSH_MCP_HTTP_LIMIT_CONCURRENCY=1000 overrides the default."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_LIMIT_CONCURRENCY", "1000")
+        with patch("uvicorn.run") as mock_run:
+            _run_http()
+        _args, kwargs = mock_run.call_args
+        assert kwargs["limit_concurrency"] == 1000
+
+    def test_custom_backlog(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SSH_MCP_HTTP_BACKLOG sets uvicorn backlog."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_BACKLOG", "512")
+        with patch("uvicorn.run") as mock_run:
+            _run_http()
+        _args, kwargs = mock_run.call_args
+        assert kwargs["backlog"] == 512
+
+    def test_invalid_keepalive_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Non-integer SSH_MCP_HTTP_KEEPALIVE_TIMEOUT must raise at startup."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_KEEPALIVE_TIMEOUT", "not-a-number")
+        with pytest.raises((ValueError, RuntimeError)):
+            _run_http()
+
+    def test_negative_keepalive_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Negative keepalive is nonsensical and must be rejected."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_KEEPALIVE_TIMEOUT", "-1")
+        with pytest.raises(RuntimeError, match="SSH_MCP_HTTP_KEEPALIVE_TIMEOUT"):
+            _run_http()
+
+    def test_zero_concurrency_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """limit_concurrency=0 would reject all requests — refuse at startup."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_LIMIT_CONCURRENCY", "0")
+        with pytest.raises(RuntimeError, match="SSH_MCP_HTTP_LIMIT_CONCURRENCY"):
+            _run_http()
+
+
 class TestOptionalAuthMode:
     """SSH_MCP_HTTP_AUTH=none disables the bearer middleware.
 

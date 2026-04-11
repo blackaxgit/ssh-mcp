@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-04-11
+
+### Security
+
+- **CRITICAL: Redact credentials from audit logs and error messages.** Production incident 2026-04-11: the `audit.info` call site in `SSHManager.execute` interpolated the raw `command` value, so `mysql -h host -u admin -pSecretPwd` shipped the plaintext password to stderr, which was then forwarded to centralized log aggregators (Loki/Datadog/Splunk) and visible to every operator with log access. New `_redact_secrets()` helper applies an ordered regex pipeline that replaces known credential patterns with `{REDACTED}` before reaching any logger. Covers:
+  - MySQL/MariaDB short flag `-pValue` (quoted and unquoted forms)
+  - Long flags `--password=`, `--pass=`, `--token=`, `--secret=`, `--api-key=`, both `=` and whitespace separator, all case-insensitive
+  - Known credential env vars: `PGPASSWORD`, `MYSQL_PWD`, `REDIS_PASSWORD`, `MONGODB_PASSWORD`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN`, `NPM_TOKEN`, `GCP_API_KEY`, `AZURE_CLIENT_SECRET`, `TOKEN`, `API_KEY`, `API_TOKEN`, `SECRET`, `SECRET_KEY`, `BEARER_TOKEN`, `ACCESS_TOKEN`, `REFRESH_TOKEN`, `CLIENT_SECRET`, `PRIVATE_KEY`, plus variants
+  - HTTP `Authorization: Bearer/Basic/Digest/Token <value>` headers
+  - Basic auth URLs `scheme://user:password@host` (user preserved, password redacted)
+- Applied to the audit log on success, the audit log on timeout, and both the dangerous-command block and timeout `logger.error` lines. Redaction is idempotent (the placeholder doesn't match any rule) so repeated passes produce identical output.
+- 28 regression tests including 2 Hypothesis property tests to fuzz the redaction pipeline on arbitrary input.
+
+### Fixed
+
+- **CRITICAL: Prevent file descriptor exhaustion under bursty HTTP traffic.** Production incident 2026-04-11: the container crashed with `OSError(24, 'Too many open files')` on `socket.accept()` because uvicorn's default `timeout_keep_alive=5s` combined with bursty n8n HTTP/1.1 traffic accumulated ~110 ESTABLISHED connections, eventually exceeding the Docker default 1024 fd limit. New tuning knobs with safer defaults:
+  - `SSH_MCP_HTTP_KEEPALIVE_TIMEOUT` — default **2s** (down from uvicorn's 5s). Closes idle HTTP/1.1 connections fast enough that ephemeral n8n-style clients don't pile up sockets.
+  - `SSH_MCP_HTTP_LIMIT_CONCURRENCY` — default **256**. Rejects new requests with HTTP 503 once 256 are in flight, preventing unbounded growth under burst load.
+  - `SSH_MCP_HTTP_BACKLOG` — default **128**. Smaller listen backlog caps SYN-flood exposure.
+- Validation at startup: non-numeric, negative, or zero-concurrency values raise `RuntimeError` with the offending env var name.
+- README deployment section now documents `ulimits.nofile: 65536` as the Docker compose mitigation for the 1024 fd default.
+- Compose `ssh-mcp-http` example template updated with `ulimits` block and tuning env var comments.
+
+### Changed
+
+- `SSHManager._execute_impl` now calls `_redact_secrets(command)` in every log interpolation path. OTel `ssh.command_length` attribute is unchanged (length-only, already privacy-safe).
+
 ## [0.4.0] - 2026-04-09
 
 ### Added
@@ -160,7 +187,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.2.0...v0.3.0

@@ -86,6 +86,171 @@ def _safe_log_value(value: Any) -> str:
     return repr(value)
 
 
+# ---------------------------------------------------------------------------
+# Credential redaction (production incident 2026-04-11)
+#
+# Audit logs previously wrote the raw ``command`` value for every tool
+# call, which meant ``mysql -pSecret``, ``PGPASSWORD=xxx psql``, and
+# ``curl -H 'Authorization: Bearer <jwt>' ...`` arrived in stderr, got
+# forwarded to centralized log aggregators (Loki / Datadog / Splunk),
+# and leaked the plaintext secret to every operator with log access.
+#
+# ``_redact_secrets`` runs a set of targeted regex substitutions against
+# a command string before it reaches any logger. The list is a TRIPWIRE
+# for the most common credential patterns — it is NOT a substitute for
+# handling secrets outside of command arguments entirely. When possible,
+# pass credentials via env vars, Docker/K8s secrets, or dedicated config
+# files, NOT on the command line.
+# ---------------------------------------------------------------------------
+
+_REDACTION_PLACEHOLDER: str = "{REDACTED}"
+
+# Environment variables that are known credential sinks. Matched
+# case-insensitively as ``<NAME>=<value>`` substrings.
+_SECRET_ENV_NAMES: tuple[str, ...] = (
+    # Database passwords
+    "PGPASSWORD",
+    "MYSQL_PWD",
+    "REDIS_PASSWORD",
+    "MONGODB_PASSWORD",
+    "DB_PASSWORD",
+    "DATABASE_PASSWORD",
+    # Cloud providers
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GCP_API_KEY",
+    "AZURE_CLIENT_SECRET",
+    # Source control / CI
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "NPM_TOKEN",
+    # Generic / OAuth
+    "TOKEN",
+    "API_KEY",
+    "API_TOKEN",
+    "SECRET",
+    "SECRET_KEY",
+    "BEARER_TOKEN",
+    "ACCESS_TOKEN",
+    "REFRESH_TOKEN",
+    "CLIENT_SECRET",
+    "PRIVATE_KEY",
+)
+
+
+def _build_credential_subs() -> list[tuple[re.Pattern[str], Any]]:
+    """Compile the ordered redaction pipeline.
+
+    Each entry is a ``(pattern, replacement)`` pair. Order matters: URL
+    basic-auth runs first so the ``@`` separator can't be swallowed by a
+    later rule. Env-var patterns run before short-flag patterns because
+    ``PGPASSWORD=xxx`` is more specific than any flag-based match.
+    """
+    env_alt = "|".join(re.escape(name) for name in _SECRET_ENV_NAMES)
+
+    return [
+        # 1. Basic auth credentials embedded in a URL:
+        #    ``scheme://user:password@host``.
+        #    Redacts the password while preserving the ``user`` and ``@``
+        #    separator so operators can still see *which* URL leaked.
+        (
+            re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/\s@]+:)([^@\s]+)(@)"),
+            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}{m.group(3)}",
+        ),
+        # 2. HTTP ``Authorization:`` header with Bearer/Basic/Digest/Token
+        #    scheme. The token follows one or more whitespace chars after
+        #    the scheme keyword.
+        (
+            re.compile(
+                r"(Authorization:\s*(?:Bearer|Basic|Digest|Token)\s+)(\S+)",
+                re.IGNORECASE,
+            ),
+            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+        ),
+        # 3. Known credential env vars: ``PGPASSWORD=value``,
+        #    ``MYSQL_PWD=value``, ``AWS_SECRET_ACCESS_KEY=value``, etc.
+        #    Matched case-insensitively so ``pgpassword=x`` also matches.
+        (
+            re.compile(
+                r"\b(" + env_alt + r")=(\S+)",
+                re.IGNORECASE,
+            ),
+            lambda m: f"{m.group(1)}={_REDACTION_PLACEHOLDER}",
+        ),
+        # 4. MySQL/MariaDB short password flag QUOTED form:
+        #    ``-p'quoted pass'`` / ``-p"quoted pass"``. The quotes are
+        #    preserved so the command shape stays readable.
+        #
+        #    ``(?<![\w-])`` lookbehind rejects BOTH word chars AND dashes,
+        #    so ``--password`` can't match ``-p`` at its second character.
+        (
+            re.compile(r"(?<![\w-])(-p)(['\"])([^'\"]*)(\2)"),
+            lambda m: f"{m.group(1)}{m.group(2)}{_REDACTION_PLACEHOLDER}{m.group(4)}",
+        ),
+        # 5. MySQL/MariaDB short password flag UNQUOTED form:
+        #    ``-pSecretValue`` (no space between ``-p`` and the value).
+        #    Requires at least 3 non-space chars to avoid matching things
+        #    like ``-pv`` which would be a combined flag cluster. The
+        #    ``(?<![\w-])`` lookbehind prevents matching inside a larger
+        #    word (``help``) AND inside the long flag ``--password``.
+        (
+            re.compile(r"(?<![\w-])(-p)(\S{3,})"),
+            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+        ),
+        # 6. Long flags with ``=`` separator:
+        #    ``--password=xxx``, ``--pass=xxx``, ``--token=xxx``,
+        #    ``--secret=xxx``, ``--api-key=xxx``, ``--api_key=xxx``.
+        (
+            re.compile(
+                r"(--(?:password|pass|token|secret|api[_-]?key))=(\S+)",
+                re.IGNORECASE,
+            ),
+            lambda m: f"{m.group(1)}={_REDACTION_PLACEHOLDER}",
+        ),
+        # 7. Long flags with whitespace separator:
+        #    ``--password xxx``, ``--token xxx``, etc.
+        (
+            re.compile(
+                r"(--(?:password|pass|token|secret|api[_-]?key))(\s+)(\S+)",
+                re.IGNORECASE,
+            ),
+            lambda m: f"{m.group(1)}{m.group(2)}{_REDACTION_PLACEHOLDER}",
+        ),
+    ]
+
+
+_CREDENTIAL_SUBS: list[tuple[re.Pattern[str], Any]] = _build_credential_subs()
+
+
+def _redact_secrets(value: Any) -> Any:
+    """Replace known credential patterns in ``value`` with a placeholder.
+
+    Runs a targeted set of substitutions for the most common
+    command-line credential leak patterns (``-pSecret``,
+    ``--password=xxx``, ``PGPASSWORD=xxx``, ``Authorization: Bearer xxx``,
+    ``https://user:pass@host``, and the other patterns compiled by
+    ``_build_credential_subs``).
+
+    Idempotent: applying the function to already-redacted text produces
+    identical output — the placeholder itself does not match any rule.
+    Safe for ``None`` and empty strings (passed through unchanged).
+    Non-string inputs are returned as-is so structured values (ints,
+    dicts, etc.) are not accidentally coerced by the caller.
+
+    This is a TRIPWIRE, not a proof of correctness — operators must
+    still prefer env-file secrets or stdin over command-line arguments.
+    """
+    if value is None or value == "":
+        return value
+    if not isinstance(value, str):
+        return value
+    out = value
+    for pattern, repl in _CREDENTIAL_SUBS:
+        out = pattern.sub(repl, out)
+    return out
+
+
 # Dangerous command patterns that could be destructive.
 #
 # This list is a TRIPWIRE for obvious accidents, NOT a security boundary.
@@ -433,7 +598,7 @@ class SSHManager:
                 logger.warning(
                     "Blocked potentially destructive command on %s: %s",
                     _safe_log_value(server_name),
-                    _safe_log_value(command),
+                    _safe_log_value(_redact_secrets(command)),
                 )
                 return ExecResult(
                     server=server_name,
@@ -522,11 +687,14 @@ class SSHManager:
                     duration_ms=duration_ms,
                 )
 
-                # Audit log successful execution
+                # Audit log successful execution. Secrets embedded in the
+                # command (``-pPassword``, ``PGPASSWORD=xxx``, etc.) are
+                # replaced with a placeholder so they don't leak into
+                # centralized log aggregators.
                 self._audit.info(
                     "server=%s command=%s exit_code=%s duration_ms=%s",
                     server_name,
-                    command,
+                    _redact_secrets(command),
                     exec_result.exit_code,
                     exec_result.duration_ms,
                 )
@@ -538,7 +706,7 @@ class SSHManager:
                 logger.error(
                     "Command timeout on %s: %s",
                     _safe_log_value(server_name),
-                    _safe_log_value(command),
+                    _safe_log_value(_redact_secrets(command)),
                 )
                 exec_result = ExecResult(
                     server=server_name,
@@ -550,11 +718,11 @@ class SSHManager:
                     duration_ms=duration_ms,
                 )
 
-                # Audit log timeout
+                # Audit log timeout (with credentials redacted)
                 self._audit.info(
                     "server=%s command=%s exit_code=%s duration_ms=%s error=timeout",
                     server_name,
-                    command,
+                    _redact_secrets(command),
                     exec_result.exit_code,
                     exec_result.duration_ms,
                 )

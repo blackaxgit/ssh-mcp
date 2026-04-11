@@ -836,6 +836,19 @@ def _run_http() -> None:
 
     app = _build_http_app(token)
 
+    # Tuning knobs for uvicorn — see `_parse_http_tuning` for defaults
+    # and rationale. These exist because the v0.4.0 default (uvicorn's
+    # own ``timeout_keep_alive=5s``) accumulated enough concurrent
+    # keepalive connections under n8n burst traffic to exhaust the
+    # container's 1024 fd limit, crashing on ``socket.accept()``.
+    keepalive, concurrency, backlog = _parse_http_tuning()
+    logger.info(
+        "HTTP tuning: timeout_keep_alive=%ss limit_concurrency=%s backlog=%s",
+        keepalive,
+        concurrency,
+        backlog,
+    )
+
     # Run the ASGI server. uvicorn's own access logs go to stdout by
     # default — route them to stderr to preserve the MCP convention that
     # protocol output and operational logs are on separate channels.
@@ -844,7 +857,54 @@ def _run_http() -> None:
         host=host,
         port=port,
         log_config=None,  # use the root logger we configured above
+        timeout_keep_alive=keepalive,
+        limit_concurrency=concurrency,
+        backlog=backlog,
     )
+
+
+def _parse_http_tuning() -> tuple[int, int, int]:
+    """Parse the uvicorn tuning env vars with validation.
+
+    Returns ``(timeout_keep_alive, limit_concurrency, backlog)``.
+
+    Defaults are chosen to survive bursty keepalive traffic on a
+    1024-fd container (typical Docker default) without tuning:
+
+    * ``timeout_keep_alive=2`` (down from uvicorn's 5s default) —
+      closes idle HTTP/1.1 connections fast so ephemeral clients
+      like n8n don't pile up ESTABLISHED sockets.
+    * ``limit_concurrency=256`` — rejects new requests with 503 once
+      256 in-flight, preventing unbounded connection growth.
+    * ``backlog=128`` — smaller listen backlog than uvicorn's 2048
+      default so a SYN flood is capped earlier.
+
+    Operators can override via ``SSH_MCP_HTTP_KEEPALIVE_TIMEOUT``,
+    ``SSH_MCP_HTTP_LIMIT_CONCURRENCY``, and ``SSH_MCP_HTTP_BACKLOG``.
+
+    Raises:
+        RuntimeError: if any value is non-numeric, negative, or (for
+            ``limit_concurrency``) zero.
+    """
+
+    def _parse_int(name: str, default: int, *, min_value: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or raw.strip() == "":
+            return default
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise RuntimeError(f"{name}={raw!r} is not a valid integer") from exc
+        if value < min_value:
+            raise RuntimeError(
+                f"{name}={value} is below the minimum allowed value {min_value}"
+            )
+        return value
+
+    keepalive = _parse_int("SSH_MCP_HTTP_KEEPALIVE_TIMEOUT", default=2, min_value=0)
+    concurrency = _parse_int("SSH_MCP_HTTP_LIMIT_CONCURRENCY", default=256, min_value=1)
+    backlog = _parse_int("SSH_MCP_HTTP_BACKLOG", default=128, min_value=1)
+    return keepalive, concurrency, backlog
 
 
 def main() -> None:

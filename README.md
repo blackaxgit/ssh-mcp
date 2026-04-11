@@ -142,6 +142,22 @@ claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx ssh-mcp
 | `SSH_MCP_HTTP_TOKEN` | — | Shared bearer secret. When set, every request must carry `Authorization: Bearer <token>` (scheme case-insensitive per RFC 7235) or receive HTTP 401. Mandatory for non-localhost binds (unless `SSH_MCP_HTTP_AUTH=none`). Minimum length 16 characters — shorter tokens are rejected at startup. Leading/trailing whitespace is stripped so `.env` files with trailing newlines work as expected. |
 | `SSH_MCP_HTTP_AUTH` | `bearer` | Authentication mode. `bearer` (default) enables the built-in middleware. `none` disables it entirely — useful when ssh-mcp sits behind a trusted reverse proxy that handles auth at the edge. Combining `none` with a non-localhost bind REQUIRES the explicit acknowledgement env var below. |
 | `SSH_MCP_HTTP_NETWORK_NO_AUTH` | — | Magic-string escape hatch. Must equal literal `I_ACCEPT_RCE_RISK` to allow `SSH_MCP_HTTP_AUTH=none` + non-localhost bind. Intentionally verbose so nobody sets it by accident. |
+| `SSH_MCP_HTTP_KEEPALIVE_TIMEOUT` | `2` | uvicorn `timeout_keep_alive` in seconds. Idle HTTP/1.1 connections are closed after this many seconds. v0.4.0 default (5s) accumulated enough concurrent connections under bursty n8n traffic to exhaust the container's 1024 fd limit — v0.4.1 default 2s is safer for spiky clients. Increase to 5–10 for long-polling MCP clients behind a load balancer. |
+| `SSH_MCP_HTTP_LIMIT_CONCURRENCY` | `256` | uvicorn `limit_concurrency`. Max simultaneous in-flight requests before returning HTTP 503. Prevents unbounded growth under burst load. Tune up for high-QPS deployments; tune down on small containers. |
+| `SSH_MCP_HTTP_BACKLOG` | `128` | uvicorn `backlog` — TCP listen backlog for the accept queue. Smaller caps SYN-flood exposure. |
+
+**fd exhaustion mitigation:** the Docker base image inherits a 1024 fd limit by default. Under sustained burst traffic that can run out quickly. Raise it in your compose file:
+
+```yaml
+ssh-mcp:
+  # ...
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+```
+
+Pair that with the `SSH_MCP_HTTP_KEEPALIVE_TIMEOUT` / `SSH_MCP_HTTP_LIMIT_CONCURRENCY` knobs above for a full fix.
 | `SSH_MCP_HTTP_STATELESS` | `false` | Set to `true` for stateless sessions (recommended for load-balanced or serverless deployments). Default is stateful with server-side sessions. |
 | `SSH_MCP_HTTP_ALLOWED_HOSTS` | — | Comma-separated extra Host-header values the SDK's DNS-rebinding protection should permit (e.g. `ssh-mcp.internal:*,api.example.com:8000`). Localhost aliases are always permitted. |
 | `HYPOTHESIS_PROFILE` | `dev` | For local development / CI only. Set to `ci` to run property-based tests with `max_examples=200` instead of `50`. |

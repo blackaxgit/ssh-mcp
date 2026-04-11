@@ -83,8 +83,21 @@ services:
   #     SSH_MCP_HTTP_STATELESS: "true"
   #     # Structured JSON logs for centralized aggregation (Loki, Datadog, etc.)
   #     SSH_MCP_LOG_FORMAT: "json"
+  #     # uvicorn tuning — survive bursty keepalive traffic (v0.4.1+)
+  #     # Default in the image is already 2s keepalive / 256 concurrency /
+  #     # 128 backlog. Override here only if your traffic pattern differs.
+  #     # SSH_MCP_HTTP_KEEPALIVE_TIMEOUT: "2"
+  #     # SSH_MCP_HTTP_LIMIT_CONCURRENCY: "256"
+  #     # SSH_MCP_HTTP_BACKLOG: "128"
   #     # Optional: extend DNS-rebinding allowlist for your internal hostname
   #     # SSH_MCP_HTTP_ALLOWED_HOSTS: "ssh-mcp.internal:*"
+  #   # Raise the fd limit from Docker's default 1024 so bursty clients
+  #   # don't exhaust the accept queue. A single n8n workflow can open
+  #   # 100+ concurrent HTTP/1.1 connections under load.
+  #   ulimits:
+  #     nofile:
+  #       soft: 65536
+  #       hard: 65536
   #   # Load the bearer token from a .env file (never commit it)
   #   # Create .env.ssh-mcp with: SSH_MCP_HTTP_TOKEN=<32+ char random value>
   #   env_file:

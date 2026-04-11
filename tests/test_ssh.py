@@ -17,9 +17,11 @@ from ssh_mcp.models import Settings
 from ssh_mcp.ssh import (
     SSHManager,
     _DANGEROUS_PATTERNS,
+    _REDACTION_PLACEHOLDER,
     _SENSITIVE_PATHS,
     _is_dangerous_command,
     _make_connection_id,
+    _redact_secrets,
     _validate_local_path,
     _validate_remote_path,
 )
@@ -1262,3 +1264,177 @@ class TestDangerousCommandProperties:
             pos = i % len(cmd)
             cmd = cmd[:pos] + chr(i % 32) + cmd[pos:]
         assert _is_dangerous_command(cmd) is True, f"bypass found: {cmd!r}"
+
+
+# ---------------------------------------------------------------------------
+# Credential redaction (production finding: mysql password leaked to logs)
+# ---------------------------------------------------------------------------
+
+
+class TestRedactSecrets:
+    """``_redact_secrets`` strips credentials from strings before logging.
+
+    Production incident on 2026-04-11: the audit log interpolated the raw
+    ``command`` value and shipped ``mysql -h ... -u freepbxuser -p<PLAIN>``
+    to stderr, which was then forwarded to centralized log aggregators.
+    Passwords must be replaced with a fixed placeholder before reaching
+    any logger.
+    """
+
+    @pytest.mark.parametrize(
+        "command,must_not_contain",
+        [
+            # MySQL client short flag — no space between -p and the value
+            (
+                'mysql -h 10.0.0.5 -u freepbxuser -pJeo56i4CuLzc asteriskcdrdb -e "SHOW TABLES;"',
+                "Jeo56i4CuLzc",
+            ),
+            # MySQL with quoted password
+            (
+                "mysql -u root -p'Secret!Pass123' mydb",
+                "Secret!Pass123",
+            ),
+            # psql --password long flag with equals
+            (
+                "psql --password=HunterTwo42 --host db.internal -U admin",
+                "HunterTwo42",
+            ),
+            # psql --password with space separator
+            (
+                "psql --password TopSecretValue2026 --user admin",
+                "TopSecretValue2026",
+            ),
+            # POSIX env var pattern (inline env)
+            (
+                "PGPASSWORD=MyPgPw pg_dump -h db mydb > /tmp/x",
+                "MyPgPw",
+            ),
+            (
+                "MYSQL_PWD=AnotherSecret mysqladmin flush-hosts",
+                "AnotherSecret",
+            ),
+            # Generic TOKEN=/API_KEY= env
+            (
+                "TOKEN=ey.abc.def curl https://api.example.com/v1/data",
+                "ey.abc.def",
+            ),
+            (
+                "API_KEY=sk-proj-abcdef123456 python deploy.py",
+                "sk-proj-abcdef123456",
+            ),
+            # HTTP Authorization header inline
+            (
+                'curl -H "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def" https://api',
+                "eyJhbGciOiJIUzI1NiJ9.abc.def",
+            ),
+            # Basic auth URL (username:password@host)
+            (
+                "wget https://admin:P4ssw0rd@internal.example.com/file.tgz",
+                "P4ssw0rd",
+            ),
+            # Long flag uppercase (--PASSWORD via case-insensitive match)
+            # NOTE: in MySQL CLI ``-P`` short flag is PORT (not password),
+            # so we intentionally do NOT test uppercase short flag.
+            (
+                "mysql --PASSWORD=UpperCaseName mydb",
+                "UpperCaseName",
+            ),
+            # AWS creds in env
+            (
+                "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCY/EXAMPLE aws s3 ls",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCY/EXAMPLE",
+            ),
+        ],
+        ids=lambda x: x[:40] if isinstance(x, str) else "p",
+    )
+    def test_known_credential_patterns_redacted(
+        self, command: str, must_not_contain: str
+    ) -> None:
+        """Every known credential pattern must be replaced with the placeholder."""
+        redacted = _redact_secrets(command)
+        assert must_not_contain not in redacted, (
+            f"Secret leaked: {must_not_contain!r} still present in {redacted!r}"
+        )
+        assert _REDACTION_PLACEHOLDER in redacted, (
+            f"Expected redaction placeholder in output: {redacted!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "safe_command",
+        [
+            # These must NOT be touched
+            "ls -la /var/log",
+            "uptime",
+            "systemctl status nginx",
+            "cat /etc/nginx/nginx.conf",
+            "ps auxf | grep python",
+            "df -h",
+            "find /var/log -mtime +30",
+            "mysql --help",  # no password present
+            "psql --version",
+            # Business text that happens to contain 'token' as a word
+            "echo 'the auth token was rotated yesterday'",
+        ],
+    )
+    def test_safe_commands_unchanged(self, safe_command: str) -> None:
+        """Commands without credentials must pass through untouched."""
+        assert _redact_secrets(safe_command) == safe_command
+
+    def test_redaction_is_idempotent(self) -> None:
+        """Redacting an already-redacted string yields the same string."""
+        once = _redact_secrets("mysql -u root -pSecret123 mydb")
+        twice = _redact_secrets(once)
+        assert once == twice
+
+    def test_redaction_preserves_structure(self) -> None:
+        """Operators should still recognize the command shape after redaction."""
+        redacted = _redact_secrets("mysql -h db -u admin -pHuntr2 dbname")
+        assert redacted.startswith("mysql -h db -u admin")
+        assert "dbname" in redacted
+        assert "Huntr2" not in redacted
+
+    def test_redaction_handles_none_and_empty(self) -> None:
+        """Edge cases: None and empty string must not crash."""
+        assert _redact_secrets("") == ""
+        assert _redact_secrets(None) is None  # type: ignore[arg-type]
+
+    def test_multiple_secrets_in_one_command(self) -> None:
+        """A command with TWO secrets redacts BOTH."""
+        cmd = "MYSQL_PWD=first mysql -u root -pSecond mydb"
+        redacted = _redact_secrets(cmd)
+        assert "first" not in redacted
+        assert "Second" not in redacted
+
+    @given(st.text(min_size=1, max_size=200))
+    def test_redaction_never_crashes_on_arbitrary_input(self, text: str) -> None:
+        """Property: redaction never raises on any string input."""
+        result = _redact_secrets(text)
+        assert isinstance(result, str)
+        # Result must never be longer than input by more than one placeholder
+        # per potential secret match — bound generously
+        assert len(result) < len(text) * 10 + 1000
+
+    @given(
+        st.sampled_from(
+            # NOTE: MySQL ``-P`` (uppercase) is the PORT flag, not password,
+            # so only lowercase ``-p`` is tested as a credential prefix.
+            ["-p", "--password=", "--password ", "PGPASSWORD=", "MYSQL_PWD="]
+        ),
+        st.text(
+            alphabet=st.characters(
+                whitelist_categories=("Lu", "Ll", "Nd"),
+                whitelist_characters="!@#$%^&*_-+",
+            ),
+            min_size=8,
+            max_size=30,
+        ),
+    )
+    def test_fuzzed_credential_patterns_always_redacted(
+        self, prefix: str, secret: str
+    ) -> None:
+        """Property: any <prefix><secret> combo must not leak the secret."""
+        cmd = f"mysql {prefix}{secret} somedb"
+        redacted = _redact_secrets(cmd)
+        assert secret not in redacted, (
+            f"Leaked: prefix={prefix!r} secret={secret!r} → {redacted!r}"
+        )
