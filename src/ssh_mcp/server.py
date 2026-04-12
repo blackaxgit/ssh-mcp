@@ -316,6 +316,8 @@ def _mcp_tool(func: F) -> F:
                 return await func(*args, **kwargs)
         except ToolError:
             raise
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error("%s failed: %s", tool_name, e, exc_info=True)
             raise ToolError(str(e)) from e
@@ -628,17 +630,20 @@ def _make_bearer_auth_middleware() -> Any:
         body: dict[str, str],
         headers: list[tuple[bytes, bytes]] | None = None,
     ) -> None:
+        encoded = json.dumps(body).encode()
+        response_headers = list(headers or [(b"content-type", b"application/json")])
+        response_headers.append((b"content-length", str(len(encoded)).encode()))
         await send(
             {
                 "type": "http.response.start",
                 "status": 401,
-                "headers": headers or [(b"content-type", b"application/json")],
+                "headers": response_headers,
             }
         )
         await send(
             {
                 "type": "http.response.body",
-                "body": json.dumps(body).encode(),
+                "body": encoded,
             }
         )
 
@@ -667,7 +672,17 @@ def _make_bearer_auth_middleware() -> Any:
                 return
             supplied = parts[1]
             if not hmac.compare_digest(supplied, self._expected):
-                await _send_401(send, {"error": "invalid bearer token"})
+                await _send_401(
+                    send,
+                    {"error": "invalid bearer token"},
+                    headers=[
+                        (b"content-type", b"application/json"),
+                        (
+                            b"www-authenticate",
+                            b'Bearer realm="ssh-mcp", error="invalid_token"',
+                        ),
+                    ],
+                )
                 return
             await self.app(scope, receive, send)
 
@@ -703,7 +718,17 @@ def _run_http() -> None:
     import uvicorn
 
     host = os.environ.get("SSH_MCP_HTTP_HOST", "127.0.0.1")
-    port = int(os.environ.get("SSH_MCP_HTTP_PORT", "8000"))
+    raw_port = os.environ.get("SSH_MCP_HTTP_PORT", "8000")
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"SSH_MCP_HTTP_PORT={raw_port!r} is not a valid integer"
+        ) from exc
+    if not (1 <= port <= 65535):
+        raise RuntimeError(
+            f"SSH_MCP_HTTP_PORT={port} is out of range (must be 1-65535)"
+        )
     # M4: strip whitespace so env-file tokens with a trailing newline work
     raw_token = os.environ.get("SSH_MCP_HTTP_TOKEN", "").strip()
     token = raw_token or None
@@ -930,9 +955,9 @@ def main() -> None:
     if transport in ("http", "streamable-http"):
         try:
             config_path = _get_config_path()
-            logger.info(f"Config will be loaded from {config_path} on first tool call")
+            logger.info("Config will be loaded from %s on first tool call", config_path)
         except FileNotFoundError as e:
-            logger.warning(f"No config file found yet: {e}")
+            logger.warning("No config file found yet: %s", e)
         _run_http()
         return
 
@@ -943,14 +968,14 @@ def main() -> None:
         )
 
     logger.info(
-        f"Starting ssh-mcp v{__version__} (stdio transport) - "
-        f"waiting for MCP client on stdin"
+        "Starting ssh-mcp v%s (stdio transport) - waiting for MCP client on stdin",
+        __version__,
     )
     try:
         config_path = _get_config_path()
-        logger.info(f"Config will be loaded from {config_path} on first tool call")
+        logger.info("Config will be loaded from %s on first tool call", config_path)
     except FileNotFoundError as e:
-        logger.warning(f"No config file found yet: {e}")
+        logger.warning("No config file found yet: %s", e)
     mcp.run(transport="stdio")
 
 

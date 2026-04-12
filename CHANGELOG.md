@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-04-12
+
+### Security
+
+- Audit log `server_name` now wrapped in `_safe_log_value` at both success and timeout call sites (closes log-injection gap).
+- All remaining f-string logger calls in ssh.py and server.py converted to lazy %-style with `_safe_log_value`.
+- Gather exception path in `execute_on_group` now redacts credentials via `_redact_secrets`.
+- ASGI 401 responses now include `Content-Length` header (proxy interop) and `WWW-Authenticate` on invalid-token path (RFC 7235 compliance).
+- `SSH_MCP_HTTP_PORT` validated with try/except and range check (1–65535).
+- `max_output_bytes` upper bound added (`le=10_485_760` / 10 MiB) to prevent unbounded memory.
+- Explicit `except asyncio.CancelledError: raise` in `_mcp_tool` decorator for defensive cancellation handling.
+
+### Added
+
+- Connection pool size periodic log in eviction loop (`Connection pool: N active, N locks` every 60s).
+- 6 new mutation-gap regression tests: audit-log redaction on success/timeout, eviction loop crash→restart, lifespan assertion, max_output_bytes bounds.
+
 ## [0.5.1] - 2026-04-12
 
 ### Changed
@@ -235,7 +252,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.2...v0.4.3

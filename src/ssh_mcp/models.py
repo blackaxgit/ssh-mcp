@@ -47,7 +47,7 @@ class Settings:
 
     ssh_config_path: str = "~/.ssh/config"
     command_timeout: int = Field(default=30, ge=1, le=3600)
-    max_output_bytes: int = Field(default=51200, ge=1024)
+    max_output_bytes: int = Field(default=51200, ge=1024, le=10_485_760)
     connection_idle_timeout: int = Field(default=300, ge=10)
     known_hosts: bool = True
     max_parallel_hosts: int = Field(default=10, ge=1, le=100)

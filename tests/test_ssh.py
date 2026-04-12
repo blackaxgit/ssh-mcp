@@ -1700,3 +1700,125 @@ mygroup = {{ description = "Test group" }}
         assert len(results) == 3
         assert all(r.exit_code == 0 for r in results)
         assert not any(r.error and "Cancelled" in r.error for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Audit log credential redaction (mutation gap tests #8 / #9)
+# ---------------------------------------------------------------------------
+
+
+class TestAuditLogRedaction:
+    """Verify that credentials embedded in commands are redacted in audit logs.
+
+    Covers:
+    - TEST #8: successful execution path
+    - TEST #9: timeout execution path
+    """
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[groups]
+t = { description = "t" }
+[servers.test-host]
+description = "Test server"
+groups = ["t"]
+"""
+        f = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        f.write(config_content)
+        f.close()
+        return ServerRegistry(f.name)
+
+    async def test_audit_log_redacts_credentials_on_success(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """Audit log must not contain plaintext credentials on success path."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        manager = SSHManager(self._make_registry(), sample_settings)
+
+        mock_result = MagicMock()
+        mock_result.stdout = "ok"
+        mock_result.stderr = ""
+        mock_result.exit_status = 0
+
+        mock_conn = MagicMock()
+        mock_conn.run = AsyncMock(return_value=mock_result)
+        mock_conn.is_closed = MagicMock(return_value=False)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            with caplog.at_level("INFO", logger="ssh_mcp.audit"):
+                await manager.execute("test-host", "mysql -u root -pSuperSecret mydb")
+
+        audit_msgs = [
+            r.getMessage() for r in caplog.records if r.name == "ssh_mcp.audit"
+        ]
+        assert any("command=" in m for m in audit_msgs), "No audit log found"
+        assert not any("SuperSecret" in m for m in audit_msgs), "Credential leaked"
+
+    async def test_audit_log_redacts_credentials_on_timeout(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """Audit log must not contain plaintext credentials on timeout path."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        manager = SSHManager(self._make_registry(), sample_settings)
+
+        mock_conn = MagicMock()
+        mock_conn.run = AsyncMock(side_effect=asyncio.TimeoutError())
+        mock_conn.is_closed = MagicMock(return_value=False)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            with caplog.at_level("INFO", logger="ssh_mcp.audit"):
+                result = await manager.execute(
+                    "test-host", "mysql -u root -pSuperSecret mydb"
+                )
+
+        # The result must indicate a timeout occurred
+        assert result.error is not None
+        assert "timeout" in result.error.lower()
+
+        audit_msgs = [
+            r.getMessage() for r in caplog.records if r.name == "ssh_mcp.audit"
+        ]
+        assert any("command=" in m for m in audit_msgs), "No audit log found on timeout"
+        assert not any("SuperSecret" in m for m in audit_msgs), (
+            "Credential leaked on timeout"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Eviction loop crash → _running reset (mutation gap test #10)
+# ---------------------------------------------------------------------------
+
+
+class TestEvictionLoopRestart:
+    """Verify _running resets to False when the eviction loop crashes."""
+
+    async def test_eviction_resets_running_on_crash(self) -> None:
+        """_running must reset to False after an unexpected exception in the loop."""
+        from unittest.mock import patch
+
+        manager = SSHManager(
+            ServerRegistry.__new__(ServerRegistry),
+            Settings(),
+        )
+        manager._running = True
+
+        with patch("ssh_mcp.ssh.asyncio.sleep", side_effect=RuntimeError("crash")):
+            task = asyncio.create_task(manager._eviction_loop())
+            try:
+                await task
+            except RuntimeError:
+                pass
+
+        assert manager._running is False, "_running must reset after crash"
