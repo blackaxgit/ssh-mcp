@@ -804,3 +804,29 @@ class TestMainTransportDispatch:
         with patch.object(server_module, "_run_http") as mock_run_http:
             main()
         mock_run_http.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Lifespan assertion fires (mutation gap test #11)
+# ---------------------------------------------------------------------------
+
+
+class TestLifespanAssertionFires:
+    """Verify _build_http_app raises when inner app lacks lifespan_context."""
+
+    def test_build_http_app_raises_if_lifespan_context_missing(self) -> None:
+        """A missing lifespan_context must trigger a RuntimeError at build time."""
+        from unittest.mock import MagicMock
+
+        import ssh_mcp.server as srv
+
+        # Build a fake inner app whose router.lifespan_context is None,
+        # simulating a future MCP SDK that restructures its internals.
+        fake_router = MagicMock()
+        fake_router.lifespan_context = None
+        fake_inner = MagicMock()
+        fake_inner.router = fake_router
+
+        with patch.object(srv.mcp, "streamable_http_app", return_value=fake_inner):
+            with pytest.raises(RuntimeError, match="lifespan_context"):
+                srv._build_http_app(token=None)

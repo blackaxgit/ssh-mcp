@@ -703,7 +703,7 @@ class SSHManager:
                 # centralized log aggregators.
                 self._audit.info(
                     "server=%s command=%s exit_code=%s duration_ms=%s",
-                    server_name,
+                    _safe_log_value(server_name),
                     _redact_secrets(command),
                     exec_result.exit_code,
                     exec_result.duration_ms,
@@ -731,7 +731,7 @@ class SSHManager:
                 # Audit log timeout (with credentials redacted)
                 self._audit.info(
                     "server=%s command=%s exit_code=%s duration_ms=%s error=timeout",
-                    server_name,
+                    _safe_log_value(server_name),
                     _redact_secrets(command),
                     exec_result.exit_code,
                     exec_result.duration_ms,
@@ -813,7 +813,7 @@ class SSHManager:
             servers = self.registry.servers_in_group(group_name)
 
             if not servers:
-                logger.warning(f"Group '{group_name}' has no servers")
+                logger.warning("Group %s has no servers", _safe_log_value(group_name))
                 return []
 
             # Limit concurrent connections (configurable via Settings)
@@ -890,7 +890,7 @@ class SSHManager:
                                 stdout="",
                                 stderr="",
                                 exit_code=None,
-                                error=f"Exception during execution: {gather_result}",
+                                error=f"Exception during execution: {_redact_secrets(str(gather_result))}",
                             )
                         )
                     else:
@@ -1269,7 +1269,9 @@ class SSHManager:
 
         # Handle jump host (tunnel)
         if server.jump_host:
-            logger.info(f"Connecting to {server.name} via jump host {server.jump_host}")
+            logger.info(
+                "Connecting to %s via jump host %s", server.name, server.jump_host
+            )
             tunnel_conn = await self._get_connection(server.jump_host, _depth + 1)
             connect_params["tunnel"] = tunnel_conn
 
@@ -1341,6 +1343,12 @@ class SSHManager:
                     idle_time = now - last_used
                     if idle_time > idle_threshold:
                         to_evict.append((server_name, idle_time))
+
+                logger.info(
+                    "Connection pool: %d active, %d locks",
+                    len(self._connections),
+                    len(self._locks),
+                )
 
                 # Evict idle connections
                 for server_name, idle_time in to_evict:

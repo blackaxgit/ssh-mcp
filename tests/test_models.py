@@ -54,6 +54,16 @@ class TestSettings:
         with pytest.raises(ValueError, match="max_output_bytes"):
             Settings(max_output_bytes=512)
 
+    def test_settings_max_output_bytes_upper_bound_rejected(self) -> None:
+        """Settings rejects max_output_bytes above 10 MiB."""
+        with pytest.raises(ValueError, match="max_output_bytes"):
+            Settings(max_output_bytes=20_000_000)
+
+    def test_settings_max_output_bytes_at_upper_bound_accepted(self) -> None:
+        """10 MiB is the maximum accepted value."""
+        s = Settings(max_output_bytes=10_485_760)
+        assert s.max_output_bytes == 10_485_760
+
     def test_settings_idle_timeout_too_small_rejected(self) -> None:
         """Test Settings rejects connection_idle_timeout below 10s."""
         with pytest.raises(ValueError, match="connection_idle_timeout"):
