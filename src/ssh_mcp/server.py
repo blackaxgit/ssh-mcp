@@ -214,20 +214,31 @@ def _get_config_path() -> str:
     )
 
 
+# R5 finding #3: atexit registration flag — prevents stacking multiple
+# handlers if _init() is called more than once (e.g. test teardown + re-init).
+_atexit_registered: bool = False
+
+
 def _cleanup_connections() -> None:
-    """Cleanup SSH connections on exit."""
+    """Best-effort SSH cleanup on process exit (stdio transport only).
+
+    R5 audit: the ``loop.create_task()`` branch was dead code — by the
+    time ``atexit`` fires the event loop is already torn down, so
+    ``get_running_loop()`` always raises ``RuntimeError``. Removed.
+    The ``asyncio.run()`` fallback creates a fresh loop which works for
+    simple ``close()`` + ``wait_closed()`` calls on asyncssh connections.
+    For the HTTP transport, the Starlette lifespan at ``_build_http_app``
+    handles shutdown cleanly — this atexit handler is a belt-and-suspenders
+    backup that fires only if the lifespan didn't run (e.g. stdio mode
+    or abnormal exit).
+    """
     global _ssh
     if _ssh is None:
         return
     try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_ssh.close_all())
-    except RuntimeError:
-        # No running event loop — create one for cleanup
-        try:
-            asyncio.run(_ssh.close_all())
-        except Exception as e:
-            logger.warning(f"Error during connection cleanup: {e}")
+        asyncio.run(_ssh.close_all())
+    except Exception as e:
+        logger.warning("Error during connection cleanup: %s", e)
 
 
 async def _init() -> None:
@@ -246,14 +257,18 @@ async def _init() -> None:
             return  # Another coroutine initialized while we waited
 
         config_path = _get_config_path()
-        logger.info(f"Loading configuration from {config_path}")
+        logger.info("Loading configuration from %s", config_path)
         _registry = ServerRegistry(config_path)
         _ssh = SSHManager(_registry, _registry.settings)
         logger.info(
-            f"Initialized SSH MCP server: {len(_registry.all_servers())} servers, "
-            f"{len(_registry.all_groups())} groups"
+            "Initialized SSH MCP server: %s servers, %s groups",
+            len(_registry.all_servers()),
+            len(_registry.all_groups()),
         )
-        atexit.register(_cleanup_connections)
+        global _atexit_registered
+        if not _atexit_registered:
+            atexit.register(_cleanup_connections)
+            _atexit_registered = True
 
 
 def _get_registry() -> ServerRegistry:
@@ -594,11 +609,25 @@ def _build_http_app(token: str | None) -> Any:
 
     inner_app = mcp.streamable_http_app()
 
+    # R5 finding #8: assert the FastMCP app exposes the lifespan we chain.
+    # This is a private Starlette attribute — if the MCP SDK restructures
+    # its app in a major version, we want a loud startup crash, not a
+    # silent 500-on-every-request like the v0.3.0 incident.
+    lifespan_ctx = getattr(getattr(inner_app, "router", None), "lifespan_context", None)
+    if not callable(lifespan_ctx):
+        raise RuntimeError(
+            "FastMCP streamable_http_app() does not expose "
+            "router.lifespan_context — the MCP SDK may have changed "
+            "its internal structure. ssh-mcp requires this to chain "
+            "the session-manager lifespan. Pin mcp[cli]<2.0.0 or "
+            "update the lifespan wiring in server.py."
+        )
+
     @asynccontextmanager
     async def _lifespan(_app: Starlette) -> Any:
         # Step 1: start the FastMCP session manager's task group via
         # its own lifespan context.
-        async with inner_app.router.lifespan_context(inner_app):
+        async with lifespan_ctx(inner_app):
             try:
                 yield
             finally:

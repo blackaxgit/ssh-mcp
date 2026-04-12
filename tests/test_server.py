@@ -476,34 +476,15 @@ class TestCleanupConnections:
         # Should not raise
         server_module._cleanup_connections()
 
-    def test_calls_close_all_with_running_loop(
+    def test_calls_close_all_via_asyncio_run(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Test cleanup calls close_all via create_task when loop is running."""
+        """R5: cleanup uses asyncio.run() directly (dead create_task branch removed)."""
         mock_ssh = MagicMock(spec=SSHManager)
         mock_ssh.close_all = AsyncMock()
         monkeypatch.setattr(server_module, "_ssh", mock_ssh)
 
-        mock_loop = MagicMock()
-        mock_loop.create_task = MagicMock()
-
-        with patch("asyncio.get_running_loop", return_value=mock_loop):
-            server_module._cleanup_connections()
-
-        mock_loop.create_task.assert_called_once()
-
-    def test_calls_close_all_without_running_loop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Test cleanup falls back to asyncio.run when no loop is running."""
-        mock_ssh = MagicMock(spec=SSHManager)
-        mock_ssh.close_all = AsyncMock()
-        monkeypatch.setattr(server_module, "_ssh", mock_ssh)
-
-        with (
-            patch("asyncio.get_running_loop", side_effect=RuntimeError),
-            patch("asyncio.run") as mock_run,
-        ):
+        with patch("asyncio.run") as mock_run:
             server_module._cleanup_connections()
 
         mock_run.assert_called_once()
@@ -511,14 +492,11 @@ class TestCleanupConnections:
     def test_handles_cleanup_error_gracefully(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Test cleanup logs warning on close_all exception (no loop)."""
+        """Test cleanup logs warning on close_all exception — does not crash."""
         mock_ssh = MagicMock(spec=SSHManager)
         mock_ssh.close_all = AsyncMock()
         monkeypatch.setattr(server_module, "_ssh", mock_ssh)
 
-        with (
-            patch("asyncio.get_running_loop", side_effect=RuntimeError),
-            patch("asyncio.run", side_effect=Exception("cleanup failed")),
-        ):
+        with patch("asyncio.run", side_effect=Exception("cleanup failed")):
             # Should not raise — error is logged
             server_module._cleanup_connections()
