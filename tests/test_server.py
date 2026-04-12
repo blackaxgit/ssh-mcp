@@ -10,6 +10,7 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncssh
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -500,3 +501,153 @@ class TestCleanupConnections:
         with patch("asyncio.run", side_effect=Exception("cleanup failed")):
             # Should not raise — error is logged
             server_module._cleanup_connections()
+
+
+# ---------------------------------------------------------------------------
+# R5 #17: _execute_impl error taxonomy
+# ---------------------------------------------------------------------------
+
+
+class TestExecErrorTaxonomy:
+    """R5 #17: verify every exception type caught by _execute_impl returns ExecResult."""
+
+    def _make_manager(self, tmp_path: Path) -> SSHManager:
+        """Build an SSHManager backed by a real ServerRegistry from a tmpfile."""
+        config_content = """\
+[servers.test-srv]
+description = "Disposable test server"
+groups = []
+"""
+        config_file = tmp_path / "taxonomy.toml"
+        config_file.write_text(config_content)
+
+        from ssh_mcp.config import ServerRegistry
+        from ssh_mcp.models import Settings
+
+        registry = ServerRegistry(str(config_file))
+        return SSHManager(registry, Settings())
+
+    @pytest.mark.parametrize(
+        "exc_class,exc_args",
+        [
+            pytest.param(
+                asyncssh.DisconnectError,
+                (1, "connection lost"),
+                id="DisconnectError",
+            ),
+            pytest.param(
+                asyncssh.PermissionDenied,
+                ("auth denied",),
+                id="PermissionDenied",
+            ),
+            pytest.param(
+                OSError,
+                ("network unreachable",),
+                id="OSError",
+            ),
+        ],
+    )
+    async def test_ssh_exceptions_return_exec_result_with_error(
+        self, tmp_path: Path, exc_class: type, exc_args: tuple[object, ...]
+    ) -> None:
+        """Each SSH-layer exception must produce ExecResult with error, not raise."""
+        manager = self._make_manager(tmp_path)
+
+        mock_conn = AsyncMock()
+        mock_conn.run = AsyncMock(side_effect=exc_class(*exc_args))
+
+        with patch.object(manager, "_get_connection", return_value=mock_conn):
+            result = await manager.execute("test-srv", "whoami")
+
+        assert isinstance(result, ExecResult)
+        assert result.exit_code is None
+        assert result.error is not None
+        assert len(result.error) > 0
+
+    async def test_timeout_error_returns_exec_result_with_error(
+        self, tmp_path: Path
+    ) -> None:
+        """asyncio.TimeoutError (inner try) must produce ExecResult with error."""
+        manager = self._make_manager(tmp_path)
+
+        mock_conn = AsyncMock()
+        mock_conn.run = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        with patch.object(manager, "_get_connection", return_value=mock_conn):
+            result = await manager.execute("test-srv", "sleep 9999")
+
+        assert isinstance(result, ExecResult)
+        assert result.exit_code is None
+        assert result.error is not None
+        assert "timeout" in result.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# R5 #18: MCP tool function signature stability
+# ---------------------------------------------------------------------------
+
+
+class TestToolSignatureStability:
+    """R5 #18: verify MCP tool function signatures are stable.
+
+    If a parameter is added, removed, or reordered, existing positional-arg
+    mock assertions in the test suite would silently pass while production
+    behaviour changes.  These tests lock down the public contract.
+    """
+
+    def test_execute_signature(self) -> None:
+        import inspect
+
+        sig = inspect.signature(server_module.execute)
+        params = list(sig.parameters.keys())
+        assert params == [
+            "server",
+            "command",
+            "timeout",
+            "working_dir",
+            "force",
+            "dry_run",
+        ]
+
+    def test_execute_on_group_signature(self) -> None:
+        import inspect
+
+        sig = inspect.signature(server_module.execute_on_group)
+        params = list(sig.parameters.keys())
+        assert params == [
+            "group",
+            "command",
+            "timeout",
+            "working_dir",
+            "fail_fast",
+            "force",
+            "dry_run",
+        ]
+
+    def test_upload_file_signature(self) -> None:
+        import inspect
+
+        sig = inspect.signature(server_module.upload_file)
+        params = list(sig.parameters.keys())
+        assert params == ["server", "local_path", "remote_path"]
+
+    def test_download_file_signature(self) -> None:
+        import inspect
+
+        sig = inspect.signature(server_module.download_file)
+        params = list(sig.parameters.keys())
+        assert params == ["server", "remote_path", "local_path"]
+
+    def test_list_servers_signature(self) -> None:
+        import inspect
+
+        sig = inspect.signature(server_module.list_servers)
+        params = list(sig.parameters.keys())
+        assert params == ["group"]
+
+    def test_list_groups_signature(self) -> None:
+        import inspect
+
+        sig = inspect.signature(server_module.list_groups)
+        params = list(sig.parameters.keys())
+        assert params == []

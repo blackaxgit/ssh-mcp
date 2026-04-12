@@ -13,7 +13,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from ssh_mcp.config import ServerRegistry
-from ssh_mcp.models import Settings
+from ssh_mcp.models import ExecResult, Settings
 from ssh_mcp.ssh import (
     SSHManager,
     _DANGEROUS_PATTERNS,
@@ -1522,3 +1522,181 @@ class TestRedactSecrets:
         assert secret not in redacted, (
             f"Leaked: prefix={prefix!r} secret={secret!r} → {redacted!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# fail_fast cancelled-result visibility (R5 finding #9)
+# ---------------------------------------------------------------------------
+
+
+class TestFailFastCancelledResults:
+    """R5 finding #9: execute_on_group fail_fast=True must include cancelled
+    server results so operators see the full server list instead of a
+    silently truncated result set.
+    """
+
+    def _make_registry(self, server_names: list[str]) -> ServerRegistry:
+        """Build a registry with N servers in one group."""
+        import tempfile
+
+        servers_toml = "\n".join(
+            f'[servers.{name}]\ndescription = "{name}"\ngroups = ["mygroup"]'
+            for name in server_names
+        )
+        config_content = f"""
+[settings]
+command_timeout = 30
+
+[groups]
+mygroup = {{ description = "Test group" }}
+
+{servers_toml}
+"""
+        tmp = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        tmp.write(config_content)
+        tmp.flush()
+        tmp.close()
+        return ServerRegistry(tmp.name)
+
+    async def test_cancelled_servers_appear_in_results(self) -> None:
+        """All 3 servers must appear: 1 failed + 2 cancelled."""
+        from unittest.mock import patch
+
+        registry = self._make_registry(["srv-a", "srv-b", "srv-c"])
+        manager = SSHManager(registry, Settings())
+
+        call_count = 0
+
+        async def mock_execute(
+            server_name: str,
+            command: str,
+            timeout: int = 30,
+            working_dir: str | None = None,
+            force: bool = False,
+            dry_run: bool = False,
+        ) -> ExecResult:
+            nonlocal call_count
+            call_count += 1
+            if server_name == "srv-a":
+                # Return failure immediately to trigger fail_fast
+                return ExecResult(
+                    server=server_name,
+                    command=command,
+                    stdout="",
+                    stderr="disk full",
+                    exit_code=1,
+                    error=None,
+                )
+            # Other servers: slow enough to be cancelled
+            await asyncio.sleep(10)
+            return ExecResult(
+                server=server_name,
+                command=command,
+                stdout="ok",
+                stderr="",
+                exit_code=0,
+            )
+
+        with patch.object(manager, "execute", side_effect=mock_execute):
+            results = await manager.execute_on_group("mygroup", "df -h", fail_fast=True)
+
+        # All 3 servers must be represented
+        result_servers = {r.server for r in results}
+        assert result_servers == {"srv-a", "srv-b", "srv-c"}, (
+            f"Expected all 3 servers, got: {result_servers}"
+        )
+
+        # Exactly 1 failed result (srv-a)
+        failed = [r for r in results if r.exit_code is not None and r.exit_code != 0]
+        assert len(failed) == 1
+        assert failed[0].server == "srv-a"
+
+        # Exactly 2 cancelled results
+        cancelled = [
+            r for r in results if r.error and r.error.startswith("Cancelled: fail_fast")
+        ]
+        assert len(cancelled) == 2
+        cancelled_servers = {r.server for r in cancelled}
+        assert cancelled_servers == {"srv-b", "srv-c"}
+
+    async def test_cancelled_results_have_correct_fields(self) -> None:
+        """Cancelled ExecResult entries must have expected field values."""
+        from unittest.mock import patch
+
+        registry = self._make_registry(["alpha", "beta"])
+        manager = SSHManager(registry, Settings())
+
+        async def mock_execute(
+            server_name: str,
+            command: str,
+            timeout: int = 30,
+            working_dir: str | None = None,
+            force: bool = False,
+            dry_run: bool = False,
+        ) -> ExecResult:
+            if server_name == "alpha":
+                return ExecResult(
+                    server=server_name,
+                    command=command,
+                    stdout="",
+                    stderr="",
+                    exit_code=None,
+                    error="SSH error: connection refused",
+                )
+            await asyncio.sleep(10)
+            return ExecResult(
+                server=server_name,
+                command=command,
+                stdout="ok",
+                stderr="",
+                exit_code=0,
+            )
+
+        with patch.object(manager, "execute", side_effect=mock_execute):
+            results = await manager.execute_on_group(
+                "mygroup", "uptime", fail_fast=True
+            )
+
+        cancelled = [
+            r for r in results if r.error and "Cancelled: fail_fast" in r.error
+        ]
+        assert len(cancelled) == 1
+        c = cancelled[0]
+        assert c.server == "beta"
+        assert c.command == "uptime"
+        assert c.stdout == ""
+        assert c.stderr == ""
+        assert c.exit_code is None
+        assert c.error == "Cancelled: fail_fast triggered by an earlier failure"
+
+    async def test_no_cancelled_results_when_all_succeed(self) -> None:
+        """When no failure occurs, no cancelled entries should be appended."""
+        from unittest.mock import patch
+
+        registry = self._make_registry(["s1", "s2", "s3"])
+        manager = SSHManager(registry, Settings())
+
+        async def mock_execute(
+            server_name: str,
+            command: str,
+            timeout: int = 30,
+            working_dir: str | None = None,
+            force: bool = False,
+            dry_run: bool = False,
+        ) -> ExecResult:
+            return ExecResult(
+                server=server_name,
+                command=command,
+                stdout="ok",
+                stderr="",
+                exit_code=0,
+            )
+
+        with patch.object(manager, "execute", side_effect=mock_execute):
+            results = await manager.execute_on_group(
+                "mygroup", "echo hi", fail_fast=True
+            )
+
+        assert len(results) == 3
+        assert all(r.exit_code == 0 for r in results)
+        assert not any(r.error and "Cancelled" in r.error for r in results)

@@ -509,75 +509,6 @@ async def download_file(
 _MIN_TOKEN_LENGTH: int = 16
 
 
-def _wrap_with_bearer_auth(inner_app: Any, token: str) -> Any:
-    """Wrap an ASGI ``inner_app`` in a bearer-token auth Starlette wrapper.
-
-    Extracted from ``_build_http_app`` so the middleware can be unit-tested
-    in isolation against a trivial downstream app, without needing the
-    full MCP session-manager lifespan.
-
-    The middleware:
-      * Requires ``Authorization: <scheme> <token>`` header on every request
-        where ``<scheme>`` is ``Bearer`` (case-insensitive per RFC 7235)
-      * Uses ``hmac.compare_digest`` to prevent timing attacks on the secret
-      * Returns 401 with ``WWW-Authenticate`` on missing/invalid credentials
-      * Does NOT exempt any path — ssh-mcp exposes no OAuth discovery, and
-        an unauthenticated health probe would leak server presence to
-        scanners anyway
-
-    Red Team R3 hardening:
-      * Refuses empty or very short tokens — ``hmac.compare_digest('','')``
-        returns True, so an empty ``expected`` would bypass auth for any
-        ``Authorization: Bearer `` request.
-      * Accepts case-insensitive scheme per RFC 7235 §2.1.
-
-    Raises:
-        ValueError: if ``token`` is empty or shorter than ``_MIN_TOKEN_LENGTH``.
-    """
-    if not token or len(token) < _MIN_TOKEN_LENGTH:
-        raise ValueError(
-            f"bearer token must be at least {_MIN_TOKEN_LENGTH} characters "
-            f"(got {len(token)}) — a short or empty token is a security risk"
-        )
-
-    from starlette.applications import Starlette
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse
-    from starlette.routing import Mount
-
-    class _BearerAuth(BaseHTTPMiddleware):
-        def __init__(self, wrapped_app: Any, expected: str) -> None:
-            super().__init__(wrapped_app)
-            self._expected = expected
-
-        async def dispatch(self, request: Request, call_next: Any) -> Any:
-            import hmac
-
-            auth = request.headers.get("authorization", "")
-            # Case-insensitive scheme match per RFC 7235 §2.1. We split
-            # on the first whitespace so tab/multi-space between scheme
-            # and token is tolerated.
-            parts = auth.split(maxsplit=1)
-            if len(parts) != 2 or parts[0].lower() != "bearer":
-                return JSONResponse(
-                    {"error": "missing bearer token"},
-                    status_code=401,
-                    headers={"WWW-Authenticate": 'Bearer realm="ssh-mcp"'},
-                )
-            supplied = parts[1]
-            if not hmac.compare_digest(supplied, self._expected):
-                return JSONResponse(
-                    {"error": "invalid bearer token"},
-                    status_code=401,
-                )
-            return await call_next(request)
-
-    wrapper = Starlette(routes=[Mount("/", app=inner_app)])
-    wrapper.add_middleware(_BearerAuth, expected=token)
-    return wrapper
-
-
 def _build_http_app(token: str | None) -> Any:
     """Return the Starlette ASGI app for streamable HTTP transport.
 
@@ -664,8 +595,9 @@ def _build_http_app(token: str | None) -> Any:
 def _assert_valid_bearer_token(token: str) -> None:
     """Raise ValueError if ``token`` is too short or empty.
 
-    Same guard that ``_wrap_with_bearer_auth`` uses. Extracted so
-    ``_build_http_app`` can validate BEFORE installing middleware.
+    Validates token length before installing the bearer middleware.
+    Called by ``_build_http_app`` so bad tokens fail fast at app
+    construction time, not on the first request.
     """
     if not token or len(token) < _MIN_TOKEN_LENGTH:
         raise ValueError(
@@ -675,39 +607,69 @@ def _assert_valid_bearer_token(token: str) -> None:
 
 
 def _make_bearer_auth_middleware() -> Any:
-    """Return the ``_BearerAuth`` middleware class.
+    """Return the ``_BearerAuth`` pure ASGI middleware class.
 
-    Factored out of ``_wrap_with_bearer_auth`` so ``_build_http_app``
-    can attach it via ``app.add_middleware`` without constructing a
-    second Starlette wrapper.
+    Uses a raw ASGI middleware instead of Starlette's ``BaseHTTPMiddleware``
+    to avoid known issues with body copying that breaks SSE streaming and
+    memory leaks under concurrency (R5 audit finding).
+
+    The middleware:
+      * Requires ``Authorization: <scheme> <token>`` header on every request
+        where ``<scheme>`` is ``Bearer`` (case-insensitive per RFC 7235 §2.1)
+      * Uses ``hmac.compare_digest`` to prevent timing attacks on the secret
+      * Returns 401 with ``WWW-Authenticate`` on missing/invalid credentials
+      * Passes non-HTTP scopes (lifespan, websocket) through unchanged
     """
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse
+    import hmac
+    import json
 
-    class _BearerAuth(BaseHTTPMiddleware):
-        def __init__(self, wrapped_app: Any, expected: str) -> None:
-            super().__init__(wrapped_app)
+    async def _send_401(
+        send: Any,
+        body: dict[str, str],
+        headers: list[tuple[bytes, bytes]] | None = None,
+    ) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": headers or [(b"content-type", b"application/json")],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": json.dumps(body).encode(),
+            }
+        )
+
+    class _BearerAuth:
+        def __init__(self, app: Any, expected: str) -> None:
+            self.app = app
             self._expected = expected
 
-        async def dispatch(self, request: Request, call_next: Any) -> Any:
-            import hmac
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
 
-            auth = request.headers.get("authorization", "")
+            headers = dict(scope.get("headers", []))
+            auth = headers.get(b"authorization", b"").decode("latin-1")
             parts = auth.split(maxsplit=1)
             if len(parts) != 2 or parts[0].lower() != "bearer":
-                return JSONResponse(
+                await _send_401(
+                    send,
                     {"error": "missing bearer token"},
-                    status_code=401,
-                    headers={"WWW-Authenticate": 'Bearer realm="ssh-mcp"'},
+                    headers=[
+                        (b"content-type", b"application/json"),
+                        (b"www-authenticate", b'Bearer realm="ssh-mcp"'),
+                    ],
                 )
+                return
             supplied = parts[1]
             if not hmac.compare_digest(supplied, self._expected):
-                return JSONResponse(
-                    {"error": "invalid bearer token"},
-                    status_code=401,
-                )
-            return await call_next(request)
+                await _send_401(send, {"error": "invalid bearer token"})
+                return
+            await self.app(scope, receive, send)
 
     return _BearerAuth
 

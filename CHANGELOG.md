@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-04-12
+
+### Changed
+
+- **Pure ASGI bearer middleware.** R5 finding #1: replaced Starlette's `BaseHTTPMiddleware` (known body-copying issues, SSE streaming breakage, memory leaks) with a zero-dependency pure ASGI middleware that implements the `__call__(scope, receive, send)` protocol directly. Non-HTTP scopes (lifespan, websocket) pass through unchanged.
+- **Deleted `_wrap_with_bearer_auth` dead code.** R5 finding #2: removed ~50 lines of unused code that duplicated the bearer middleware logic. Tests refactored to use `_build_http_app` and `_make_bearer_auth_middleware` directly.
+- **`execute_on_group` fail_fast now reports cancelled servers.** R5 finding #9: previously, `fail_fast=True` silently dropped cancelled server results — operators saw a partial result set with no indication that other servers were skipped. Now appends `ExecResult(error="Cancelled: fail_fast triggered by an earlier failure")` for every server whose task was cancelled, so the full server list always appears in the output.
+- **mypy strict mode expanded.** R5 finding #14: added `no_implicit_reexport`, `warn_redundant_casts`, `warn_unused_ignores`, `strict_equality` to `[tool.mypy]` config.
+- **CI matrix adds Python 3.14.** R5 finding #15: test matrix now covers `["3.11", "3.12", "3.13", "3.14"]`, matching the `pyproject.toml` classifier.
+- **ExecResult error contract documented.** R5 finding #16: comprehensive docstring explaining the error/exit_code state matrix and the distinct SFTP contract.
+
+### Added
+
+- 17 new tests: 4 exception-taxonomy tests (asyncssh.DisconnectError, PermissionDenied, OSError, TimeoutError), 6 tool-signature-stability tests, 3 fail_fast-cancelled-results tests, reworked bearer middleware tests for pure ASGI.
+
 ## [0.5.0] - 2026-04-12
 
 ### Security
@@ -220,7 +235,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.1...v0.4.2
