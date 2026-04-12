@@ -827,7 +827,7 @@ def _run_http() -> None:
                 )
 
     # Also add the actual bind host if it's not already covered
-    if host not in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:
+    if host not in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:  # nosec B104
         base_hosts.append(f"{host}:*")
 
     existing = mcp.settings.transport_security
