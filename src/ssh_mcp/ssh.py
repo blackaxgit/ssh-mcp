@@ -54,6 +54,12 @@ _EVICTION_LOOP_INTERVAL_S: int = 60
 # runtime in case the registry is mutated between loads).
 _MAX_JUMP_HOST_DEPTH: int = 5
 
+# Maximum file size (in bytes) allowed for a single SFTP transfer.
+# 100 MiB is a sensible default for an MCP tool — larger files should use
+# rsync, scp streaming, or chunked transfer. Upload is hard-blocked;
+# download emits a warning (the bytes are already on disk by then).
+_MAX_SFTP_BYTES: int = 104_857_600  # 100 MiB default; future: promote to Settings field
+
 
 def _make_connection_id(server_name: str) -> str:
     """Return a short, grep-friendly connection identifier.
@@ -316,6 +322,13 @@ _DANGEROUS_PATTERNS = [
     re.compile(r"fdisk\s+/dev/sd", re.IGNORECASE),
     # Classic fork bomb — tolerates spaced variants.
     re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
+    # P10: Encoded payload execution wrappers (tripwire, not boundary)
+    re.compile(
+        r"base64\s+(-d|--decode)\s*\|\s*(bash|sh|zsh|python|perl|ruby)", re.IGNORECASE
+    ),
+    re.compile(r"\beval\s+[\"'\$\(]", re.IGNORECASE),
+    re.compile(r"\b(python|python3|perl|ruby)\s+-(c|e)\s+", re.IGNORECASE),
+    re.compile(r"\bbash\s+-c\s+", re.IGNORECASE),
 ]
 
 # Sensitive paths that should be blocked in SFTP operations.
@@ -342,6 +355,8 @@ _SENSITIVE_PATHS = [
     ".ssh/id_ecdsa",
     ".ssh/id_dsa",
     ".ssh/identity",
+    ".ssh/config",
+    ".ssh/known_hosts",
     # Cloud provider credentials
     ".aws/credentials",
     ".aws/config",
@@ -990,10 +1005,16 @@ class SSHManager:
             )
             self._audit.info("sftp.upload.start")
 
+            # P8: pre-flight size guard — reject before transfer starts
+            local_size = Path(local_path).stat().st_size
+            if local_size > _MAX_SFTP_BYTES:
+                raise ValueError(
+                    f"File too large for SFTP transfer: {local_size} bytes "
+                    f"(max {_MAX_SFTP_BYTES}). Reduce file size or adjust _MAX_SFTP_BYTES."
+                )
+
             async with conn.start_sftp_client() as sftp:
                 await sftp.put(local_path, remote_path)
-
-                local_size = Path(local_path).stat().st_size
                 duration_ms = int((time.monotonic() - start_time) * 1000)
 
                 self._audit.info(
@@ -1101,6 +1122,15 @@ class SSHManager:
 
                 local_size = Path(local_path).stat().st_size
                 duration_ms = int((time.monotonic() - start_time) * 1000)
+
+                # P8: post-download size warning — bytes already on disk,
+                # so we warn rather than block.
+                if local_size > _MAX_SFTP_BYTES:
+                    logger.warning(
+                        "Downloaded file exceeds recommended size limit: %d bytes (limit %d)",
+                        local_size,
+                        _MAX_SFTP_BYTES,
+                    )
 
                 self._audit.info(
                     "sftp.download.complete bytes=%s duration_ms=%s",

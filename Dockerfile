@@ -2,10 +2,12 @@
 # Base: python:3.13-slim-trixie (Debian 13, 2026 standard)
 # Stage 1: Builder - compile dependencies with uv
 
-FROM python:3.13-slim-trixie AS builder
+# python:3.13-slim-trixie
+FROM python:3.13-slim-trixie@sha256:d168b8d9eb761f4d3fe305ebd04aeb7e7f2de0297cec5fb2f8f6403244621664 AS builder
 
 # Copy uv from official distribution image (not using as base to keep image small)
-COPY --from=ghcr.io/astral-sh/uv:0.11.3 /uv /usr/local/bin/uv
+# ghcr.io/astral-sh/uv:0.11.3
+COPY --from=ghcr.io/astral-sh/uv:0.11.3@sha256:90bbb3c16635e9627f49eec6539f956d70746c409209041800a0280b93152823 /uv /usr/local/bin/uv
 
 # Compile bytecode and optimize cache locality for production
 ENV UV_COMPILE_BYTECODE=1 \
@@ -30,7 +32,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Stage 2: Runtime - minimal production image
 
-FROM python:3.13-slim-trixie
+# python:3.13-slim-trixie
+FROM python:3.13-slim-trixie@sha256:d168b8d9eb761f4d3fe305ebd04aeb7e7f2de0297cec5fb2f8f6403244621664
 
 # Create non-root user for security (uid 1000 standard)
 RUN useradd --uid 1000 --create-home --shell /sbin/nologin sshmcp

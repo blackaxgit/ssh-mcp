@@ -10,6 +10,7 @@ exercised via a mocked ``uvicorn.run``.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -830,3 +831,129 @@ class TestLifespanAssertionFires:
         with patch.object(srv.mcp, "streamable_http_app", return_value=fake_inner):
             with pytest.raises(RuntimeError, match="lifespan_context"):
                 srv._build_http_app(token=None)
+
+
+# ---------------------------------------------------------------------------
+# Purple-team P3: DNS rebinding protection always enabled
+# ---------------------------------------------------------------------------
+
+
+class TestDnsRebindingAlwaysEnabled:
+    """P3: TransportSecuritySettings must be configured even when
+    SSH_MCP_HTTP_ALLOWED_HOSTS is not set."""
+
+    def test_dns_rebinding_enabled_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without SSH_MCP_HTTP_ALLOWED_HOSTS, dns rebinding protection
+        must still be True (the MCP SDK default is False)."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.delenv("SSH_MCP_HTTP_ALLOWED_HOSTS", raising=False)
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        with patch("uvicorn.run"):
+            _run_http()
+        ts = server_module.mcp.settings.transport_security
+        assert ts is not None, (
+            "transport_security must be set even without ALLOWED_HOSTS"
+        )
+        assert ts.enable_dns_rebinding_protection is True
+
+    def test_dns_rebinding_includes_localhost_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Default allowed_hosts must include localhost entries."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.delenv("SSH_MCP_HTTP_ALLOWED_HOSTS", raising=False)
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        with patch("uvicorn.run"):
+            _run_http()
+        allowed = server_module.mcp.settings.transport_security.allowed_hosts
+        assert "127.0.0.1:*" in allowed
+        assert "localhost:*" in allowed
+        assert "[::1]:*" in allowed
+
+    def test_custom_bind_host_added_to_allowed_hosts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A non-standard bind host should be included in allowed_hosts."""
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "10.0.0.5")
+        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN", "s3cret-long-token-val")
+        monkeypatch.delenv("SSH_MCP_HTTP_ALLOWED_HOSTS", raising=False)
+        with patch("uvicorn.run"):
+            _run_http()
+        allowed = server_module.mcp.settings.transport_security.allowed_hosts
+        assert "10.0.0.5:*" in allowed
+
+
+# ---------------------------------------------------------------------------
+# Purple-team P5: SSH_MCP_HTTP_TOKEN_FILE support
+# ---------------------------------------------------------------------------
+
+
+class TestTokenFile:
+    """P5: SSH_MCP_HTTP_TOKEN_FILE reads a bearer token from disk."""
+
+    def test_token_file_read_from_disk(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Create a tmpfile with a token, set SSH_MCP_HTTP_TOKEN_FILE,
+        verify _run_http reads it and passes to _build_http_app."""
+        token_path = tmp_path / "token.txt"
+        token_path.write_text("  file-based-secret-token-long\n")
+
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN_FILE", str(token_path))
+
+        captured: list[str | None] = []
+
+        def fake_build(token):  # type: ignore[no-untyped-def]
+            captured.append(token)
+            return _make_dummy_asgi_app()
+
+        with patch("ssh_mcp.server._build_http_app", side_effect=fake_build):
+            with patch("uvicorn.run"):
+                _run_http()
+
+        assert captured == ["file-based-secret-token-long"], (
+            f"Token from file not passed correctly: got {captured!r}"
+        )
+
+    def test_token_file_missing_raises(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """SSH_MCP_HTTP_TOKEN_FILE pointing to nonexistent path must raise."""
+        missing = tmp_path / "nonexistent" / "token.txt"
+
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN_FILE", str(missing))
+
+        with pytest.raises(RuntimeError, match="SSH_MCP_HTTP_TOKEN_FILE"):
+            _run_http()
+
+    def test_token_env_takes_precedence_over_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """When both SSH_MCP_HTTP_TOKEN and SSH_MCP_HTTP_TOKEN_FILE are set,
+        the env var token wins (file is only a fallback)."""
+        token_path = tmp_path / "token.txt"
+        token_path.write_text("file-token-should-lose-this")
+
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN", "env-token-should-win-ok")
+        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN_FILE", str(token_path))
+
+        captured: list[str | None] = []
+
+        def fake_build(token):  # type: ignore[no-untyped-def]
+            captured.append(token)
+            return _make_dummy_asgi_app()
+
+        with patch("ssh_mcp.server._build_http_app", side_effect=fake_build):
+            with patch("uvicorn.run"):
+                _run_http()
+
+        assert captured == ["env-token-should-win-ok"], (
+            f"Env token did not take precedence: got {captured!r}"
+        )
