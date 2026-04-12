@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-04-12
+
+### Security
+
+- Added `.ssh/config` and `.ssh/known_hosts` to SFTP sensitive-path blocklist (purple-team P2).
+- DNS rebinding protection now enabled by default even without `SSH_MCP_HTTP_ALLOWED_HOSTS` (P3).
+- Dangerous-command tripwire expanded: `base64 -d | bash`, `eval`, `python -c`, `perl -e`, `bash -c` (P10).
+
+### Added
+
+- `SSH_MCP_HTTP_TOKEN_FILE` env var for file-based token delivery, Docker secrets compatible (P5).
+- SFTP transfer size limit: 100 MiB default via `_MAX_SFTP_BYTES` constant (P8).
+- Dockerfile + CI actions pinned by SHA digest (P7).
+- README: TLS requirement warning, Docker secrets documentation.
+
+### Changed
+
+- Dockerfile and CI GitHub Actions pinned by SHA digest for supply-chain hardening (P7).
+
 ## [0.5.2] - 2026-04-12
 
 ### Security
@@ -252,7 +271,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.3...v0.5.0

@@ -91,6 +91,12 @@ services:
   #     # SSH_MCP_HTTP_BACKLOG: "128"
   #     # Optional: extend DNS-rebinding allowlist for your internal hostname
   #     # SSH_MCP_HTTP_ALLOWED_HOSTS: "ssh-mcp.internal:*"
+  #   # Prefer file-based token delivery over environment variable.
+  #   # With Docker secrets:
+  #   # secrets:
+  #   #   - ssh_mcp_token
+  #   # environment:
+  #   #   SSH_MCP_HTTP_TOKEN_FILE: /run/secrets/ssh_mcp_token
   #   # Raise the fd limit from Docker's default 1024 so bursty clients
   #   # don't exhaust the accept queue. A single n8n workflow can open
   #   # 100+ concurrent HTTP/1.1 connections under load.

@@ -140,6 +140,7 @@ claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx ssh-mcp
 | `SSH_MCP_HTTP_HOST` | `127.0.0.1` | Bind address for HTTP transport. **Binding to any non-localhost value (e.g. `0.0.0.0`) REQUIRES `SSH_MCP_HTTP_TOKEN` — startup aborts otherwise.** |
 | `SSH_MCP_HTTP_PORT` | `8000` | TCP port for HTTP transport. |
 | `SSH_MCP_HTTP_TOKEN` | — | Shared bearer secret. When set, every request must carry `Authorization: Bearer <token>` (scheme case-insensitive per RFC 7235) or receive HTTP 401. Mandatory for non-localhost binds (unless `SSH_MCP_HTTP_AUTH=none`). Minimum length 16 characters — shorter tokens are rejected at startup. Leading/trailing whitespace is stripped so `.env` files with trailing newlines work as expected. |
+| `SSH_MCP_HTTP_TOKEN_FILE` | — | Path to a file containing the bearer token (alternative to `SSH_MCP_HTTP_TOKEN`). Read at startup, stripped of whitespace. Preferred for Docker secrets: mount the secret file and point this env var at it. |
 | `SSH_MCP_HTTP_AUTH` | `bearer` | Authentication mode. `bearer` (default) enables the built-in middleware. `none` disables it entirely — useful when ssh-mcp sits behind a trusted reverse proxy that handles auth at the edge. Combining `none` with a non-localhost bind REQUIRES the explicit acknowledgement env var below. |
 | `SSH_MCP_HTTP_NETWORK_NO_AUTH` | — | Magic-string escape hatch. Must equal literal `I_ACCEPT_RCE_RISK` to allow `SSH_MCP_HTTP_AUTH=none` + non-localhost bind. Intentionally verbose so nobody sets it by accident. |
 | `SSH_MCP_HTTP_KEEPALIVE_TIMEOUT` | `2` | uvicorn `timeout_keep_alive` in seconds. Idle HTTP/1.1 connections are closed after this many seconds. v0.4.0 default (5s) accumulated enough concurrent connections under bursty n8n traffic to exhaust the container's 1024 fd limit — v0.4.1 default 2s is safer for spiky clients. Increase to 5–10 for long-polling MCP clients behind a load balancer. |
@@ -165,6 +166,12 @@ Pair that with the `SSH_MCP_HTTP_KEEPALIVE_TIMEOUT` / `SSH_MCP_HTTP_LIMIT_CONCUR
 ### Running over HTTP
 
 ssh-mcp exposes the MCP streamable HTTP transport as an alternative to stdio. This lets MCP-aware clients connect over the network instead of launching a subprocess, which is useful for containerized deployments, shared-team servers, or anything that needs to survive a client restart.
+
+> **WARNING: ssh-mcp serves plain HTTP, not HTTPS.** The bearer token is
+> transmitted in cleartext on every request. Deploying on a public IP
+> without a TLS-terminating reverse proxy (Caddy, nginx, Traefik) exposes
+> the token to any network observer — equivalent to publishing a root
+> shell. **Always terminate TLS before ssh-mcp reaches the network.**
 
 **Security first.** ssh-mcp runs shell commands on remote servers. Exposing the HTTP endpoint without authentication is equivalent to exposing a root shell. The startup code enforces this:
 

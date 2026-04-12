@@ -731,6 +731,16 @@ def _run_http() -> None:
         )
     # M4: strip whitespace so env-file tokens with a trailing newline work
     raw_token = os.environ.get("SSH_MCP_HTTP_TOKEN", "").strip()
+    # P5: fall back to reading token from a file (e.g. Docker secret mount)
+    if not raw_token:
+        token_file = os.environ.get("SSH_MCP_HTTP_TOKEN_FILE", "").strip()
+        if token_file:
+            try:
+                raw_token = Path(token_file).read_text().strip()
+            except (OSError, FileNotFoundError) as e:
+                raise RuntimeError(
+                    f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} could not be read: {e}"
+                ) from e
     token = raw_token or None
     stateless = os.environ.get("SSH_MCP_HTTP_STATELESS", "false").lower() == "true"
     allowed_hosts_env = os.environ.get("SSH_MCP_HTTP_ALLOWED_HOSTS", "").strip()
@@ -792,9 +802,14 @@ def _run_http() -> None:
     mcp.settings.host = host
     mcp.settings.port = port
     mcp.settings.stateless_http = stateless
-    if allowed_hosts_env:
-        from mcp.server.transport_security import TransportSecuritySettings
+    # P3: Always enable DNS rebinding protection, even without
+    # SSH_MCP_HTTP_ALLOWED_HOSTS. The MCP SDK defaults to
+    # enable_dns_rebinding_protection=False which is unsafe.
+    from mcp.server.transport_security import TransportSecuritySettings
 
+    base_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    extra_hosts: list[str] = []
+    if allowed_hosts_env:
         extra_hosts = [h.strip() for h in allowed_hosts_env.split(",") if h.strip()]
         # H4: reject wildcards — they silently disable DNS-rebinding
         # protection. An operator setting "*" almost certainly means
@@ -810,26 +825,24 @@ def _run_http() -> None:
                     "would disable DNS-rebinding protection. "
                     "Use a concrete hostname (e.g. 'ssh-mcp.internal:*') instead."
                 )
-        existing = mcp.settings.transport_security
-        default_origins = [
-            "http://127.0.0.1:*",
-            "http://localhost:*",
-            "http://[::1]:*",
-        ]
-        mcp.settings.transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=[
-                "127.0.0.1:*",
-                "localhost:*",
-                "[::1]:*",
-                *extra_hosts,
-            ],
-            allowed_origins=(
-                list(existing.allowed_origins)
-                if existing is not None
-                else default_origins
-            ),
-        )
+
+    # Also add the actual bind host if it's not already covered
+    if host not in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:  # nosec B104
+        base_hosts.append(f"{host}:*")
+
+    existing = mcp.settings.transport_security
+    default_origins = [
+        "http://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::1]:*",
+    ]
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[*base_hosts, *extra_hosts],
+        allowed_origins=(
+            list(existing.allowed_origins) if existing is not None else default_origins
+        ),
+    )
 
     from ssh_mcp import __version__
 
