@@ -836,7 +836,12 @@ class SSHManager:
             if fail_fast:
                 # Cancel remaining tasks on first failure
                 actual_tasks = [asyncio.create_task(coro) for coro in tasks]
-                results = []
+                # Map each task back to its server name so we can attribute
+                # cancelled results after fail_fast triggers.
+                task_to_server = {
+                    task: server.name for task, server in zip(actual_tasks, servers)
+                }
+                results: list[ExecResult] = []
                 for future in asyncio.as_completed(actual_tasks):
                     result = await future
                     results.append(result)
@@ -851,6 +856,23 @@ class SSHManager:
                         if remaining:
                             await asyncio.gather(*remaining, return_exceptions=True)
                         break
+                # Append a "cancelled" result for every server whose task
+                # did not produce a result — operators see the full
+                # server list instead of a silently truncated result.
+                completed_servers = {r.server for r in results}
+                for task in actual_tasks:
+                    server_name = task_to_server[task]
+                    if server_name not in completed_servers:
+                        results.append(
+                            ExecResult(
+                                server=server_name,
+                                command=command,
+                                stdout="",
+                                stderr="",
+                                exit_code=None,
+                                error="Cancelled: fail_fast triggered by an earlier failure",
+                            )
+                        )
                 return results
             else:
                 # Wait for all tasks to complete

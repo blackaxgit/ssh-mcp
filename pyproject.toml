@@ -71,6 +71,10 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 check_untyped_defs = true
+no_implicit_reexport = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+strict_equality = true
 
 [[tool.mypy.overrides]]
 module = "asyncssh.*"

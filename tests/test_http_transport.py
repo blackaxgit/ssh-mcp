@@ -16,7 +16,13 @@ import pytest
 from starlette.testclient import TestClient
 
 import ssh_mcp.server as server_module
-from ssh_mcp.server import _build_http_app, _run_http, _wrap_with_bearer_auth, main
+from ssh_mcp.server import (
+    _assert_valid_bearer_token,
+    _build_http_app,
+    _make_bearer_auth_middleware,
+    _run_http,
+    main,
+)
 
 
 def _make_dummy_asgi_app():
@@ -464,28 +470,30 @@ class TestUvicornLogRouting:
 class TestBearerAuthR3Hardening:
     """Red Team R3 HIGH findings H2, H3, H4, M4."""
 
-    def test_wrap_rejects_empty_expected_token(self) -> None:
-        """H2: _wrap_with_bearer_auth must refuse empty string as expected.
+    def test_build_http_app_rejects_empty_expected_token(self) -> None:
+        """H2: _build_http_app must refuse empty string as expected.
 
         Otherwise hmac.compare_digest('', '') returns True and any client
         sending 'Authorization: Bearer ' authenticates.
         """
-        dummy = _make_dummy_asgi_app()
         with pytest.raises(ValueError, match="token"):
-            _wrap_with_bearer_auth(dummy, "")
+            _assert_valid_bearer_token("")
 
-    def test_wrap_rejects_very_short_tokens(self) -> None:
+    def test_build_http_app_rejects_very_short_tokens(self) -> None:
         """H2 follow-up: tokens under a reasonable minimum are suspicious."""
-        dummy = _make_dummy_asgi_app()
         with pytest.raises(ValueError, match="token"):
-            _wrap_with_bearer_auth(dummy, "abc")
+            _assert_valid_bearer_token("abc")
 
     def test_bearer_scheme_is_case_insensitive(self) -> None:
         """H3: RFC 7235 says scheme is case-insensitive. Accept any casing."""
-        wrapped = _wrap_with_bearer_auth(
-            _make_dummy_asgi_app(), "correct-token-longenough"
-        )
-        client = TestClient(wrapped)
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+
+        dummy = _make_dummy_asgi_app()
+        app = Starlette(routes=[Mount("/", app=dummy)])
+        _BearerAuth = _make_bearer_auth_middleware()
+        app.add_middleware(_BearerAuth, expected="correct-token-longenough")
+        client = TestClient(app)
         for scheme in ("Bearer", "bearer", "BEARER", "BeArEr"):
             resp = client.get(
                 "/mcp", headers={"Authorization": f"{scheme} correct-token-longenough"}
@@ -543,7 +551,7 @@ class TestBearerAuthR3Hardening:
 
 
 class TestBearerTokenMiddleware:
-    """Middleware tested against a trivial downstream ASGI app.
+    """Pure ASGI middleware tested against a trivial downstream ASGI app.
 
     The MCP session-manager lifespan is NOT available inside a TestClient
     without running ``mcp.run()``, which makes it unsuitable as a
@@ -554,8 +562,14 @@ class TestBearerTokenMiddleware:
     """
 
     def _make_client_with_token(self, token: str) -> TestClient:
-        wrapped = _wrap_with_bearer_auth(_make_dummy_asgi_app(), token)
-        return TestClient(wrapped)
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+
+        dummy = _make_dummy_asgi_app()
+        app = Starlette(routes=[Mount("/", app=dummy)])
+        _BearerAuth = _make_bearer_auth_middleware()
+        app.add_middleware(_BearerAuth, expected=token)
+        return TestClient(app)
 
     def test_missing_auth_returns_401(self) -> None:
         """No Authorization header → 401 with WWW-Authenticate challenge."""
@@ -604,9 +618,8 @@ class TestBearerTokenMiddleware:
         assert resp.status_code == 401
 
     def test_no_token_configured_all_requests_pass_through(self) -> None:
-        """``_wrap_with_bearer_auth`` is not called at all when token is None;
-        requests must reach the downstream directly via the raw FastMCP app.
-        We verify this using a trivial downstream mounted in place of MCP.
+        """When token is None, no middleware is attached and requests
+        reach the downstream directly via the raw app.
         """
         from starlette.testclient import TestClient as _TC
 

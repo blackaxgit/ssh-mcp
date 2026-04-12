@@ -109,6 +109,19 @@ class ExecResult:
     constructed from trusted ``asyncssh`` output — and Pydantic validation
     would add runtime cost for every command execution.
 
+    ExecResult is returned by execute() and execute_on_group() — these methods
+    NEVER raise exceptions. All errors are embedded in the ``error`` field:
+    - ``error is None`` + ``exit_code >= 0``: command succeeded
+    - ``error is None`` + ``exit_code is None``: should not happen
+    - ``error is not None`` + ``exit_code is None``: execution failed (SSH error,
+      timeout, server not found, blocked by dangerous-command tripwire, cancelled
+      by fail_fast)
+    - ``error is not None`` + ``exit_code >= 0``: command ran but had issues
+
+    SFTP operations (upload_file, download_file) follow a DIFFERENT contract:
+    they RAISE ValueError or RuntimeError on failure. The _mcp_tool decorator
+    converts all exceptions to ToolError for the MCP protocol.
+
     Attributes:
         server: Server name where command was executed
         command: The command that was executed
