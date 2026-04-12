@@ -638,7 +638,7 @@ class SSHManager:
                     )
                 preview = (
                     f"[DRY RUN] Would execute on {server_name}\n"
-                    f"  command:     {command}\n"
+                    f"  command:     {_redact_secrets(command)}\n"
                     f"  working_dir: {effective_wd}\n"
                     f"  timeout:     {effective_to}s\n"
                     f"  force:       {force}"
@@ -877,7 +877,7 @@ class SSHManager:
                 return normalized_results
 
         except KeyError as e:
-            logger.error(f"Group not found: {group_name}")
+            logger.error("Group not found: %s", _safe_log_value(group_name))
             return [
                 ExecResult(
                     server=group_name,
@@ -890,7 +890,9 @@ class SSHManager:
             ]
 
         except Exception as e:
-            logger.error(f"Unexpected error in group execution: {e}")
+            logger.error(
+                "Unexpected error in group execution: %s", _safe_log_value(str(e))
+            )
             return [
                 ExecResult(
                     server=group_name,
@@ -1137,6 +1139,7 @@ class SSHManager:
         self._connections.clear()
         self._last_used.clear()
         self._connection_ids.clear()
+        self._locks.clear()  # R5 #11: prune per-server locks on full reset
 
     async def _get_connection(
         self, server_name: str, _depth: int = 0
@@ -1256,16 +1259,32 @@ class SSHManager:
             )
             return conn
         except asyncssh.DisconnectError as e:
-            logger.error(f"SSH disconnect error connecting to {server.name}: {e}")
+            logger.error(
+                "SSH disconnect error connecting to %s: %s",
+                _safe_log_value(server.name),
+                _safe_log_value(str(e)),
+            )
             raise
         except asyncssh.PermissionDenied as e:
-            logger.error(f"SSH permission denied for {server.name}: {e}")
+            logger.error(
+                "SSH permission denied for %s: %s",
+                _safe_log_value(server.name),
+                _safe_log_value(str(e)),
+            )
             raise
         except OSError as e:
-            logger.error(f"OS error connecting to {server.name}: {e}")
+            logger.error(
+                "OS error connecting to %s: %s",
+                _safe_log_value(server.name),
+                _safe_log_value(str(e)),
+            )
             raise
         except asyncio.TimeoutError as e:
-            logger.error(f"Timeout connecting to {server.name}: {e}")
+            logger.error(
+                "Timeout connecting to %s: %s",
+                _safe_log_value(server.name),
+                _safe_log_value(str(e)),
+            )
             raise
 
     def _start_eviction_loop(self) -> None:
@@ -1323,18 +1342,31 @@ class SSHManager:
                                 conn.close()
                                 await conn.wait_closed()
                                 logger.info(
-                                    f"Evicted idle connection to {server_name} (idle {now - current_last_used:.0f}s)"
+                                    "Evicted idle connection to %s (idle %.0fs)",
+                                    server_name,
+                                    now - current_last_used,
                                 )
                             except Exception as e:
                                 logger.warning(
-                                    f"Error evicting connection to {server_name}: {e}"
+                                    "Error evicting connection to %s: %s",
+                                    _safe_log_value(server_name),
+                                    _safe_log_value(str(e)),
                                 )
                             finally:
                                 self._connections.pop(server_name, None)
                                 self._last_used.pop(server_name, None)
                                 self._connection_ids.pop(server_name, None)
+                                self._locks.pop(server_name, None)  # R5 #11
 
         except asyncio.CancelledError:
             logger.info("Connection eviction loop cancelled")
         except Exception as e:
-            logger.error(f"Unexpected error in eviction loop: {e}")
+            logger.error(
+                "Unexpected error in eviction loop: %s", _safe_log_value(str(e))
+            )
+            # R5 finding #6: reset _running so _start_eviction_loop() can
+            # restart the loop on the next _get_connection() call. Without
+            # this, _running stays True after a crash and the loop is
+            # permanently dead — connections accumulate without eviction
+            # until the fd limit is hit.
+            self._running = False

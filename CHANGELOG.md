@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-12
+
+### Security
+
+- **dry_run preview now redacts credentials.** R5 finding #4: `execute(..., dry_run=True, command="mysql -pSecret ...")` previously returned the raw command in the preview stdout. Now applies `_redact_secrets()` to the preview string.
+- **All f-string log calls converted to %-style with `_safe_log_value`.** R5 finding #5: 7 `logger.error(f"...")` calls in `_create_connection`, eviction loop, and group execution bypassed `_safe_log_value` — attacker-controlled SSH banners could inject forged log lines. All 7 now use `%s` + `_safe_log_value(str(e))`.
+
+### Fixed
+
+- **Eviction loop auto-restarts after crash.** R5 finding #6: if the eviction loop raised an unexpected exception, `_running` stayed `True` and the loop was permanently dead — connections accumulated without eviction until fd exhaustion. Now resets `_running = False` in the except block so the next `_get_connection()` call restarts the loop.
+- **`close_all()` prunes `_locks` dict.** R5 finding #11: `self._locks` was never cleared by `close_all()` or eviction, causing monotonic memory growth. Now both paths call `.pop()` / `.clear()` on `_locks`.
+- **`atexit` handler simplified.** R5 finding #3: removed dead `loop.create_task()` branch (event loop is always torn down before `atexit` fires). Guarded registration with `_atexit_registered` flag to prevent stacking.
+- **FastMCP lifespan coupling assertion.** R5 finding #8: `_build_http_app` now validates that `inner_app.router.lifespan_context` is callable at startup. If the MCP SDK restructures its internals, the server crashes immediately with a clear error instead of silently returning 500 on every request.
+- **`max_output_bytes` docstring corrected.** R5 finding #10: the enforcement is character-based (`len(str)`), not byte-based. Docstring updated to reflect the actual behavior honestly.
+
 ## [0.4.3] - 2026-04-12
 
 ### Security
@@ -205,7 +220,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.0...v0.4.1

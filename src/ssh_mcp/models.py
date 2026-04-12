@@ -33,7 +33,11 @@ class Settings:
     Attributes:
         ssh_config_path: Path to SSH config file (supports ~ expansion)
         command_timeout: Default command execution timeout in seconds
-        max_output_bytes: Maximum bytes to capture from command output
+        max_output_bytes: Maximum characters to capture from command output.
+            Named "bytes" for historical reasons but the enforcement is
+            character-based (``len(str)``), not byte-based. For ASCII
+            output the two are equivalent; for multibyte (CJK, emoji)
+            the actual byte size may exceed this limit.
         connection_idle_timeout: Seconds before idle connection is closed
         known_hosts: Whether to enforce strict known_hosts checking
         max_parallel_hosts: Maximum concurrent SSH connections during
