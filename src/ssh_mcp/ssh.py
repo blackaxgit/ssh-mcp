@@ -152,15 +152,11 @@ def _build_credential_subs() -> list[tuple[re.Pattern[str], Any]]:
     return [
         # 1. Basic auth credentials embedded in a URL:
         #    ``scheme://user:password@host``.
-        #    Redacts the password while preserving the ``user`` and ``@``
-        #    separator so operators can still see *which* URL leaked.
         (
             re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/\s@]+:)([^@\s]+)(@)"),
             lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}{m.group(3)}",
         ),
-        # 2. HTTP ``Authorization:`` header with Bearer/Basic/Digest/Token
-        #    scheme. The token follows one or more whitespace chars after
-        #    the scheme keyword.
+        # 2. HTTP ``Authorization:`` header with Bearer/Basic/Digest/Token.
         (
             re.compile(
                 r"(Authorization:\s*(?:Bearer|Basic|Digest|Token)\s+)(\S+)",
@@ -168,9 +164,7 @@ def _build_credential_subs() -> list[tuple[re.Pattern[str], Any]]:
             ),
             lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
         ),
-        # 3. Known credential env vars: ``PGPASSWORD=value``,
-        #    ``MYSQL_PWD=value``, ``AWS_SECRET_ACCESS_KEY=value``, etc.
-        #    Matched case-insensitively so ``pgpassword=x`` also matches.
+        # 3a. Known credential env vars (enumerated list, exact match).
         (
             re.compile(
                 r"\b(" + env_alt + r")=(\S+)",
@@ -178,41 +172,57 @@ def _build_credential_subs() -> list[tuple[re.Pattern[str], Any]]:
             ),
             lambda m: f"{m.group(1)}={_REDACTION_PLACEHOLDER}",
         ),
-        # 4. MySQL/MariaDB short password flag QUOTED form:
-        #    ``-p'quoted pass'`` / ``-p"quoted pass"``. The quotes are
-        #    preserved so the command shape stays readable.
-        #
-        #    ``(?<![\w-])`` lookbehind rejects BOTH word chars AND dashes,
-        #    so ``--password`` can't match ``-p`` at its second character.
-        (
-            re.compile(r"(?<![\w-])(-p)(['\"])([^'\"]*)(\2)"),
-            lambda m: f"{m.group(1)}{m.group(2)}{_REDACTION_PLACEHOLDER}{m.group(4)}",
-        ),
-        # 5. MySQL/MariaDB short password flag UNQUOTED form:
-        #    ``-pSecretValue`` (no space between ``-p`` and the value).
-        #    Requires at least 3 non-space chars to avoid matching things
-        #    like ``-pv`` which would be a combined flag cluster. The
-        #    ``(?<![\w-])`` lookbehind prevents matching inside a larger
-        #    word (``help``) AND inside the long flag ``--password``.
-        (
-            re.compile(r"(?<![\w-])(-p)(\S{3,})"),
-            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
-        ),
-        # 6. Long flags with ``=`` separator:
-        #    ``--password=xxx``, ``--pass=xxx``, ``--token=xxx``,
-        #    ``--secret=xxx``, ``--api-key=xxx``, ``--api_key=xxx``.
+        # 3b. (v0.4.3 G2) Generic env var SUFFIX patterns:
+        #     ``*_PASSWORD=``, ``*_SECRET=``, ``*_TOKEN=``, ``*_KEY=``,
+        #     ``*_CREDENTIAL=``, ``*_PWD=``. Catches ``VAULT_TOKEN``,
+        #     ``STRIPE_SECRET_KEY``, ``MY_CUSTOM_PASSWORD``, etc. without
+        #     needing to enumerate every possible prefix.
         (
             re.compile(
-                r"(--(?:password|pass|token|secret|api[_-]?key))=(\S+)",
+                r"\b(\w+(?:_PASSWORD|_SECRET|_TOKEN|_KEY|_CREDENTIAL|_PWD))=(\S+)",
                 re.IGNORECASE,
             ),
             lambda m: f"{m.group(1)}={_REDACTION_PLACEHOLDER}",
         ),
-        # 7. Long flags with whitespace separator:
-        #    ``--password xxx``, ``--token xxx``, etc.
+        # 4. MySQL/MariaDB short password flag QUOTED form.
+        (
+            re.compile(r"(?<![\w-])(-p)(['\"])([^'\"]*)(\2)"),
+            lambda m: f"{m.group(1)}{m.group(2)}{_REDACTION_PLACEHOLDER}{m.group(4)}",
+        ),
+        # 5. MySQL/MariaDB short password flag UNQUOTED form (≥3 chars).
+        (
+            re.compile(r"(?<![\w-])(-p)(\S{3,})"),
+            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+        ),
+        # 6. (v0.4.3 G4) ``curl -u user:password`` basic auth flag.
+        #    Redacts the password portion after the colon.
+        (
+            re.compile(r"(?<!\w)(-u\s+\S+:)(\S+)"),
+            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+        ),
+        # 7. (v0.4.3 G4) ``sshpass -p PASSWORD`` (space-separated).
+        #    sshpass uses ``-p`` with a SPACE before the password, unlike
+        #    MySQL which uses no space. Match ``sshpass`` prefix to
+        #    disambiguate from the MySQL rule.
+        (
+            re.compile(r"(sshpass\s+-p\s+)(\S+)", re.IGNORECASE),
+            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+        ),
+        # 8. Long flags with ``=`` separator — EXPANDED in v0.4.3 (G3):
+        #    Now matches ANY ``--<prefix>-password=``, ``--<prefix>-secret=``,
+        #    ``--<prefix>-token=``, ``--<prefix>-key=`` via optional
+        #    ``[\w-]*`` prefix. Also adds ``--http-password`` (wget).
         (
             re.compile(
-                r"(--(?:password|pass|token|secret|api[_-]?key))(\s+)(\S+)",
+                r"(--(?:[\w-]*[-_])?(?:password|pass|token|secret|key|credential))=(\S+)",
+                re.IGNORECASE,
+            ),
+            lambda m: f"{m.group(1)}={_REDACTION_PLACEHOLDER}",
+        ),
+        # 9. Long flags with whitespace separator — same expansion.
+        (
+            re.compile(
+                r"(--(?:[\w-]*[-_])?(?:password|pass|token|secret|key|credential))(\s+)(\S+)",
                 re.IGNORECASE,
             ),
             lambda m: f"{m.group(1)}{m.group(2)}{_REDACTION_PLACEHOLDER}",
@@ -569,7 +579,7 @@ class SSHManager:
             if result.error:
                 # Truncate error messages into spans — some operators ingest
                 # traces into cost-sensitive backends.
-                span.set_attribute("ssh.error", result.error[:200])
+                span.set_attribute("ssh.error", _redact_secrets(result.error[:200]))
                 span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
             return result
 
