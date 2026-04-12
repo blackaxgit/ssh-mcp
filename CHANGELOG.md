@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-04-11
+
+### Security
+
+- **CRITICAL: Silence asyncssh INFO-level command logging.** Production verification of v0.4.1 revealed a SECOND credential leak: `asyncssh` itself logs every dispatched command at INFO level via its internal channel logger as `[conn=N, chan=N] Command: <raw>`. The v0.4.1 redaction only covered the ssh-mcp audit log, not asyncssh's logger hierarchy, so passwords like `mysql -p<pass>` continued to leak into the structured stderr stream and centralized log aggregators despite the v0.4.1 fix.
+- `_configure_logging` now raises the `asyncssh`, `asyncssh.sftp`, and `asyncssh.connection` logger levels to `WARNING` so per-command INFO records never reach the root handler. Real failures (connection errors, channel errors, etc.) still propagate as warnings/errors.
+- 2 new regression tests verify (a) the asyncssh logger level is `>= WARNING` after `_configure_logging` runs and (b) a simulated asyncssh INFO record does not propagate to root.
+
 ## [0.4.1] - 2026-04-11
 
 ### Security
@@ -187,7 +195,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.0...v0.3.1

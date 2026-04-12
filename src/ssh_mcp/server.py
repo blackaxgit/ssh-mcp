@@ -147,6 +147,20 @@ def _configure_logging() -> None:
     root.addHandler(handler)
     root.setLevel(logging.INFO)
 
+    # Production incident 2026-04-11 (round 2): asyncssh emits the FULL
+    # SSH command at INFO level via its internal channel logger as
+    # ``[conn=N, chan=N]   Command: <raw command including credentials>``.
+    # Our audit-log redaction in ``ssh.py`` only sanitizes the ssh-mcp
+    # logger, so any ``mysql -p<pass>`` arriving via asyncssh's own
+    # logger leaked the password despite v0.4.1.
+    #
+    # Raise the asyncssh logger family to WARNING so its INFO records
+    # never reach our handler. We still see warnings/errors (real
+    # connection failures, channel errors, etc.) — we just don't ship
+    # the per-command audit trail to centralized log aggregators.
+    for noisy in ("asyncssh", "asyncssh.sftp", "asyncssh.connection"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 _configure_logging()
 
