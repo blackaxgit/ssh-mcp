@@ -107,6 +107,52 @@ class TestConfigureLogging:
             "Reconfiguration must clear handlers to avoid duplicate log lines"
         )
 
+    def test_asyncssh_logger_silenced_at_warning_level(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Production incident 2026-04-11 (round 2): asyncssh emits the
+        full SSH command at INFO level via its internal channel logger
+        (``[conn=N, chan=N] Command: <raw>``). My audit-log redaction
+        only covers the ssh-mcp logger, not asyncssh's logger hierarchy,
+        so credentials leaked despite v0.4.1.
+
+        ``_configure_logging`` must raise the ``asyncssh`` logger level
+        to WARNING so its INFO messages never reach the handler. We can
+        still see warnings/errors from asyncssh (real failures), just
+        not the per-command audit trail.
+        """
+        import logging
+
+        monkeypatch.delenv("SSH_MCP_LOG_FORMAT", raising=False)
+        _reload_server_module()
+
+        asyncssh_logger = logging.getLogger("asyncssh")
+        # WARNING (30) or higher is acceptable; INFO (20) is the bug.
+        assert asyncssh_logger.level >= logging.WARNING, (
+            f"asyncssh logger level is {asyncssh_logger.level} "
+            f"(must be >= WARNING to prevent command-level credential leak)"
+        )
+
+    def test_asyncssh_command_log_does_not_reach_root(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A simulated asyncssh INFO record must NOT propagate to root."""
+        import logging
+
+        monkeypatch.delenv("SSH_MCP_LOG_FORMAT", raising=False)
+        _reload_server_module()
+
+        with caplog.at_level(logging.INFO):
+            asyncssh_logger = logging.getLogger("asyncssh")
+            asyncssh_logger.info(
+                "[conn=0, chan=0]   Command: echo --password=NEVER_LEAK_AGAIN"
+            )
+
+        leaked = [r for r in caplog.records if "NEVER_LEAK_AGAIN" in r.getMessage()]
+        assert leaked == [], f"asyncssh INFO leaked through to root logger: {leaked}"
+
     def test_unknown_format_falls_back_to_console(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
