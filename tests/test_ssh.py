@@ -929,6 +929,31 @@ default_dir = "/srv/app"
         assert "[DRY RUN]" in result.stdout
         assert "rm -rf /" in result.stdout
 
+    async def test_dry_run_redacts_credentials_in_preview(self) -> None:
+        """Green Team v0.5.0: dry_run preview must redact credentials.
+
+        R5 finding #4 regression test — if _redact_secrets is removed
+        from the dry_run path, this test catches the leak.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        with patch.object(
+            manager,
+            "_get_connection",
+            AsyncMock(side_effect=AssertionError("must not connect")),
+        ):
+            result = await manager.execute(
+                "test-host",
+                "mysql -u root -pSuperSecret123 mydb",
+                dry_run=True,
+            )
+
+        assert "SuperSecret123" not in result.stdout, (
+            f"Credential leaked in dry_run preview: {result.stdout!r}"
+        )
+        assert _REDACTION_PLACEHOLDER in result.stdout
+
     async def test_dry_run_with_force_warns_about_dangerous_bypass(self) -> None:
         """Red Team R3 finding H1: dry_run+force must warn when the dangerous
         check would otherwise have blocked the command. An LLM building a
