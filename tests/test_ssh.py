@@ -1414,6 +1414,65 @@ class TestRedactSecrets:
         # per potential secret match — bound generously
         assert len(result) < len(text) * 10 + 1000
 
+    # --- v0.4.3 gap closures (G2, G3, G4) ---
+
+    @pytest.mark.parametrize(
+        "command,must_not_contain",
+        [
+            # G2: suffix-pattern env vars NOT in the static list
+            ("VAULT_TOKEN=hvs.abc123tokenvalue deploy.sh", "hvs.abc123tokenvalue"),
+            ("STRIPE_SECRET_KEY=sk_live_abc123 python app.py", "sk_live_abc123"),
+            ("SLACK_BOT_TOKEN=xoxb-foobar-secret slackbot", "xoxb-foobar-secret"),
+            ("DOCKER_PASSWORD=MyDockPwd123 docker login", "MyDockPwd123"),
+            ("JIRA_API_TOKEN=jira_secret_tok jira-cli ls", "jira_secret_tok"),
+            ("MY_CUSTOM_PASSWORD=hunter2 ./run.sh", "hunter2"),
+            ("DB_SECRET=verysecretvalue app start", "verysecretvalue"),
+            ("SSH_KEY=base64keydata ssh-add -", "base64keydata"),
+            # G3: long flag variants with prefix
+            ("myapp --db-password=DbPass123 start", "DbPass123"),
+            ("myapp --admin-password=AdmPass123", "AdmPass123"),
+            ("myapp --user-password SecretPwd run", "SecretPwd"),
+            ("deploy --access-key=AKIA_EXAMPLE_KEY", "AKIA_EXAMPLE_KEY"),
+            ("deploy --secret-key=wJalrXUtnFEMI", "wJalrXUtnFEMI"),
+            ("myapp --auth-token=tok_live_1234 serve", "tok_live_1234"),
+            # G4: curl -u, sshpass -p, wget --http-password
+            ("curl -u admin:CurlPwd123 https://api.internal/v1", "CurlPwd123"),
+            ("curl -u admin:CurlPwd123", "CurlPwd123"),
+            ("sshpass -p SshPassValue ssh user@host", "SshPassValue"),
+            ("wget --http-password=WgetPwd456 https://x/file", "WgetPwd456"),
+            ("wget --http-password WgetPwd789 https://x/file", "WgetPwd789"),
+        ],
+        ids=lambda x: x[:45] if isinstance(x, str) else "p",
+    )
+    def test_v043_gap_patterns_redacted(
+        self, command: str, must_not_contain: str
+    ) -> None:
+        """v0.4.3 gap closures: suffix env vars, variant long flags, curl/sshpass/wget."""
+        redacted = _redact_secrets(command)
+        assert must_not_contain not in redacted, (
+            f"v0.4.3 gap: {must_not_contain!r} leaked in {redacted!r}"
+        )
+        assert _REDACTION_PLACEHOLDER in redacted
+
+    @pytest.mark.parametrize(
+        "safe_command",
+        [
+            # Must NOT trigger false positives
+            "vault status",
+            "docker ps",
+            "jira --help",
+            "curl https://public.api.com/health",
+            "curl -v https://example.com",
+            "wget https://releases.example.com/v1.tar.gz",
+            "sshpass --help",
+            "myapp --db-port=5432 start",
+            "deploy --access-log=/var/log/app.log",
+        ],
+    )
+    def test_v043_safe_commands_unchanged(self, safe_command: str) -> None:
+        """v0.4.3 patterns must not over-match common admin commands."""
+        assert _redact_secrets(safe_command) == safe_command
+
     @given(
         st.sampled_from(
             # NOTE: MySQL ``-P`` (uppercase) is the PORT flag, not password,

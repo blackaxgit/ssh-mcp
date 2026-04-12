@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-04-12
+
+### Security
+
+- **Broaden credential redaction coverage.** v0.4.1 covered an enumerated list of env var names; v0.4.3 adds generic **suffix-pattern matching** for env vars ending in `_PASSWORD`, `_SECRET`, `_TOKEN`, `_KEY`, `_CREDENTIAL`, `_PWD` — so `VAULT_TOKEN=`, `STRIPE_SECRET_KEY=`, `MY_CUSTOM_PASSWORD=`, `DOCKER_PASSWORD=`, etc. are all caught without needing to maintain a static list.
+- **Variant long-flag redaction.** `--db-password=`, `--admin-password=`, `--user-password=`, `--access-key=`, `--secret-key=`, `--auth-token=`, `--http-password=` (wget), and ANY other `--<prefix>-password/secret/token/key/credential=` pattern is now redacted. Previously only exact `--password` / `--token` / `--secret` / `--api-key` were matched.
+- **New tool-specific patterns.** `curl -u user:password`, `sshpass -p PASSWORD` (space-separated), and `wget --http-password` are now redacted.
+- **OTel `ssh.error` span attribute** now runs through `_redact_secrets()` before being set on the span, closing the trace-backend leak path identified in green-team round 1 (G5).
+- **README security section** now explicitly documents that command OUTPUT (stdout/stderr) is NOT redacted — operators should never run commands that print secrets via ssh-mcp.
+
 ## [0.4.2] - 2026-04-11
 
 ### Security
@@ -195,7 +205,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/blackaxgit/ssh-mcp/compare/v0.3.1...v0.4.0
