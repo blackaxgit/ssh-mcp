@@ -961,6 +961,14 @@ def main() -> None:
       a TCP port. Requires ``SSH_MCP_HTTP_TOKEN`` for non-localhost binds.
       See ``_run_http`` for the full list of env vars.
     """
+    # Dispatch subcommands BEFORE any expensive setup.
+    # The ``healthcheck`` subcommand must NOT touch ``mcp.run`` or open sockets.
+    if len(sys.argv) >= 2 and sys.argv[1] == "healthcheck":
+        from ssh_mcp.healthcheck import run as run_healthcheck
+
+        run_healthcheck()  # exits 0 or 1
+        return  # unreachable but keeps mypy happy
+
     from ssh_mcp import __version__
 
     transport = os.environ.get("SSH_MCP_TRANSPORT", "stdio").strip().lower()
