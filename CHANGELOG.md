@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-04-12
+
+### Added
+
+- **`ssh-mcp healthcheck` CLI subcommand** — built-in liveness probe that auto-detects transport (stdio vs streamable-http), respects auth env vars (`SSH_MCP_HTTP_TOKEN`, `SSH_MCP_HTTP_TOKEN_FILE`, `SSH_MCP_HTTP_AUTH=none`), and performs a real MCP `initialize` handshake in HTTP mode. Uses Python stdlib only, 3-second timeout, exits 0 healthy / 1 unhealthy.
+- New module `src/ssh_mcp/healthcheck.py` with unit tests in `tests/test_healthcheck.py`.
+
+### Changed
+
+- **Dockerfile `HEALTHCHECK`** now uses the built-in `ssh-mcp healthcheck` subcommand instead of the old `python -c "import ssh_mcp"` liveness-only check. The new check performs a real MCP protocol handshake in HTTP mode, so a container marked "healthy" actually means the MCP tools respond correctly — not just that the Python package is importable.
+- **`compose.yaml`** — removed the ~40-line inline Python healthcheck block from the commented `ssh-mcp-http` service template. Operators no longer need to embed credential-handling Python in their compose files. The Dockerfile's baked-in HEALTHCHECK handles both stdio and HTTP modes automatically.
+
+### Fixed
+
+- Eliminates the pain point where upgrading the healthcheck required editing every operator's compose.yaml.
+
 ## [0.5.3] - 2026-04-12
 
 ### Security
@@ -271,7 +287,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.4...HEAD
+[0.5.4]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.0...v0.5.1

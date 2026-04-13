@@ -55,13 +55,16 @@ USER sshmcp
 # Override via SSH_MCP_HTTP_PORT env var and republish with -p.
 EXPOSE 8000
 
-# HEALTHCHECK: Python-based import check (slim image has no `ps`)
-# Verifies the ssh_mcp package is importable — signals the runtime is healthy.
-# For HTTP transport, operators may prefer a curl-based probe against
-# http://127.0.0.1:${SSH_MCP_HTTP_PORT:-8000}/mcp but curl is not in the slim
-# image, so the import check is the portable default.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD python -c "import ssh_mcp" || exit 1
+# HEALTHCHECK: use the built-in ``ssh-mcp healthcheck`` subcommand which
+# auto-detects transport (stdio vs streamable-http) and performs a real
+# MCP initialize handshake in HTTP mode. Reads the same env vars as the
+# server itself (SSH_MCP_TRANSPORT, SSH_MCP_HTTP_PORT, SSH_MCP_HTTP_TOKEN,
+# SSH_MCP_HTTP_TOKEN_FILE, SSH_MCP_HTTP_AUTH).
+#
+# start_period=10s covers startup for HTTP transport (FastMCP session
+# manager init + uvicorn bind). interval=30s is standard.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ssh-mcp healthcheck
 
 # Entry point: invoke the console script installed by uv
 ENTRYPOINT ["ssh-mcp"]

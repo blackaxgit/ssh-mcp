@@ -213,6 +213,43 @@ Host: ssh-mcp.internal
 
 For stateful sessions (default), FastMCP maintains per-client context across requests. For stateless deployments behind a load balancer, set `SSH_MCP_HTTP_STATELESS=true` — each request is handled independently with no server-side session.
 
+### Healthcheck
+
+The Docker image includes a built-in `ssh-mcp healthcheck` CLI subcommand that
+Docker's `HEALTHCHECK` directive invokes automatically. No inline Python, no
+`curl`, no manual compose surgery required. The subcommand:
+
+- Auto-detects the transport via `SSH_MCP_TRANSPORT`:
+  - **stdio mode**: verifies the package imports and `servers.toml` parses
+  - **http mode**: sends a real MCP `initialize` JSON-RPC POST and checks for any non-5xx response
+- Reads the same auth env vars as the server (`SSH_MCP_HTTP_TOKEN`, `SSH_MCP_HTTP_TOKEN_FILE`, `SSH_MCP_HTTP_AUTH`) — never logs the token
+- Exits 0 if healthy, 1 otherwise
+- Uses Python stdlib only (no `curl`/`wget` dependency)
+- 3-second hard timeout per probe
+
+Run manually for debugging:
+
+```bash
+docker exec ssh-mcp ssh-mcp healthcheck && echo "healthy"
+```
+
+Check current status:
+
+```bash
+docker inspect ssh-mcp --format '{{.State.Health.Status}}'
+```
+
+To override the baked-in settings in your compose file:
+
+```yaml
+healthcheck:
+  test: ["CMD", "ssh-mcp", "healthcheck"]
+  interval: 15s
+  timeout: 5s
+  retries: 3
+  start_period: 10s
+```
+
 ### Reverse proxy deployment (auth at the edge)
 
 If your reverse proxy (Caddy, nginx, Traefik, Envoy, Cloudflare Access, etc.) already authenticates requests before they reach ssh-mcp, you can disable the built-in bearer middleware with `SSH_MCP_HTTP_AUTH=none`. This mode is deliberately hard to enable on a public bind — you must also set a verbose acknowledgement env var:
