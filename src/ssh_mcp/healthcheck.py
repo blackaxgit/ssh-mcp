@@ -88,10 +88,13 @@ def _check_http() -> tuple[bool, str]:
         headers["Authorization"] = f"Bearer {token}"
 
     url = f"http://127.0.0.1:{port}/mcp"
-    req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
+    req = urllib.request.Request(url, data=payload, method="POST", headers=headers)  # noqa: S310
 
     try:
-        with urllib.request.urlopen(req, timeout=HEALTHCHECK_TIMEOUT) as resp:
+        # URL is hardcoded http://127.0.0.1:<port>/mcp — not user-controlled
+        # and not a file:// scheme. Port comes from the validated
+        # SSH_MCP_HTTP_PORT env var, so B310 (permitted-schemes) doesn't apply.
+        with urllib.request.urlopen(req, timeout=HEALTHCHECK_TIMEOUT) as resp:  # nosec B310  # noqa: S310
             return True, f"http {resp.status}"
     except urllib.error.HTTPError as e:
         # Any 4xx means the server is alive but the request was rejected
