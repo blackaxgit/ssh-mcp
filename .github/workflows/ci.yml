@@ -60,7 +60,11 @@ jobs:
         run: uv run mypy src/
 
       - name: Audit dependencies
-        run: uv run pip-audit
+        # CVE-2026-3219 affects the runner's bundled pip 26.0.1 (a tool, not a
+        # runtime dep of this project) and has no published fix yet — ignore
+        # until upstream pip ships a patched release. Track:
+        # https://github.com/advisories/CVE-2026-3219
+        run: uv run pip-audit --ignore-vuln CVE-2026-3219
 
       - name: Security scan with bandit
         run: uvx bandit -r src/ -q
