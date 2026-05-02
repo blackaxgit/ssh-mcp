@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-05-02
+
+### Security
+
+- **CVE-2026-28684** (python-dotenv ≤ 1.2.1, symlink-following in `set_key`/`unset_key`) — closed by bumping the transitive dep to 1.2.2 in `uv.lock`. ssh-mcp doesn't call dotenv directly, but the package was pulled in via `mcp[cli]`; the deployed Docker image is now clean.
+- **CVE-2026-40347** (python-multipart < 0.0.26, multipart preamble DoS) — closed by bumping the transitive dep to 0.0.27 in `uv.lock`. Same transitive path via `mcp[cli]` → `starlette`.
+
+### Changed
+
+- CI `pip-audit` step now passes `--ignore-vuln CVE-2026-3219` for the runner-bundled pip 26.0.1 vulnerability (no upstream fix yet at release time). Tracked for removal once upstream pip ships a patched release; an automated agent will revisit on 2026-05-16.
+
 ## [0.5.4] - 2026-04-12
 
 ### Added
