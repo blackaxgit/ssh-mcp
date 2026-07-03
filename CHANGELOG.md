@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-07-02
+
+### Security
+
+Cleared every CVE reported by `pip-audit` against the dependency tree. All are transitive deps (pulled in via `mcp[cli]`); ssh-mcp does not call them directly, but the deployed Docker image and dev/CI environment are now clean.
+
+- **GHSA-537c-gmf6-5ccf** (cryptography) — bumped 46.0.7 → 49.0.0.
+- **CVE-2026-48817 / -48818 / -54282 / -54283** (starlette) — bumped 0.52.1 → 1.3.1 (major version; full test suite passes unchanged).
+- **PYSEC-2026-175 … -179** (PyJWT) — bumped 2.12.0 → 2.13.0.
+- **CVE-2026-53538 / -53539 / -53540** (python-multipart) — bumped 0.0.27 → 0.0.32.
+- **GHSA-4xgf-cpjx-pc3j** (pydantic-settings) — bumped 2.12.0 → 2.14.2.
+- **GHSA-6v7p-g79w-8964** (msgpack, `Unpacker` segfault after a decode failure) — bumped 1.1.2 → 1.2.1.
+- **PYSEC-2026-196** (pip in the dev/CI venv) — pinned `pip>=26.1.2` in the `dev` extra. pip is not a runtime dependency of the shipped package.
+
+### Changed
+
+- **asyncssh** bumped 2.22.0 → 2.23.0 (routine; direct dependency, no advisory).
+- CI Trivy image scan now reads a documented `.trivyignore` for two **upstream-unfixable** `perl-base` CVEs from the `python:3.13-slim-trixie` base image (`CVE-2026-42496` `fix_deferred`, `CVE-2026-8376` `affected`). perl is not used at runtime. Only OS CVEs with no published fix are ignored; fixable CVEs remain gated. Re-review on the next base-image bump.
+
 ## [0.5.5] - 2026-05-02
 
 ### Security
@@ -298,7 +317,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tilde expansion for config file paths
 - Packaged for distribution via PyPI; installable with `uvx ssh-mcp`
 
-[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.4...HEAD
+[Unreleased]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.6...HEAD
+[0.5.6]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.5...v0.5.6
+[0.5.5]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/blackaxgit/ssh-mcp/compare/v0.5.1...v0.5.2
