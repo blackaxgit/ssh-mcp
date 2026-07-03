@@ -43,6 +43,8 @@ dev = [
     "pytest-cov>=6.0",
     "mypy>=1.15",
     "pip-audit>=2.9",
+    # Patched pip in the dev/CI venv (PYSEC-2026-196); not a runtime dependency.
+    "pip>=26.1.2",
     "hypothesis>=6.151.0,<7.0.0",
     # OTel SDK is needed at test time for the in-memory exporter.
     "opentelemetry-sdk>=1.30.0,<2.0.0",
