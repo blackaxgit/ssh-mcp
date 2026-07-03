@@ -1,0 +1,13 @@
+# Trivy ignore file — image (OS-level) CVEs with NO upstream fix available.
+#
+# Policy: we only ignore CVEs that are unfixable at the base-image layer
+# (Debian status "fix_deferred" / "affected", no fixed version published).
+# Fixable CVEs must be patched, not ignored. Re-review each entry when the
+# base image (python:3.13-slim-trixie) is next bumped.
+#
+# Last reviewed: 2026-07-02
+
+# perl-base (from python:3.13-slim-trixie). Not used at runtime by ssh-mcp,
+# which is a pure-Python app. Debian has not published a fix for either.
+CVE-2026-42496  # perl-archive-tar path traversal — Debian status: fix_deferred
+CVE-2026-8376   # perl regex-compile heap buffer overflow — Debian status: affected

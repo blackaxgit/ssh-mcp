@@ -111,6 +111,7 @@ jobs:
           image-ref: ssh-mcp:ci
           severity: CRITICAL
           exit-code: 1
+          trivyignores: .trivyignore
 
       - name: Push to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
