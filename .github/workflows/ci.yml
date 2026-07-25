@@ -50,25 +50,64 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev
 
+      # ruff and bandit come from the LOCKED dev env at a pinned version.
+      # `uvx` was used here previously; it floats to the newest release, so
+      # ruff 0.16.0's default-rule expansion (59 -> 413 on 2026-07-23) turned
+      # this job red on commits it had passed days earlier. See pyproject.toml
+      # [tool.ruff.lint] for the explicitly declared rule set.
       - name: Check formatting with ruff
-        run: uvx ruff format --check src/ tests/
+        run: uv run ruff format --check src/ tests/
 
       - name: Lint with ruff
-        run: uvx ruff check src/ tests/
+        run: uv run ruff check src/ tests/
 
       - name: Type check with mypy
         run: uv run mypy src/
 
+      - name: Security scan with bandit
+        run: uv run bandit -r src/ -q
+
+  # `pip-audit` lives in its own job rather than inside `lint` because its
+  # input is the LIVE advisory database, not the commit: a newly published
+  # CVE against any transitive dependency fails this job on every open PR at
+  # once. Keeping it separate makes that failure attributable instead of
+  # masquerading as a lint error.
+  #
+  # Two different guarantees, do not conflate them:
+  #   * The GHCR image publish is gated UNCONDITIONALLY — `docker` lists this
+  #     job in its `needs:` (see below), enforced by this workflow itself.
+  #   * Blocking a PR merge is enforced by BRANCH PROTECTION, not by this
+  #     file. Until `Dependency audit` is in the repository's required-checks
+  #     list, this job runs on every PR but does not block merging.
+  #
+  # A scheduled counterpart runs daily in audit.yml.
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
       - name: Audit dependencies
         run: uv run pip-audit
-
-      - name: Security scan with bandit
-        run: uvx bandit -r src/ -q
 
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-latest
-    needs: [test, lint]
+    # `audit` is REQUIRED here. When pip-audit lived inside `lint` this
+    # dependency existed only implicitly; making it explicit is what keeps a
+    # known-vulnerable image from reaching GHCR. Do not remove it — a
+    # regression test asserts this list contains `audit`.
+    needs: [test, lint, audit]
     permissions:
       contents: read
       packages: write

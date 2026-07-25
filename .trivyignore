@@ -5,9 +5,19 @@
 # Fixable CVEs must be patched, not ignored. Re-review each entry when the
 # base image (python:3.13-slim-trixie) is next bumped.
 #
-# Last reviewed: 2026-07-02
+# Last reviewed: 2026-07-25
 
 # perl-base (from python:3.13-slim-trixie). Not used at runtime by ssh-mcp,
-# which is a pure-Python app. Debian has not published a fix for either.
+# which is a pure-Python app. Debian has not published a fix for any of these.
 CVE-2026-42496  # perl-archive-tar path traversal — Debian status: fix_deferred
 CVE-2026-8376   # perl regex-compile heap buffer overflow — Debian status: affected
+
+# Added 2026-07-25. Both surfaced as CRITICAL on the first Trivy run after the
+# `Lint` job was un-blocked (previously `docker` never reached the scan step).
+# Verified against the Debian security tracker: trixie is "vulnerable" at
+# perl 5.40.1-6 with NO fixed version published for trixie.
+CVE-2026-13221  # perl regex trie >65535 branches -> silently wrong matches; trixie: vulnerable, no fix
+# NOTE for re-review: CVE-2026-57433 IS fixed in Debian sid (5.42.2-3) and
+# forky (5.40.1-8) — just not in trixie. The moment the base image moves off
+# trixie this entry becomes FIXABLE and must be deleted, not carried forward.
+CVE-2026-57433  # Storable SX_HOOK signed-int overflow -> deserialization panic; trixie: vulnerable, no fix

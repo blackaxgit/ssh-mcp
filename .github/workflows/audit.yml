@@ -1,0 +1,47 @@
+name: Scheduled Audit
+
+# Proactive advisory discovery, decoupled from PR activity.
+#
+# `pip-audit`'s input is the live OSV/PyPI advisory database, so its result is
+# a function of world-state rather than of any commit. Running it ONLY on
+# push/pull_request means a newly published CVE first surfaces as a red build
+# on whatever unrelated PR happens to be open — which is how a Dependabot
+# lockfile bump (PR #45) ended up blocked by an unrelated `click` advisory.
+#
+# This workflow adds a daily run against the default branch so new advisories
+# get discovered on their own schedule and can be remediated in a dedicated
+# PR. It does NOT replace the `audit` job in ci.yml, which runs on every push
+# and pull request and unconditionally gates the GHCR image publish via
+# `docker: needs: [test, lint, audit]`. Note that blocking a PR *merge* on
+# that job additionally requires `Dependency audit` to be listed in the
+# repository's branch-protection required checks — that is a settings change,
+# not something either workflow file can enforce.
+on:
+  schedule:
+    # 06:00 UTC daily. Cron in GitHub Actions is best-effort, not exact.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Scheduled dependency audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Audit dependencies
+        run: uv run pip-audit
