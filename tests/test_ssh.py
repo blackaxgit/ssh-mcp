@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from hypothesis import given
+from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from ssh_mcp.config import ServerRegistry
@@ -1557,6 +1557,18 @@ class TestRedactSecrets:
         self, prefix: str, secret: str
     ) -> None:
         """Property: any <prefix><secret> combo must not leak the secret."""
+        # A generated secret that is itself a substring of the prefix makes
+        # this property unsatisfiable by construction: redaction correctly
+        # yields "PGPASSWORD={REDACTED}", but a secret of "PGPASSWO" is still
+        # "in" that string via the *prefix*, not via any leak. Hypothesis
+        # found exactly that case (prefix='PGPASSWORD=', secret='PGPASSWO').
+        # Excluding it keeps the property about leakage rather than about
+        # accidental substring overlap.
+        assume(secret not in prefix)
+        # Same class of overlap against the replacement text: a secret of
+        # "REDACTED" (or any substring of "{REDACTED}") is "in" correctly
+        # redacted output via the placeholder, not via a leak.
+        assume(secret not in "{REDACTED}")
         cmd = f"mysql {prefix}{secret} somedb"
         redacted = _redact_secrets(cmd)
         assert secret not in redacted, (
