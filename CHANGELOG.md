@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Release note for whoever cuts this:** the `mcp` floor in `[project.dependencies]` is narrowed from `>=1.27.0` to `>=1.28.1`. Narrowing a declared dependency range is a **minor**-level change, so this should ship as **0.6.0**, not 0.5.7.
+
+### Security
+
+Cleared every advisory reported by `pip-audit`. **None of the four is exploitable in ssh-mcp** — this is defence-in-depth and a CI unblock, not an incident response. Being precise, because the two are not the same thing: three of the four are *unreachable* (the vulnerable code is never imported or never called), while CVE-2026-52869's session manager **is** in the HTTP request path — it is reachable but its exploit precondition cannot be satisfied by ssh-mcp's authentication model. Details per advisory below. Reachability was verified by grep over `src/` and the non-exploitability argument for CVE-2026-52869 was independently stress-tested by two external models.
+
+- **PYSEC-2026-2132 / CVE-2026-7246** (click, CVSS 7.2 HIGH, CWE-78) — command injection in `click.edit()`: the `filename` argument was interpolated into a shell string with its quotes unescaped. Bumped 8.3.1 → **8.4.2** (advisory fix floor is 8.3.3). `click` reaches ssh-mcp only via `mcp[cli]` → `typer` → `click` and `uvicorn` → `click`; ssh-mcp never imports it (its CLI parses `sys.argv` directly), so `click.edit()` is unreachable.
+- **PYSEC-2026-3481 / CVE-2026-52870** (mcp, High 7.6, CWE-862) — missing authorization in the experimental tasks handlers. Unreachable: requires opt-in `enable_tasks()`, never called.
+- **PYSEC-2026-3482 / CVE-2026-52869** (mcp, High 7.1, CWE-639) — cross-principal session bypass in `StreamableHTTPSessionManager`. The component is in the request path in HTTP mode, but the exploit precondition is unsatisfiable here: ssh-mcp authenticates *outside* the SDK with a single shared bearer token, so the SDK sees every request as anonymous — the advisory's documented "not affected without authentication configured" case.
+- **PYSEC-2026-3483 / CVE-2026-59950** (mcp, High 7.6 CVSS v4, CWE-346/1385) — origin validation in the deprecated `websocket_server()` transport. Unreachable: that transport is never imported.
+- **`mcp` bumped 1.27.0 → 1.28.1** in both `uv.lock` and `[project.dependencies]`. The `pyproject.toml` floor is the load-bearing half: `[project.dependencies]` is the only declaration that reaches the published wheel's `METADATA`, so a lockfile-only bump would have left `pip install ssh-mcp` free to resolve a vulnerable 1.27.0. stdio mode was unaffected by all three `mcp` advisories.
+- Added **`[tool.uv] constraint-dependencies = ["click>=8.3.3"]`** to record the transitive floor. Deliberately *not* added to `[project.dependencies]`, which would assert a dependency edge ssh-mcp does not have. Without this, a future `uv lock` regeneration could silently drop back below the fix.
+
+### Fixed
+
+- **CI `Lint` job was non-deterministic and had begun failing on unmodified code.** It invoked `uvx ruff` and `uvx bandit`; `uvx` resolves the newest release at run time. ruff **0.16.0** (2026-07-23) expanded its default rule set from **59 to 413 rules**, so the same command that printed `All checks passed!` on 2026-07-16 reported 50 errors days later with zero code changes. Lint tooling is now pinned (`ruff==0.16.0`, `bandit==1.9.4`) in the `dev` extra and invoked via `uv run`, so the gate is a function of the commit rather than of the outside world.
+- **The repo now declares its own lint standard.** There was no `[tool.ruff]` config at all, so the standard was whatever default the installed ruff happened to ship. `[tool.ruff.lint] select = ["E4", "E7", "E9", "F"]` codifies the pre-0.16 default the codebase has always been held to and is 100% clean against — no rule is dropped. Adopting ruff 0.16's wider default is tracked as a separate deliberate change.
+
+### Changed
+
+- **`pip-audit` moved out of the `lint` job into a dedicated `audit` job**, and `docker` now declares `needs: [test, lint, audit]`. The audit's input is the live advisory database, not the commit, so a newly published CVE against any transitive dependency fails every open PR at once; a dedicated job makes that failure attributable instead of masquerading as a lint error. The gate is **not** weakened. Two parts, with different guarantees: the GHCR publish is gated **unconditionally and in-workflow** — the previously *implicit* dependency of `docker` on the audit is now an explicit `needs:` entry. PR blocking, however, is enforced by branch protection, so it holds **only once `Dependency audit` is added to the required-checks list** (see *Operator action required* below). Until then the audit runs on every PR but does not block merges.
+- **New `.github/workflows/audit.yml`** runs `pip-audit` daily at 06:00 UTC plus on demand via `workflow_dispatch`, so new advisories are discovered on a schedule and remediated in their own PR rather than first appearing as noise on an unrelated one. Note: `main` will now show a red scheduled run whenever a new advisory lands and remains unremediated.
+- Added `pyyaml>=6.0` to the `dev` extra (used by the new CI-invariant tests; previously present only transitively via bandit).
+- `.gitignore` now covers `.coverage` / `.coverage.*`.
+- **`.trivyignore`: two new `perl-base` entries** — `CVE-2026-13221` (regex trie >65535 branches → silently incorrect matches) and `CVE-2026-57433` (Storable `SX_HOOK` signed-integer overflow → deserialization panic). Both surfaced as CRITICAL on the **first Trivy run the `docker` job ever completed**: while `Lint` was red, `docker` was skipped and the image scan never executed, so these were latent rather than new. Verified against the Debian security tracker — trixie is `vulnerable` at perl 5.40.1-6 with **no fixed version published for trixie** — so they meet the existing ignore policy (unfixable OS CVEs only, with a stated reason and review date). perl is not used at runtime by this pure-Python app. The `severity: CRITICAL` threshold was **not** changed and no fixable CVE is ignored. Note for the next base-image bump: `CVE-2026-57433` *is* fixed in Debian sid (5.42.2-3) and forky (5.40.1-8), so it becomes fixable and must be deleted from the ignore list once the image moves off trixie.
+
+### Added
+
+- `tests/test_dependency_floors.py` — asserts every security-motivated version floor both holds in the resolved environment and is declared in `pyproject.toml` at the layer matching the dependency's kind. Runs offline with no advisory-DB access, so it catches a lockfile regression that `pip-audit` structurally cannot detect without network.
+- `tests/test_ci_lint_determinism.py` — asserts no linter is invoked through `uvx`, lint tools are exactly pinned, the ruff rule set is declared, `pip-audit` has its own job, the scheduled audit workflow exists, and **the `docker` publish job depends on `audit`**. That last assertion guards a regression caught during cross-model review: relocating `pip-audit` to a separate workflow would have silently removed it from the image-publish path, because GitHub Actions `needs:` cannot span workflows.
+
+### Operator action required
+
+If `main` has branch protection with required status checks, add **`Dependency audit`** to the required list. Without it the audit becomes advisory-only on pull requests, which *would* weaken the gate. This is a repository-settings change that cannot be made from the repo files.
+
 ## [0.5.6] - 2026-07-02
 
 ### Security

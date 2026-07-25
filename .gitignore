@@ -6,6 +6,8 @@ dist/
 build/
 .venv/
 .pytest_cache/
+.coverage
+.coverage.*
 
 # Config (contains real infrastructure data)
 config/servers.toml
@@ -41,9 +43,15 @@ id_dsa.*
 *.pub
 *.ppk
 
-# Research / internal docs
-docs/research-prep/
-docs/internal/
+# Docs / AI-agent working directories — local only, not part of the project.
+# `docs/` supersedes the previous narrower docs/research-prep/ + docs/internal/
+# entries. Reminder: adding a directory here does NOT untrack files already
+# committed under it; use `git rm -r --cached <dir>` for that.
+docs/
+wiki/
+claude/
+codex/
+.codex/
 
 # Hypothesis database
 .hypothesis/
