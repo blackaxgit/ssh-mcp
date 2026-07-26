@@ -3420,11 +3420,17 @@ class TestUnlinkBeneathIdentity:
         original.write_bytes(b"original contents")
         original_st = original.stat()
 
-        # Simulate the race: the original slot is replaced by an
-        # unrelated file via rename onto the exact same leaf name.
-        original.unlink()
+        # Create the replacement while the original still exists, so the two
+        # are guaranteed to hold DIFFERENT inodes, then rename over the leaf.
+        #
+        # Creating it after unlinking (the obvious ordering) is not portable:
+        # ext4 reuses the just-freed inode number, so the "replacement" can
+        # land on the same (st_dev, st_ino) and the identity check correctly
+        # sees a match. APFS never reuses, which is why that ordering passed
+        # on macOS and failed on Linux CI.
         replacement = tmp_path / "replacement.txt"
         replacement.write_bytes(b"replacement contents")
+        assert replacement.stat().st_ino != original_st.st_ino
         os.replace(replacement, tmp_path / "victim.txt")
 
         root_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)

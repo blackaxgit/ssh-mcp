@@ -83,6 +83,11 @@ class TestGetConfigPath:
     ) -> None:
         """Test XDG config path is used when env var is absent."""
         monkeypatch.delenv("SSH_MCP_CONFIG", raising=False)
+        # `_get_config_path` checks $XDG_CONFIG_HOME before falling back to
+        # Path.home(); without unsetting it, patching Path.home has no effect
+        # on a machine that sets it (CI does), so this test resolved the real
+        # user config and failed there while passing locally.
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
 
         xdg_config = tmp_path / ".config" / "ssh-mcp" / "servers.toml"
         xdg_config.parent.mkdir(parents=True)
@@ -92,6 +97,28 @@ class TestGetConfigPath:
             result = server_module._get_config_path()
 
         assert result == str(xdg_config)
+
+    def test_xdg_config_home_is_honoured_when_set(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """$XDG_CONFIG_HOME takes precedence over ~/.config.
+
+        The XDG branch previously had no positive test — only one that
+        unset the variable — so the behaviour it adds was unverified while
+        being load-bearing enough to break two other tests in CI.
+        """
+        monkeypatch.delenv("SSH_MCP_CONFIG", raising=False)
+        xdg_home = tmp_path / "xdg"
+        cfg = xdg_home / "ssh-mcp" / "servers.toml"
+        cfg.parent.mkdir(parents=True)
+        cfg.touch()
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
+
+        # Point HOME somewhere with no config, so a pass can only come from
+        # the XDG branch rather than the ~/.config fallback.
+        monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+
+        assert server_module._get_config_path() == str(cfg)
 
     def test_dev_path_fallback(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

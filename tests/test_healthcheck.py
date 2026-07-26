@@ -72,6 +72,12 @@ def test_stdio_healthy_via_xdg_fallback_without_env_var(
     """
     monkeypatch.delenv("SSH_MCP_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+    # XDG_CONFIG_HOME must be pinned too, not merely HOME: _get_config_path
+    # consults it FIRST, so on any machine that sets it (GitHub runners do,
+    # macOS typically does not) pinning only HOME leaves resolution pointing
+    # at the real user config. That asymmetry made this test pass locally and
+    # fail in CI.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     xdg_dir = tmp_path / ".config" / "ssh-mcp"
     xdg_dir.mkdir(parents=True)
     (xdg_dir / "servers.toml").write_text("# empty registry\n")
