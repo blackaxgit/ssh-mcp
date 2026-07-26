@@ -550,11 +550,18 @@ groups = []
     async def test_ssh_exceptions_return_exec_result_with_error(
         self, tmp_path: Path, exc_class: type, exc_args: tuple[object, ...]
     ) -> None:
-        """Each SSH-layer exception must produce ExecResult with error, not raise."""
+        """Each SSH-layer exception must produce ExecResult with error, not raise.
+
+        S10: ``execute()`` no longer calls ``conn.run()`` — it calls
+        ``conn.create_process()`` and drains stdout/stderr itself. A
+        connection-layer failure (disconnect, auth, network) surfaces at
+        the ``create_process()`` call itself, before any draining starts,
+        which is where the mock now raises.
+        """
         manager = self._make_manager(tmp_path)
 
         mock_conn = AsyncMock()
-        mock_conn.run = AsyncMock(side_effect=exc_class(*exc_args))
+        mock_conn.create_process = AsyncMock(side_effect=exc_class(*exc_args))
 
         with patch.object(manager, "_get_connection", return_value=mock_conn):
             result = await manager.execute("test-srv", "whoami")
@@ -567,14 +574,33 @@ groups = []
     async def test_timeout_error_returns_exec_result_with_error(
         self, tmp_path: Path
     ) -> None:
-        """asyncio.TimeoutError (inner try) must produce ExecResult with error."""
+        """asyncio.TimeoutError (inner try) must produce ExecResult with error.
+
+        S10: the timeout now comes from the real ``asyncio.timeout()``
+        around the bounded stdout/stderr drain loop, not from
+        ``conn.run(timeout=...)``. The mocked process's streams never
+        yield EOF, so a short ``timeout=`` reliably trips it.
+        """
         manager = self._make_manager(tmp_path)
 
+        async def _hang(_n: int) -> bytes:
+            await asyncio.sleep(3600)
+            return b""  # pragma: no cover - never reached
+
+        mock_process = MagicMock()
+        mock_process.stdout = MagicMock()
+        mock_process.stdout.read = AsyncMock(side_effect=_hang)
+        mock_process.stderr = MagicMock()
+        mock_process.stderr.read = AsyncMock(side_effect=_hang)
+        mock_process.wait_closed = AsyncMock(return_value=None)
+        mock_process.terminate = MagicMock()
+        mock_process.exit_status = None
+
         mock_conn = AsyncMock()
-        mock_conn.run = AsyncMock(side_effect=asyncio.TimeoutError())
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
 
         with patch.object(manager, "_get_connection", return_value=mock_conn):
-            result = await manager.execute("test-srv", "sleep 9999")
+            result = await manager.execute("test-srv", "sleep 9999", timeout=0.05)
 
         assert isinstance(result, ExecResult)
         assert result.exit_code is None

@@ -37,7 +37,26 @@ def _load_token() -> str | None:
 
 
 def _check_stdio() -> tuple[bool, str]:
-    """Verify the package imports and the config file parses.
+    """Verify the package imports and its resolved config actually parses.
+
+    S15 (production incident risk): the previous version of this check only
+    looked at ``SSH_MCP_CONFIG``, and only *if* it was both set and pointed
+    at a file that already existed — otherwise it silently reported healthy
+    off a bare ``import ssh_mcp``. But ``server.py::_get_config_path`` has a
+    three-step fallback chain (``SSH_MCP_CONFIG`` env var ->
+    ``~/.config/ssh-mcp/servers.toml`` -> package-relative dev config), so a
+    probe that checks only the first step is checking a *different* path
+    than the one the server actually uses to start up. That asymmetry let a
+    container with no usable configuration anywhere in the real chain (e.g.
+    ``SSH_MCP_CONFIG`` unset, or set to a typo'd path) still pass Docker's
+    liveness gate, because the probe never got far enough to notice.
+    "Configured" is therefore defined here as: the server's own resolver
+    finds a config file, and that file parses into a valid ServerRegistry.
+    We call ``server._get_config_path`` directly instead of re-implementing
+    its fallback chain — a hand-rolled second copy would drift from the
+    real one the next time either changes, reintroducing this exact bug.
+    Measured cost of importing server.py (FastMCP + asyncssh + structlog)
+    is ~0.3s, well inside the 3s HEALTHCHECK_TIMEOUT budget.
 
     Returns (ok, diagnostic).
     """
@@ -45,15 +64,27 @@ def _check_stdio() -> tuple[bool, str]:
         import ssh_mcp  # noqa: F401
     except ImportError as e:
         return False, f"import failed: {e}"
-    # Try to resolve and parse config if present
-    config_path = os.environ.get("SSH_MCP_CONFIG", "")
-    if config_path and Path(config_path).exists():
-        try:
-            from ssh_mcp.config import ServerRegistry
 
-            ServerRegistry(config_path)
-        except Exception as e:
-            return False, f"config parse failed: {type(e).__name__}"
+    try:
+        from ssh_mcp.server import _get_config_path
+    except ImportError as e:
+        return False, f"import failed: {e}"
+
+    try:
+        config_path = _get_config_path()
+    except FileNotFoundError as e:
+        # The server itself would refuse to start here (see
+        # _get_config_path's docstring for the exact chain), so reporting
+        # healthy would be a lie the container orchestrator would trust.
+        return False, f"no config resolved: {e}"
+
+    try:
+        from ssh_mcp.config import ServerRegistry
+
+        ServerRegistry(config_path)
+    except Exception as e:
+        return False, f"config parse failed: {type(e).__name__}"
+
     return True, "stdio healthy"
 
 

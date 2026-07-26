@@ -104,11 +104,35 @@ def format_group_table(groups: list[GroupConfig], server_counts: dict[str, int])
 def format_exec_result(result: ExecResult) -> str:
     """Format a single command execution result.
 
+    N3 fix: ``models.py`` (``ExecResult`` docstring) documents FOUR reachable
+    states of the ``(error, exit_code)`` pair, including ``error is not
+    None`` + ``exit_code >= 0`` — "command ran but had issues" (e.g. a
+    tripwire warning attached to output that still exit-coded 0, or a
+    partial-output condition). The previous version of this function
+    treated *any* non-empty ``error`` as a pure execution failure and
+    returned immediately, discarding ``stdout``/``stderr``/``exit_code`` —
+    exactly the diagnostic evidence a user needs when a command ran but the
+    server also flagged an issue. This version renders every field that is
+    actually populated, for all four documented states:
+
+      * ``error is None`` + ``exit_code >= 0``: command + output + exit code.
+      * ``error is None`` + ``exit_code is None``: same as above with an
+        "unknown" exit code (should not happen per the model contract, but
+        rendered rather than crashing).
+      * ``error is not None`` + ``exit_code is None``: execution never
+        produced a result (SSH error, timeout, server not found, tripwire
+        block, fail_fast cancellation) — no exit-code line, since there
+        isn't one.
+      * ``error is not None`` + ``exit_code >= 0``: command + output +
+        ERROR line + exit code, so the user sees both what happened and
+        what the server flagged about it.
+
     Args:
         result: Execution result to format
 
     Returns:
-        Formatted text showing command, output, and exit status
+        Formatted text showing command, output, error (if any), and exit
+        status (if a command actually ran)
 
     Example:
         >>> result = ExecResult(
@@ -125,9 +149,6 @@ def format_exec_result(result: ExecResult) -> str:
         <BLANKLINE>
         Exit code: 0 (150ms)
     """
-    if result.error:
-        return f"[{result.server}] ERROR: {result.error}"
-
     lines = [f"[{result.server}] $ {result.command}"]
 
     # Add stdout if present
@@ -140,7 +161,19 @@ def format_exec_result(result: ExecResult) -> str:
         lines.append("STDERR:")
         lines.append(result.stderr)
 
-    # Add exit code and duration
+    # Add error if present (does not, by itself, imply the command never ran)
+    if result.error:
+        lines.append("")
+        lines.append(f"ERROR: {result.error}")
+
+    # A None exit_code alongside an error means the command never completed
+    # (see docstring above) — there is no exit status to report. Otherwise
+    # (including the "should not happen" error-is-None/exit_code-is-None
+    # case) report the exit code, using "unknown" as the documented
+    # fallback rather than fabricating a value.
+    if result.exit_code is None and result.error:
+        return "\n".join(lines)
+
     lines.append("")
     exit_code = result.exit_code if result.exit_code is not None else "unknown"
     lines.append(f"Exit code: {exit_code} ({result.duration_ms}ms)")

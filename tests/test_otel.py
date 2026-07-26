@@ -205,15 +205,25 @@ class TestSFTPTracing:
     """
 
     async def test_upload_creates_span_on_failure(self, tmp_path: Path) -> None:
-        """A failing upload still produces a span with error status."""
+        """A failing upload still produces a span with error status.
+
+        B1: local_path is now transfer_root-RELATIVE, not an absolute
+        ``tmp_path`` string — an absolute path is rejected by
+        ``validate_relative`` (PathConfinementError) BEFORE
+        ``_get_connection`` is ever reached, which would exercise a
+        different failure than the one this test targets (a connection
+        failure surfacing as RuntimeError). A relative name lets the
+        mocked ``_get_connection`` OSError be the thing that actually
+        fires.
+        """
         import ssh_mcp.ssh as ssh_module
         from opentelemetry.trace.status import StatusCode
 
-        local = tmp_path / "payload.txt"
-        local.write_bytes(b"hello")
+        local_path = "payload.txt"
 
         with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
-            manager = SSHManager(_make_registry(), Settings())
+            settings = Settings(transfer_root=str(tmp_path / "transfers"))
+            manager = SSHManager(_make_registry(), settings)
             with patch.object(
                 manager,
                 "_get_connection",
@@ -222,13 +232,13 @@ class TestSFTPTracing:
                 from contextlib import suppress
 
                 with suppress(Exception):
-                    await manager.upload("test-host", str(local), "/tmp/target.txt")
+                    await manager.upload("test-host", local_path, "/tmp/target.txt")
 
         spans = [s for s in _exporter.get_finished_spans() if s.name == "ssh.upload"]
         assert len(spans) == 1, "Exactly one ssh.upload span expected"
         span = spans[0]
         assert span.attributes["ssh.host"] == "test-host"
-        assert span.attributes["ssh.local_path_length"] == len(str(local))
+        assert span.attributes["ssh.local_path_length"] == len(local_path)
         assert span.attributes["ssh.remote_path_length"] == len("/tmp/target.txt")
         # Inner _upload_impl catches OSError and re-raises as RuntimeError,
         # so the outer span sees the wrapped exception class.
@@ -240,10 +250,11 @@ class TestSFTPTracing:
         import ssh_mcp.ssh as ssh_module
         from opentelemetry.trace.status import StatusCode
 
-        local = tmp_path / "downloaded.txt"
+        local_path = "downloaded.txt"
 
         with patch.object(ssh_module, "_ssh_tracer", trace.get_tracer("ssh_mcp.ssh")):
-            manager = SSHManager(_make_registry(), Settings())
+            settings = Settings(transfer_root=str(tmp_path / "transfers"))
+            manager = SSHManager(_make_registry(), settings)
             with patch.object(
                 manager,
                 "_get_connection",
@@ -252,7 +263,7 @@ class TestSFTPTracing:
                 from contextlib import suppress
 
                 with suppress(Exception):
-                    await manager.download("test-host", "/tmp/source.txt", str(local))
+                    await manager.download("test-host", "/tmp/source.txt", local_path)
 
         spans = [s for s in _exporter.get_finished_spans() if s.name == "ssh.download"]
         assert len(spans) == 1
@@ -263,22 +274,37 @@ class TestSFTPTracing:
     async def test_sftp_spans_not_created_when_tracer_none(
         self, tmp_path: Path
     ) -> None:
-        """Soft-import fallback: no tracer → no spans, but upload still runs."""
+        """Soft-import fallback: no tracer → no spans, but upload still runs.
+
+        Defect 7 (panel iteration 2, all three reviewers): this test used
+        to pass ``upload()`` an ABSOLUTE local path (``str(local)``),
+        which ``validate_relative`` (B1 confinement) rejects immediately
+        with a ``ValueError`` — the ``suppress(Exception)`` hid that, so
+        "upload still runs" was never actually exercised. The assertion
+        below passed regardless, for a reason unrelated to what the test
+        claims to prove: ``_ssh_tracer is None`` makes ``upload()`` skip
+        the ``with start_as_current_span(...)`` block BEFORE
+        ``_upload_impl`` is even called, so no span is created no matter
+        what (or how early) ``_upload_impl`` raises. A transfer_root
+        relative path lets the call proceed past validation into
+        ``_get_connection`` (mocked to fail) instead, so the no-op-tracer
+        assertion is now proven against a call that actually did real
+        work.
+        """
         import ssh_mcp.ssh as ssh_module
         from contextlib import suppress
 
-        local = tmp_path / "payload.txt"
-        local.write_bytes(b"data")
+        settings = Settings(transfer_root=str(tmp_path / "transfers"))
 
         with patch.object(ssh_module, "_ssh_tracer", None):
-            manager = SSHManager(_make_registry(), Settings())
+            manager = SSHManager(_make_registry(), settings)
             with patch.object(
                 manager,
                 "_get_connection",
                 AsyncMock(side_effect=OSError("no net")),
             ):
                 with suppress(Exception):
-                    await manager.upload("test-host", str(local), "/tmp/target.txt")
+                    await manager.upload("test-host", "payload.txt", "/tmp/target.txt")
 
         # No SFTP spans should exist
         sftp_spans = [

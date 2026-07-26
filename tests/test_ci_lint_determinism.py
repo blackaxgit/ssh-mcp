@@ -45,6 +45,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 AUDIT_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "audit.yml"
+RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
 PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
 
 # Tools whose *version* determines whether the gate passes. These must come
@@ -232,7 +233,7 @@ def test_scheduled_audit_does_not_duplicate_pull_request_runs() -> None:
 
 def test_workflow_actions_are_pinned_by_commit_sha() -> None:
     """Existing repo convention: third-party actions are pinned by SHA, not tag."""
-    for path in (CI_WORKFLOW_PATH, AUDIT_WORKFLOW_PATH):
+    for path in (CI_WORKFLOW_PATH, AUDIT_WORKFLOW_PATH, RELEASE_WORKFLOW_PATH):
         workflow = _load_workflow(path)
         for job_name, job in workflow["jobs"].items():
             for step in job.get("steps") or []:
@@ -246,6 +247,191 @@ def test_workflow_actions_are_pinned_by_commit_sha() -> None:
                     f"{path.name} job {job_name!r} uses {uses!r}, which is not "
                     f"pinned to a 40-character commit SHA."
                 )
+
+
+def test_every_uv_sync_uses_locked_flag() -> None:
+    """Security floors in pyproject.toml require --locked to enforce them.
+
+    Without --locked, a synced venv could ignore raised dependency floors and
+    install something stale from the lockfile, silently bypassing security
+    constraints. --locked enforces lockfile ↔ pyproject.toml consistency.
+    """
+    for path in (CI_WORKFLOW_PATH, AUDIT_WORKFLOW_PATH, RELEASE_WORKFLOW_PATH):
+        for command in _run_commands(_load_workflow(path)):
+            if "uv sync" in command:
+                assert "--locked" in command, (
+                    f"{path.name} runs `uv sync` without `--locked`, which allows "
+                    f"the lockfile to drift from pyproject.toml's security floors. "
+                    f"Command: {command!r}"
+                )
+
+
+def test_setup_uv_is_version_pinned() -> None:
+    """setup-uv without a version: resolves the newest uv at run time.
+
+    This is the identical failure mode that bit the repo when unpinned `uvx ruff`
+    jumped to 0.16.0 and reddened CI (see pyproject.toml:56-62). Every gate must
+    be a function of the commit, not of what Astral shipped this morning.
+    """
+    for path in (CI_WORKFLOW_PATH, AUDIT_WORKFLOW_PATH, RELEASE_WORKFLOW_PATH):
+        workflow = _load_workflow(path)
+        for job_name, job in workflow["jobs"].items():
+            for step in job.get("steps") or []:
+                uses = step.get("uses", "")
+                if "astral-sh/setup-uv@" in uses:
+                    with_config = step.get("with", {})
+                    assert "version" in with_config, (
+                        f"{path.name} job {job_name!r} uses setup-uv without a "
+                        f"version: field, so it resolves the newest uv at run time "
+                        f"and makes the gate depend on the outside world instead of "
+                        f"on the commit."
+                    )
+
+
+def test_docker_job_builds_exactly_once() -> None:
+    """S7: the scanned image must be the published image.
+
+    With load: true (docker exporter), BuildKit constructs an image that the
+    Docker daemon re-assembles. A second build-push-action with push: true
+    (registry exporter) is an independent invocation, so cache misses or
+    poisoning produce different bytes. Fix: build once with push-by-digest,
+    scan that digest, then promote tags from it.
+    """
+    workflow = _load_workflow(CI_WORKFLOW_PATH)
+    docker_job = workflow["jobs"].get("docker")
+    assert docker_job, "docker job does not exist"
+
+    build_push_steps = [
+        step
+        for step in docker_job.get("steps", [])
+        if step.get("uses", "").startswith("docker/build-push-action@")
+    ]
+
+    assert len(build_push_steps) <= 2, (
+        "docker job has more than 2 build-push-action steps; this defeats "
+        "the 'build once' requirement"
+    )
+
+    # If there are 2 steps, one must be conditional (PR path) and one (publish path)
+    if len(build_push_steps) == 2:
+        step_ifs = [step.get("if", "") for step in build_push_steps]
+        assert any("PUBLISH" in cond for cond in step_ifs), (
+            "docker job has 2 build-push-action steps but neither is gated on "
+            "PUBLISH, so both always run"
+        )
+
+    # The publish-path step must use push-by-digest
+    for step in build_push_steps:
+        if "build" in step.get("id", "") and "local" not in step.get("id", ""):
+            # This is the main/publish build step
+            with_config = step.get("with", {})
+            outputs = with_config.get("outputs", "")
+            assert "push-by-digest=true" in outputs, (
+                "docker job's publish-path build step does not use "
+                "push-by-digest=true; the pushed image would not be the "
+                "scanned one"
+            )
+
+
+def test_release_workflow_exists_and_is_tag_triggered() -> None:
+    """S6: a release workflow must exist and be triggered by version tags."""
+    assert RELEASE_WORKFLOW_PATH.exists(), (
+        f"{RELEASE_WORKFLOW_PATH.name} does not exist. Without a release "
+        f"workflow, the wheel cannot be published to PyPI with Trusted "
+        f"Publishing and PEP 740 attestations."
+    )
+
+    workflow = _load_workflow(RELEASE_WORKFLOW_PATH)
+    triggers = _triggers(workflow)
+
+    assert "push" in triggers, "release.yml does not have a push trigger"
+    push_config = triggers.get("push", {})
+    tags = push_config.get("tags", [])
+    assert "v*" in tags, (
+        "release.yml's push trigger does not list tags: [v*], so release "
+        "tags do not trigger the workflow"
+    )
+
+
+def test_release_workflow_gates_on_test_lint_audit() -> None:
+    """S6: the release publish job must gate on test, lint, and audit.
+
+    ci.yml runs on branches only; a tag could be cut from a commit that never
+    passed CI. The audit job must re-run at tag time — its input is the live
+    advisory database, not the commit.
+    """
+    workflow = _load_workflow(RELEASE_WORKFLOW_PATH)
+    jobs = workflow["jobs"]
+
+    for job_name in ("test", "lint", "audit"):
+        assert job_name in jobs, (
+            f"release.yml does not define a {job_name!r} job, so release "
+            f"tags would bypass {job_name}"
+        )
+
+    build_job = jobs.get("build")
+    assert build_job, "release.yml does not define a build job"
+
+    build_needs = _needs(build_job)
+    for gate in ("test", "lint", "audit"):
+        assert gate in build_needs, (
+            f"release.yml's build job needs {build_needs!r}, which omits {gate!r}. "
+            f"A release could ship without passing {gate}."
+        )
+
+
+def test_release_workflow_publishes_via_trusted_publishing() -> None:
+    """S6: publish-pypi job must use Trusted Publishing with id-token: write.
+
+    Trusted Publishing (OIDC) replaces API tokens and generates PEP 740
+    attestations by default.
+    """
+    workflow = _load_workflow(RELEASE_WORKFLOW_PATH)
+    jobs = workflow["jobs"]
+
+    publish_job = jobs.get("publish-pypi")
+    assert publish_job, "release.yml does not define a publish-pypi job"
+
+    permissions = publish_job.get("permissions", {})
+    assert permissions.get("id-token") == "write", (
+        f"publish-pypi job has permissions {permissions!r}, which does not "
+        f"include id-token: write (required for Trusted Publishing)"
+    )
+
+    # Verify that attestations: is NOT set (it defaults to true in v1.11.0+)
+    for step in publish_job.get("steps", []):
+        uses = step.get("uses", "")
+        if "pypa/gh-action-pypi-publish@" in uses:
+            with_config = step.get("with", {})
+            assert "attestations" not in with_config, (
+                "publish-pypi step explicitly sets attestations:, which invites "
+                "someone to 'simplify' it to false later. Let it default to true "
+                "(v1.11.0+ default behavior)."
+            )
+
+
+def test_release_workflow_uses_environment_gate() -> None:
+    """S6: publish-pypi should run in a GitHub Environment for human approval.
+
+    This is where the second gate lives (first gate is the test/lint/audit
+    dependency), and it should be the `pypi` environment that PyPI's trusted
+    publisher config pins to.
+    """
+    workflow = _load_workflow(RELEASE_WORKFLOW_PATH)
+    publish_job = workflow["jobs"].get("publish-pypi")
+    assert publish_job, "release.yml does not define a publish-pypi job"
+
+    environment = publish_job.get("environment")
+    assert environment, (
+        "publish-pypi job does not declare an environment, so there is no "
+        "human approval gate before publishing to PyPI"
+    )
+
+    env_name = environment.get("name") if isinstance(environment, dict) else environment
+    assert env_name == "pypi", (
+        f"publish-pypi job uses environment {env_name!r}, not 'pypi'. "
+        f"PyPI's trusted publisher config should pin to the 'pypi' environment."
+    )
 
 
 # --- failure-path coverage for the helpers ---------------------------------

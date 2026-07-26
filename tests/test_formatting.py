@@ -211,6 +211,67 @@ class TestFormatExecResult:
 
         assert "Exit code: unknown" in output
 
+    def test_format_exec_result_error_with_exit_code_preserves_output(self) -> None:
+        """N3 regression: error set + exit_code >= 0 ("command ran but had
+        issues", per models.py:117-123 ExecResult docstring) must still
+        surface stdout/stderr/exit_code, not just the error message.
+
+        Before the fix, ``format_exec_result`` returned immediately on any
+        truthy ``error`` and silently dropped this evidence.
+        """
+        result = ExecResult(
+            server="web1",
+            command="deploy.sh",
+            stdout="Step 1/3 complete\nStep 2/3 complete",
+            stderr="warning: config drift detected",
+            exit_code=0,
+            error="post-deploy healthcheck tripwire triggered",
+            duration_ms=4200,
+        )
+        output = format_exec_result(result)
+
+        assert "[web1] $ deploy.sh" in output
+        assert "Step 1/3 complete" in output
+        assert "Step 2/3 complete" in output
+        assert "STDERR:" in output
+        assert "warning: config drift detected" in output
+        assert "ERROR: post-deploy healthcheck tripwire triggered" in output
+        assert "Exit code: 0" in output
+        assert "4200ms" in output
+
+    def test_format_exec_result_error_with_nonzero_exit_code_preserves_output(
+        self,
+    ) -> None:
+        """Same documented state as above but with a failing exit code, to
+        confirm the exit code itself (not just its presence) is rendered
+        correctly when paired with an error."""
+        result = ExecResult(
+            server="db1",
+            command="migrate.sh",
+            stdout="applying migration 042",
+            stderr="",
+            exit_code=1,
+            error="migration exited non-zero",
+            duration_ms=900,
+        )
+        output = format_exec_result(result)
+
+        assert "applying migration 042" in output
+        assert "ERROR: migration exited non-zero" in output
+        assert "Exit code: 1" in output
+
+    def test_format_exec_result_pure_error_no_regression(
+        self, sample_exec_error: ExecResult
+    ) -> None:
+        """Pure execution failure (error set, exit_code is None) must still
+        report the error and must NOT fabricate an exit code, since none
+        exists (see models.py ExecResult docstring)."""
+        output = format_exec_result(sample_exec_error)
+
+        assert "[web1]" in output
+        assert "ERROR: Command not found: invalid-command" in output
+        assert "Exit code:" not in output
+
 
 class TestFormatGroupResults:
     """Tests for format_group_results function."""

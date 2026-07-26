@@ -7,6 +7,9 @@ initialization. All tests run without real SSH connections.
 from __future__ import annotations
 
 import asyncio
+import itertools
+import os
+import time
 
 import pytest
 from hypothesis import assume, given
@@ -14,16 +17,17 @@ from hypothesis import strategies as st
 
 from ssh_mcp.config import ServerRegistry
 from ssh_mcp.models import ExecResult, Settings
+from ssh_mcp.paths import PathConfinementError
 from ssh_mcp.ssh import (
     SSHManager,
     _DANGEROUS_PATTERNS,
-    _MAX_SFTP_BYTES,
+    _LONG_FLAG_KEYWORDS,
     _REDACTION_PLACEHOLDER,
     _SENSITIVE_PATHS,
     _is_dangerous_command,
     _make_connection_id,
     _redact_secrets,
-    _validate_local_path,
+    _unlink_beneath,
     _validate_remote_path,
 )
 
@@ -324,7 +328,10 @@ class TestValidateRemotePath:
             # to database data files can exfiltrate tables/secrets.
             "/usr/local/bin/script.sh",
             "/backups/2026-01-01/dump.sql",
-            "/home/user/.ssh/id_ed25519.pub",  # public keys are legitimate
+            # NOTE (B1): '/home/user/.ssh/id_ed25519.pub' used to be here as
+            # an allowed path under the now-removed ``.pub`` exemption. It
+            # is deliberately gone from this list — see
+            # TestExpandedSensitiveAllowlist.test_ssh_pub_key_no_longer_exempted.
         ],
         ids=lambda p: p.replace("/", "_")[:50],
     )
@@ -472,91 +479,48 @@ groups = ["test"]
         assert manager._eviction_task is None
 
     async def test_group_execution_semaphore_uses_max_parallel_hosts(self) -> None:
-        """execute_on_group's concurrency semaphore reflects Settings.max_parallel_hosts.
+        """The process-wide concurrency semaphore reflects Settings.max_parallel_hosts.
 
-        Guards against regressing the hardcoded ``Semaphore(10)``. We inject a
-        custom ``max_parallel_hosts`` and assert the semaphore built inside
-        ``execute_on_group`` has the matching bound by patching
-        ``asyncio.Semaphore`` and capturing its first positional argument.
+        Guards against regressing the hardcoded ``Semaphore(10)``. We inject
+        a custom ``max_parallel_hosts`` and assert the semaphore has the
+        matching bound.
+
+        S1 (behaviour change): the semaphore used to be constructed INSIDE
+        ``execute_on_group`` on every call, so this test used to patch
+        ``asyncio.Semaphore`` and invoke ``execute_on_group`` to observe the
+        construction. It is now built ONCE in ``SSHManager.__init__`` and
+        reused across calls — bounding the whole process, not one
+        invocation — so the assertion moved to the constructed attribute
+        directly rather than intercepting a call inside
+        ``execute_on_group``.
         """
-        from unittest.mock import patch
-
         settings = Settings(max_parallel_hosts=7)
         registry = self._make_registry()
         manager = SSHManager(registry, settings)
 
-        captured: list[int] = []
-        real_semaphore = asyncio.Semaphore
-
-        def capturing_semaphore(value: int) -> asyncio.Semaphore:
-            captured.append(value)
-            return real_semaphore(value)
-
-        with patch("ssh_mcp.ssh.asyncio.Semaphore", side_effect=capturing_semaphore):
-            # Group has 1 test-host, so only 1 execute will be attempted;
-            # the real execute will fail (no SSH), but by then the Semaphore
-            # is already constructed.
-            try:
-                await manager.execute_on_group("test", "true")
-            except Exception:
-                pass
-
-        assert captured, "Semaphore was never constructed in execute_on_group"
-        assert captured[0] == 7
+        assert isinstance(manager._group_semaphore, asyncio.Semaphore)
+        # asyncio.Semaphore does not expose its bound publicly; ``_value``
+        # is the initializer value before any acquire() calls, which is
+        # exactly the case here (a freshly constructed manager).
+        assert manager._group_semaphore._value == 7
 
 
 # ---------------------------------------------------------------------------
-# _validate_local_path
-# ---------------------------------------------------------------------------
-
-
-class TestValidateLocalPath:
-    """Tests for _validate_local_path — blocks sensitive local files."""
-
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "/home/user/../etc/shadow",
-            "../../etc/passwd",
-            "/etc/shadow",
-            "/etc/passwd",
-            "/home/user/.ssh/authorized_keys",
-            "/home/user/.ssh/id_rsa",
-            "/home/user/.ssh/id_ed25519",
-        ],
-        ids=lambda p: p.replace("/", "_").replace(".", "_")[:50],
-    )
-    def test_blocks_sensitive_local_path(self, path: str) -> None:
-        with pytest.raises(ValueError):
-            _validate_local_path(path)
-
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "/var/log/app.log",
-            "/home/user/file.txt",
-            "/tmp/data",
-            "/opt/app/config.yaml",
-        ],
-        ids=lambda p: p.replace("/", "_")[:50],
-    )
-    def test_allows_normal_local_path(self, path: str) -> None:
-        _validate_local_path(path)  # Should not raise
-
-    def test_sensitive_local_paths_list_coverage(self) -> None:
-        for sensitive in _SENSITIVE_PATHS:
-            if sensitive.startswith("\\"):
-                continue
-            if sensitive.endswith("/"):
-                path = sensitive + "secret.txt"
-            elif sensitive.startswith("/"):
-                path = sensitive
-            else:
-                path = f"/home/user/{sensitive}"
-            with pytest.raises(ValueError):
-                _validate_local_path(path)
-
-
+# _validate_local_path — REMOVED (B1 / RC1)
+#
+# ``_validate_local_path`` and its ``TestValidateLocalPath`` coverage are
+# deliberately gone, not merely renamed. B1's whole fix is that local SFTP
+# paths are no longer checked against a string denylist at all — three
+# successive "harden the validator" designs were each shown insufficient
+# during review (denylist misses unlisted paths; realpath-then-transfer is a
+# TOCTOU; final-component O_NOFOLLOW misses intermediate components). They
+# are now resolved beneath a pinned ``transfer_root`` file descriptor via
+# ``ssh_mcp.paths.open_beneath``, which refuses a symlink at every path
+# component. That confinement primitive is covered by
+# ``tests/test_paths.py`` (already landed) and the end-to-end SFTP behaviour
+# by the new ``tests/test_sftp_confinement.py``. Keeping a same-shaped test
+# class here pointed at a function that no longer exists would just be
+# testing that the import doesn't crash.
 # ---------------------------------------------------------------------------
 # Red-team hardening: path normalization + expanded allowlist (RT-Fix 1)
 # ---------------------------------------------------------------------------
@@ -638,17 +602,11 @@ class TestPathNormalizationBypasses:
         with pytest.raises(ValueError):
             _validate_remote_path(path)
 
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "/etc//shadow",
-            "/etc/./shadow",
-        ],
-    )
-    def test_double_slash_bypass_blocked_local(self, path: str) -> None:
-        """Same protection for local SFTP paths."""
-        with pytest.raises(ValueError):
-            _validate_local_path(path)
+    # NOTE (B1): there used to be a `test_double_slash_bypass_blocked_local`
+    # here exercising `_validate_local_path`. That function is gone — local
+    # paths are no longer denylist-checked, they're confined beneath
+    # transfer_root by ``ssh_mcp.paths.open_beneath`` (see
+    # tests/test_sftp_confinement.py and tests/test_paths.py).
 
 
 class TestExpandedSensitiveAllowlist:
@@ -696,25 +654,27 @@ class TestExpandedSensitiveAllowlist:
     def test_ssh_config_blocked(self) -> None:
         with pytest.raises(ValueError):
             _validate_remote_path("/home/user/.ssh/config")
-        with pytest.raises(ValueError):
-            _validate_local_path("/home/user/.ssh/config")
 
     def test_ssh_known_hosts_blocked(self) -> None:
         with pytest.raises(ValueError):
             _validate_remote_path("/home/user/.ssh/known_hosts")
 
-    def test_ssh_pub_key_allowed(self) -> None:
-        """.pub keys are NOT secret — allow SFTP upload/download of public keys.
+    def test_ssh_pub_key_no_longer_exempted(self) -> None:
+        """B1: the ``.pub`` exemption is deliberately REMOVED, not kept.
 
-        Red Team R3 finding H5: the previous substring match blocked
-        ``id_ed25519.pub`` because it contains the substring ``id_ed25519``.
-        This broke legitimate public-key distribution via SFTP.
+        This inverts what was `test_ssh_pub_key_allowed` (Red Team R3
+        finding H5). The exemption was a pure string-suffix check on the
+        caller-supplied NAME — ``path.endswith(".pub")`` — unrelated to
+        what the path actually identifies; nothing stopped a caller from
+        naming a symlink or a sensitive file ``foo.pub``. Per the fix plan
+        it is dropped rather than hardened: a ``.pub``-suffixed path that
+        matches a sensitive substring is now blocked like any other, same
+        as everything else `_validate_remote_path` covers.
         """
-        _validate_remote_path("/home/user/.ssh/id_ed25519.pub")
-        _validate_remote_path("/home/user/.ssh/id_rsa.pub")
-        _validate_remote_path("/home/user/.ssh/id_ecdsa.pub")
-        _validate_remote_path("/home/user/.ssh/id_dsa.pub")
-        _validate_local_path("/tmp/deploy_key.pub")
+        with pytest.raises(ValueError):
+            _validate_remote_path("/home/user/.ssh/id_ed25519.pub")
+        with pytest.raises(ValueError):
+            _validate_remote_path("/home/user/.ssh/id_rsa.pub")
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +796,81 @@ class TestDangerousCommandR3Extensions:
         assert _is_dangerous_command(command) is False, (
             f"R3 regex over-matched: {command!r}"
         )
+
+
+class TestDangerousCommandS11Extensions:
+    """S11 (RC7): the tripwire's plain-variant blind spots.
+
+    ``execute()``'s docstring (server.py) claims ``rm -rf /``, ``chmod 777
+    /``, and ``dd`` are caught, but the pre-fix patterns only matched a
+    single combined flag token (``-rf``), the ``-R``-before-mode chmod
+    order, and ``if=`` immediately after ``dd``. Plain variants that are
+    equally destructive and equally valid shell syntax — separated flags,
+    GNU long options, flag-after-mode, or=/if= in the other order — slipped
+    through, contradicting the documented contract. This does NOT widen
+    into the *obfuscation* bypasses (base64, hex escapes, homoglyphs,
+    ``$(...)``/eval) that the README documents as deliberately out of
+    scope — those stay unmatched below.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # rm: recursive + force as SEPARATE tokens, either order
+            "rm -r -f /",
+            "rm -f -r /",
+            # rm: GNU long options
+            "rm --recursive --force /",
+            "rm --force --recursive /",
+            # rm: mixed short/long
+            "rm -r --force /",
+            "rm --recursive -f /",
+            # chmod: mode BEFORE the recursive flag (previously only
+            # -R-before-777 was matched)
+            "chmod 777 -R /",
+            "chmod 777 --recursive /",
+            # dd: of= before if= (previously only `dd if=...` first matched)
+            "dd of=/dev/sda if=/dev/zero",
+            "dd bs=1M of=/dev/sda if=/dev/urandom",
+        ],
+        ids=lambda c: c[:40].replace(" ", "_"),
+    )
+    def test_s11_plain_variants_blocked(self, command: str) -> None:
+        assert _is_dangerous_command(command) is True, (
+            f"S11: plain variant must be blocked (execute() docstring "
+            f"claims coverage): {command!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Must NOT over-match: relative/benign targets and unrelated
+            # flag combinations that merely resemble the dangerous shape.
+            "rm -r -f mydir",
+            "rm --recursive --force ./build",
+            "chmod 777 -R mydir",
+            "rm -r /var/log/myapp",  # recursive only, no force
+            "rm -f /var/log/myapp.log",  # force only, no recursive
+        ],
+        ids=lambda c: c[:40].replace(" ", "_"),
+    )
+    def test_s11_plain_variants_do_not_over_match(self, command: str) -> None:
+        assert _is_dangerous_command(command) is False, (
+            f"S11 extension over-matched a safe command: {command!r}"
+        )
+
+    def test_s11_does_not_widen_into_obfuscation_bypasses(self) -> None:
+        """The tripwire is documented as NOT catching obfuscated payloads
+        (base64, hex escapes, homoglyphs, subshell indirection) — this is a
+        deliberate scope boundary, not a gap S11 should have closed.
+
+        A base64-encoded ``rm -rf /`` (``cm0gLXJmIC8=``), NOT wrapped in a
+        decode-and-pipe form, must stay unmatched — S11 extends plain
+        rm/chmod/dd syntax, not payload decoding. (The decode-and-pipe
+        wrapper shape itself — ``base64 -d | bash`` — is a pre-existing,
+        separate rule (P10) and out of scope for this test.)
+        """
+        assert _is_dangerous_command("cm0gLXJmIC8=") is False
 
 
 class TestDangerousCommandForceBypass:
@@ -1070,8 +1105,6 @@ class TestConnectionIdGeneration:
         assert cid.startswith("web1-")
 
     def test_connection_id_contains_pid(self) -> None:
-        import os
-
         cid = _make_connection_id("web1")
         assert f"-{os.getpid()}-" in cid
 
@@ -1082,7 +1115,14 @@ class TestConnectionIdGeneration:
 
 
 class TestSFTPAuditLogging:
-    """SFTP upload/download emit start/complete/failed audit logs."""
+    """SFTP upload/download emit start/complete/failed audit logs.
+
+    B1 (RC1): these no longer mock ``sftp.put``/``sftp.get`` — that API is
+    never called any more (see ``tests/test_sftp_confinement.py`` for the
+    test that asserts exactly that). Instead they mock the public
+    ``sftp.open()`` -> ``SFTPClientFile`` surface the confined copy loop
+    drives directly, and ``local_path`` is now transfer_root-RELATIVE.
+    """
 
     def _make_registry(self) -> ServerRegistry:
         import tempfile
@@ -1104,31 +1144,52 @@ groups = ["test"]
         tmp.close()
         return ServerRegistry(tmp.name)
 
+    def _transfer_settings(self, tmp_path) -> Settings:
+        """A Settings instance whose transfer_root is an isolated tmp dir."""
+        root = tmp_path / "transfers"
+        root.mkdir(mode=0o700)
+        return Settings(transfer_root=str(root))
+
+    @staticmethod
+    def _async_cm(return_value: object):
+        """Build a MagicMock usable as ``async with x() as y``."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=return_value)
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
     async def test_upload_emits_start_and_complete_audit_logs(
         self,
         tmp_path,
         caplog: pytest.LogCaptureFixture,
-        sample_settings: Settings,
     ) -> None:
         """upload() must emit sftp.upload.start AND sftp.upload.complete."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
-        local = tmp_path / "payload.txt"
-        local.write_bytes(b"hello sftp")
+        settings = self._transfer_settings(tmp_path)
+        (tmp_path / "transfers" / "payload.txt").write_bytes(b"hello sftp")
 
-        manager = SSHManager(self._make_registry(), sample_settings)
-        # Seed the pool so _get_connection returns our mock without touching
-        # real network or asyncssh.connect().
+        manager = SSHManager(self._make_registry(), settings)
+
+        import asyncssh
+
+        mock_remote_file = MagicMock()
+        mock_remote_file.write = AsyncMock(return_value=None)
+
         mock_sftp = MagicMock()
-        mock_sftp.put = AsyncMock(return_value=None)
-
-        sftp_ctx = MagicMock()
-        sftp_ctx.__aenter__ = AsyncMock(return_value=mock_sftp)
-        sftp_ctx.__aexit__ = AsyncMock(return_value=None)
+        # Defect 3: upload now stats the remote path (follow_symlinks=False)
+        # before opening it, to refuse an existing non-regular file — a
+        # missing remote path (the common case, a fresh upload) reports
+        # "no such file", which must NOT block the upload.
+        mock_sftp.stat = AsyncMock(side_effect=asyncssh.SFTPNoSuchFile("no such file"))
+        mock_sftp.limits = MagicMock(max_write_len=16384)
+        mock_sftp.open = MagicMock(return_value=self._async_cm(mock_remote_file))
 
         mock_conn = MagicMock()
         mock_conn.is_closed = MagicMock(return_value=False)
-        mock_conn.start_sftp_client = MagicMock(return_value=sftp_ctx)
+        mock_conn.start_sftp_client = MagicMock(return_value=self._async_cm(mock_sftp))
 
         with patch.object(
             manager, "_get_connection", AsyncMock(return_value=mock_conn)
@@ -1137,7 +1198,9 @@ groups = ["test"]
             manager._connection_ids["test-host"] = "test-host-1-abcd1234"
 
             with caplog.at_level("INFO", logger="ssh_mcp.audit"):
-                await manager.upload("test-host", str(local), "/tmp/target.txt")
+                await manager.upload("test-host", "payload.txt", "/tmp/target.txt")
+
+        mock_sftp.open.assert_called_once_with("/tmp/target.txt", "wb")
 
         messages = [r.message for r in caplog.records]
         assert any("sftp.upload.start" in m for m in messages), (
@@ -1151,15 +1214,14 @@ groups = ["test"]
         self,
         tmp_path,
         caplog: pytest.LogCaptureFixture,
-        sample_settings: Settings,
     ) -> None:
         """Upload failure must emit sftp.upload.failed with error type."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
-        local = tmp_path / "payload.txt"
-        local.write_bytes(b"data")
+        settings = self._transfer_settings(tmp_path)
+        (tmp_path / "transfers" / "payload.txt").write_bytes(b"data")
 
-        manager = SSHManager(self._make_registry(), sample_settings)
+        manager = SSHManager(self._make_registry(), settings)
 
         # start_sftp_client raises to simulate failure
         mock_conn = MagicMock()
@@ -1172,7 +1234,7 @@ groups = ["test"]
             manager._connection_ids["test-host"] = "test-host-1-deadbeef"
             with caplog.at_level("WARNING", logger="ssh_mcp.audit"):
                 with pytest.raises(RuntimeError, match="Upload failed"):
-                    await manager.upload("test-host", str(local), "/tmp/target.txt")
+                    await manager.upload("test-host", "payload.txt", "/tmp/target.txt")
 
         messages = [r.message for r in caplog.records]
         assert any("sftp.upload.failed" in m for m in messages), (
@@ -1185,33 +1247,43 @@ groups = ["test"]
         self,
         tmp_path,
         caplog: pytest.LogCaptureFixture,
-        sample_settings: Settings,
     ) -> None:
         """download() must emit sftp.download.start AND sftp.download.complete."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
-        local = tmp_path / "downloaded.txt"
-        # Pre-create so Path(local_path).stat() works after mocked get()
-        local.write_bytes(b"some data")
+        from asyncssh.constants import FILEXFER_TYPE_REGULAR
 
-        manager = SSHManager(self._make_registry(), sample_settings)
+        settings = self._transfer_settings(tmp_path)
+        # NOT pre-created: B1's download is no-clobber (O_CREAT|O_EXCL), so
+        # the destination must not already exist.
+
+        manager = SSHManager(self._make_registry(), settings)
+
+        mock_attrs = MagicMock()
+        mock_attrs.type = FILEXFER_TYPE_REGULAR
+
+        mock_remote_file = MagicMock()
+        mock_remote_file.read = AsyncMock(side_effect=[b"some data", b""])
+
         mock_sftp = MagicMock()
-        mock_sftp.get = AsyncMock(return_value=None)
-
-        sftp_ctx = MagicMock()
-        sftp_ctx.__aenter__ = AsyncMock(return_value=mock_sftp)
-        sftp_ctx.__aexit__ = AsyncMock(return_value=None)
+        mock_sftp.stat = AsyncMock(return_value=mock_attrs)
+        mock_sftp.limits = MagicMock(max_read_len=16384)
+        mock_sftp.open = MagicMock(return_value=self._async_cm(mock_remote_file))
 
         mock_conn = MagicMock()
         mock_conn.is_closed = MagicMock(return_value=False)
-        mock_conn.start_sftp_client = MagicMock(return_value=sftp_ctx)
+        mock_conn.start_sftp_client = MagicMock(return_value=self._async_cm(mock_sftp))
 
         with patch.object(
             manager, "_get_connection", AsyncMock(return_value=mock_conn)
         ):
             manager._connection_ids["test-host"] = "test-host-1-cafef00d"
             with caplog.at_level("INFO", logger="ssh_mcp.audit"):
-                await manager.download("test-host", "/tmp/source.txt", str(local))
+                await manager.download("test-host", "/tmp/source.txt", "downloaded.txt")
+
+        mock_sftp.stat.assert_called_once_with("/tmp/source.txt", follow_symlinks=False)
+        downloaded = tmp_path / "transfers" / "downloaded.txt"
+        assert downloaded.read_bytes() == b"some data"
 
         messages = [r.message for r in caplog.records]
         assert any("sftp.download.start" in m for m in messages)
@@ -1575,6 +1647,480 @@ class TestRedactSecrets:
             f"Leaked: prefix={prefix!r} secret={secret!r} → {redacted!r}"
         )
 
+    # --- Defect 1 (panel iteration 2): the bounded-length leak ---
+    #
+    # All three reviewers verified that bounding the ambiguous quantifiers
+    # (B2-regex) to stay linear made the patterns STOP MATCHING past the
+    # bound — a redactor that silently stops redacting is worse than the
+    # ReDoS it replaced. These properties generate prefixes/userinfo/
+    # password WELL PAST the old bounds (40 / 255 / 512 chars) to prove
+    # the hand-written scanners (_redact_url_basic_auth,
+    # _redact_long_flags) have no such ceiling.
+
+    @given(
+        junk=st.text(
+            alphabet=st.characters(
+                whitelist_categories=("Lu", "Ll", "Nd"), whitelist_characters="_-"
+            ),
+            min_size=41,  # strictly past the old {0,40} bound
+            max_size=300,
+        ),
+        keyword=st.sampled_from(
+            ["password", "pass", "token", "secret", "key", "credential"]
+        ),
+        secret=st.text(
+            alphabet=st.characters(
+                whitelist_categories=("Lu", "Ll", "Nd"),
+                whitelist_characters="!@#$%^&*_-+",
+            ),
+            min_size=8,
+            max_size=40,
+        ),
+    )
+    def test_fuzzed_long_flag_junk_prefix_is_unbounded(
+        self, junk: str, keyword: str, secret: str
+    ) -> None:
+        """Property: a ``--<junk>-<keyword>=<secret>`` flag redacts the
+        secret NO MATTER HOW LONG ``junk`` is. This is the exact shape of
+        the reported leak: ``--aaa...(41 a's)...-password=Secret123``
+        sailed through unredacted because the old regex bounded the junk
+        prefix to 40 chars — this generates junk from 41 to 300 chars to
+        prove the replacement scanner has no such ceiling.
+        """
+        assume(secret not in junk)
+        assume(secret not in "{REDACTED}")
+        cmd = f"myapp --{junk}-{keyword}={secret} run"
+        redacted = _redact_secrets(cmd)
+        assert secret not in redacted, (
+            f"Leaked: junk_len={len(junk)} keyword={keyword!r} secret={secret!r} "
+            f"→ {redacted!r}"
+        )
+        assert _REDACTION_PLACEHOLDER in redacted
+
+    @given(
+        userinfo=st.text(
+            alphabet=st.characters(
+                whitelist_categories=("Lu", "Ll", "Nd"), whitelist_characters="_-."
+            ),
+            min_size=1,
+            max_size=400,  # strictly past the old {1,255} bound
+        ),
+        password=st.text(
+            alphabet=st.characters(
+                whitelist_categories=("Lu", "Ll", "Nd"),
+                whitelist_characters="!$%^&*_-+.",
+            ),
+            min_size=8,
+            max_size=700,  # strictly past the old {1,512} bound
+        ),
+    )
+    def test_fuzzed_url_credentials_are_unbounded(
+        self, userinfo: str, password: str
+    ) -> None:
+        """Property: ``scheme://user:password@host`` redacts the password
+        regardless of userinfo/password length. Reported leaks:
+        ~300-char userinfo and ~600-char password both sailed through
+        unredacted against the old {1,255}/{1,512}-bounded regex — this
+        generates userinfo up to 400 chars and password up to 700 chars
+        to prove the replacement scanner has no such ceiling.
+        """
+        assume(password not in userinfo)
+        assume(password not in "{REDACTED}")
+        cmd = f"curl https://{userinfo}:{password}@internal.example.com/path"
+        redacted = _redact_secrets(cmd)
+        assert password not in redacted, (
+            f"Leaked: userinfo_len={len(userinfo)} password_len={len(password)} "
+            f"→ {redacted!r}"
+        )
+        assert _REDACTION_PLACEHOLDER in redacted
+
+    # --- Defect 1: explicit regressions for the four reported leaks ---
+
+    def test_leak_regression_long_flag_junk_prefix(self) -> None:
+        """Exact repro from the defect report: 41 'a' characters before
+        ``-password=`` — one character past the old {0,40} bound."""
+        cmd = "app --" + "a" * 41 + "-password=Secret123 run"
+        redacted = _redact_secrets(cmd)
+        assert "Secret123" not in redacted, f"Leaked: {redacted!r}"
+        assert _REDACTION_PLACEHOLDER in redacted
+
+    def test_leak_regression_url_long_userinfo(self) -> None:
+        """Exact repro from the defect report: 300-char userinfo — past
+        the old {1,255} bound on rule 0's userinfo group."""
+        cmd = "curl https://" + "u" * 300 + ":Secret123@host"
+        redacted = _redact_secrets(cmd)
+        assert "Secret123" not in redacted, f"Leaked: {redacted!r}"
+        assert _REDACTION_PLACEHOLDER in redacted
+
+    def test_leak_regression_url_long_password(self) -> None:
+        """Exact repro from the defect report: 600-char password — past
+        the old {1,512} bound on rule 0's password group."""
+        secret = "p" * 600
+        cmd = f"curl https://user:{secret}@host"
+        redacted = _redact_secrets(cmd)
+        assert secret not in redacted, f"Leaked: password of length {len(secret)}"
+        assert _REDACTION_PLACEHOLDER in redacted
+
+    def test_no_leak_short_flag_within_old_bound(self) -> None:
+        """Control case: the shape that was already correctly redacted
+        pre-fix (well within the old 40-char bound) must stay redacted."""
+        cmd = "app --db-password=Secret123 run"
+        redacted = _redact_secrets(cmd)
+        assert "Secret123" not in redacted
+        assert _REDACTION_PLACEHOLDER in redacted
+
+
+class TestRedactSecretsPerformance:
+    """B2-regex: quadratic backtracking in rules 0, 8, 9 fixed via bounded
+    (and, for rule 0, possessive) quantifiers.
+
+    Measured against the ORIGINAL unbounded patterns, before this fix:
+    ``_redact_secrets("-" * 10_000)`` took 6.12s; a 32 KiB input took
+    ~25s. Growth was quadratic (CPython retries the whole pattern at every
+    start offset), not exponential — no pattern has a nested quantified
+    group. These are regression tests that FAIL against the old patterns
+    and pass against the bounded ones — a tight bound would be flaky on
+    slow CI runners, so every assertion below is deliberately generous
+    (2s for adversarial inputs up to 48 KiB); the fixed patterns clear
+    this by roughly two orders of magnitude in local testing (~0.03s).
+    """
+
+    _BOUND_S = 2.0
+
+    def test_dash_run_10k_is_fast(self) -> None:
+        """The exact reproduction from the finding: 10_000 '-' characters."""
+        start = time.monotonic()
+        _redact_secrets("-" * 10_000)
+        elapsed = time.monotonic() - start
+        assert elapsed < self._BOUND_S, (
+            f"Took {elapsed:.3f}s on 10k dashes — quadratic regex regression?"
+        )
+
+    def test_dash_run_32k_is_fast(self) -> None:
+        """Larger adversarial input, still well inside the generous bound."""
+        start = time.monotonic()
+        _redact_secrets("-" * 32_000)
+        elapsed = time.monotonic() - start
+        assert elapsed < self._BOUND_S, (
+            f"Took {elapsed:.3f}s on 32k dashes — quadratic regex regression?"
+        )
+
+    def test_rule0_adversarial_input_without_url_syntax_is_fast(self) -> None:
+        """Rule 0 (URL basic-auth) is the WORSE pathological case, not the
+        milder one it looks like: it needs no ``://`` or ``@`` at all — a
+        bare run of scheme-alphabet characters is enough to trigger its
+        backtracking. Measured at 5.84s for 48_000 'a' characters pre-fix,
+        with NO URL syntax present anywhere in the input.
+        """
+        start = time.monotonic()
+        _redact_secrets("a" * 48_000)
+        elapsed = time.monotonic() - start
+        assert elapsed < self._BOUND_S, (
+            f"Took {elapsed:.3f}s on 48k 'a's — quadratic regex regression?"
+        )
+
+    def test_long_flag_adversarial_input_is_fast(self) -> None:
+        """Rules 8/9 are the CHEAPER attack: ~13k chars was enough pre-fix
+        to reach ~5s. ``--`` followed by a long run of word/hyphen
+        characters with no ``=`` terminator, so the ambiguous prefix never
+        resolves and the engine backtracks across the whole run.
+        """
+        start = time.monotonic()
+        _redact_secrets("--" + "a" * 16_000)
+        elapsed = time.monotonic() - start
+        assert elapsed < self._BOUND_S, (
+            f"Took {elapsed:.3f}s on a long flag run — quadratic regex regression?"
+        )
+
+    def test_bounded_prefix_is_not_possessive(self) -> None:
+        """Correctness guard named explicitly in the fix plan: a possessive
+        ``[\\w-]{0,40}+`` prefix on rules 8/9 would share its character
+        class with the keyword alternation that follows it, greedily
+        swallowing ``db-password`` whole before the alternation ever gets a
+        chance to match — leaking the secret unredacted. The fix bounds
+        the prefix's LENGTH (which removes the quadratic behaviour)
+        WITHOUT making it possessive (which would silently break this
+        exact case). This must keep passing alongside the timing tests
+        above — a fix that only fixed performance would fail here.
+        """
+        redacted = _redact_secrets("myapp --db-password=Sup3rSecret start")
+        assert "Sup3rSecret" not in redacted
+        assert _REDACTION_PLACEHOLDER in redacted
+
+
+# ---------------------------------------------------------------------------
+# Defect A (panel iteration 3): token-wise redaction — "skip a candidate"
+# made structurally impossible, not just absent for the observed cases.
+# ---------------------------------------------------------------------------
+
+# Whitespace characters used by the property below — deliberately mixes
+# plain space/tab with characters that are ``str.isspace() == True`` but
+# NOT in a hardcoded ``" \t\r\n"`` set (NBSP, em space, vertical tab), to
+# exercise the Unicode-aware separator requirement directly.
+_TOKENWISE_WS_CHARS = " \t\v  "
+
+_BOOLEAN_FLAG_NAMES = (
+    "--rm",
+    "--verbose",
+    "--detach",
+    "--help",
+    "--dry-run",
+    "--no-pager",
+    "--force",
+    "--quiet",
+)
+_NONCRED_VALUED_FLAG_NAMES = ("--host", "--port", "--user", "--tag", "--path")
+
+
+@st.composite
+def _tokenwise_command(draw: st.DrawFn) -> tuple[str, str]:
+    """Build a command from a SHUFFLED list of tokens — some boolean
+    flags, some non-credential valued flags, and exactly one credential
+    flag with an arbitrary-length name and an arbitrary secret — joined
+    by arbitrary-length runs of arbitrary whitespace. Returns
+    ``(command, secret)``.
+
+    This is the property that would have caught all three historical
+    ``_redact_secrets`` leaks in one generator: iteration 1 (quadratic
+    regex) is defeated by a long run of a single trigger character —
+    subsumed here by an unbounded junk prefix; iteration 2 (bounded
+    quantifier) needed a long credential-flag NAME — the junk prefix is
+    unbounded; iteration 3 (positional scanner that skipped the token
+    immediately after a boolean flag) needed a boolean flag positioned
+    directly before the credential flag — shuffling the token order
+    guarantees that shape appears across the example space, including
+    the exact reported cases (``--rm``/``--verbose``/``--detach``
+    immediately before ``--password=...``).
+    """
+    boolean_flags = draw(st.lists(st.sampled_from(_BOOLEAN_FLAG_NAMES), max_size=4))
+    noncred_flags = draw(
+        st.lists(
+            st.sampled_from(_NONCRED_VALUED_FLAG_NAMES).map(lambda n: f"{n}=x"),
+            max_size=4,
+        )
+    )
+    cred_junk = draw(
+        st.text(
+            alphabet=st.characters(
+                whitelist_categories=("Lu", "Ll", "Nd"), whitelist_characters="_-"
+            ),
+            min_size=0,
+            max_size=80,  # unbounded in production; 80 comfortably exceeds
+            # the historical 40-char bound without slowing the property down.
+        )
+    )
+    cred_keyword = draw(st.sampled_from(_LONG_FLAG_KEYWORDS))
+    secret = draw(
+        st.text(
+            alphabet=st.characters(
+                whitelist_categories=("Lu", "Ll", "Nd"),
+                whitelist_characters="!@#$%^&*_+",
+            ),
+            min_size=4,
+            max_size=40,
+        )
+    )
+    assume(secret not in cred_junk)
+    assume(secret not in "{REDACTED}")
+
+    use_eq_form = draw(st.booleans())
+    cred_name = f"--{cred_junk}-{cred_keyword}" if cred_junk else f"--{cred_keyword}"
+    if use_eq_form:
+        cred_tokens = [f"{cred_name}={secret}"]
+    else:
+        # Space-separated form: a value token starting with '-' is
+        # genuinely ambiguous with another flag (this is documented,
+        # intentional behaviour — see _redact_long_flags), so exclude it
+        # here rather than assert on undefined CLI-parsing behaviour.
+        assume(not secret.startswith("-"))
+        cred_tokens = [cred_name, secret]
+
+    token_groups = [[t] for t in boolean_flags] + [[t] for t in noncred_flags]
+    token_groups.append(cred_tokens)
+    order = draw(st.permutations(range(len(token_groups))))
+
+    flat_tokens: list[str] = []
+    for idx in order:
+        flat_tokens.extend(token_groups[idx])
+
+    parts: list[str] = []
+    for i, tok in enumerate(flat_tokens):
+        parts.append(tok)
+        if i != len(flat_tokens) - 1:
+            ws_len = draw(st.integers(min_value=1, max_value=3))
+            parts.append(
+                "".join(
+                    draw(st.sampled_from(_TOKENWISE_WS_CHARS)) for _ in range(ws_len)
+                )
+            )
+    return "".join(parts), secret
+
+
+class TestRedactSecretsTokenwise:
+    """Defect A (panel iteration 3, verified by executing code): the
+    positional scanner assumed a space-separated flag's value was
+    always the NEXT token and jumped its scan position past it,
+    silently skipping classification of a credential flag that
+    immediately followed a boolean flag. Fixed by classifying every
+    whitespace-delimited token on its own turn — see the module comment
+    above ``_URL_TERMINATORS`` in ssh.py.
+    """
+
+    @given(_tokenwise_command())
+    def test_credential_never_skipped_regardless_of_token_order(
+        self, command_and_secret: tuple[str, str]
+    ) -> None:
+        """Property: shuffling boolean flags, non-credential flags, and a
+        credential flag (arbitrary name length, arbitrary secret) with
+        arbitrary whitespace between them must never leak the secret,
+        no matter what token precedes the credential flag."""
+        command, secret = command_and_secret
+        redacted = _redact_secrets(command)
+        assert secret not in redacted, (
+            f"Leaked: command={command!r} secret={secret!r} -> {redacted!r}"
+        )
+
+    # --- Explicit regressions: the five cases verified in the defect report ---
+
+    @pytest.mark.parametrize(
+        "command,secret",
+        [
+            ("docker run --rm --password=Secret99 image", "Secret99"),
+            ("cmd --verbose --password=Secret123", "Secret123"),
+            ("myapp --detach --db-password=Secret99", "Secret99"),
+            ("a" + "1" * 40 + "://user:Secret123@host", "Secret123"),
+            ("app --host db --password=Secret77", "Secret77"),
+        ],
+        ids=[
+            "boolean-rm-then-eq-password",
+            "boolean-verbose-then-eq-password",
+            "boolean-detach-then-eq-db-password",
+            "url-scheme-alpha-then-40-digits",
+            "valued-flag-then-eq-password-control",
+        ],
+    )
+    def test_verified_leak_cases_from_defect_report(
+        self, command: str, secret: str
+    ) -> None:
+        redacted = _redact_secrets(command)
+        assert secret not in redacted, f"Leaked: {command!r} -> {redacted!r}"
+        assert _REDACTION_PLACEHOLDER in redacted
+
+    def test_boolean_flag_then_space_separated_credential_flag(self) -> None:
+        """Same class of bug as the '=' cases above, but for the
+        space-separated flag form (``--password VALUE``) — the scanner's
+        positional jump was in the value-consumption path, so this form
+        is exactly as exposed as the '=' form."""
+        redacted = _redact_secrets("cmd --verbose --password SpaceSecret123")
+        assert "SpaceSecret123" not in redacted
+        assert _REDACTION_PLACEHOLDER in redacted
+
+    def test_multiple_boolean_flags_before_credential_flag(self) -> None:
+        """Not just one boolean flag — a RUN of them, none of which may
+        consume the credential flag's token as their own 'value'."""
+        redacted = _redact_secrets(
+            "docker run --rm --detach --quiet --password=Chained99 image"
+        )
+        assert "Chained99" not in redacted
+        assert _REDACTION_PLACEHOLDER in redacted
+
+    def test_credential_flag_then_boolean_flag_still_boolean(self) -> None:
+        """The inverse shape: a space-separated credential flag directly
+        followed by a token that starts with '-' must be treated as
+        boolean (no value to redact) rather than swallowing the next
+        flag's name as its 'secret'."""
+        redacted = _redact_secrets("cmd --password --rm image")
+        assert redacted == "cmd --password --rm image"
+
+    def test_url_digit_heavy_scheme_prefix_unbounded(self) -> None:
+        """Iteration 3's URL leak: a scheme shape longer than the old
+        32-char backward-walk cap (here: 'a' followed by 60 digits)
+        must still be recognised as a scheme and its password redacted."""
+        cmd = "curl " + "a" + "9" * 60 + "://user:LongSchemeSecret@host"
+        redacted = _redact_secrets(cmd)
+        assert "LongSchemeSecret" not in redacted
+        assert _REDACTION_PLACEHOLDER in redacted
+
+    def test_nbsp_separated_credential_flag_still_classified(self) -> None:
+        """Defect A requirement: separators must be recognised via
+        ``str.isspace()``, not a hardcoded ``" \\t\\r\\n"`` set — a
+        hardcoded set would silently treat NBSP as part of the
+        surrounding token, gluing the credential flag to its neighbour
+        and preventing it from ever being classified as a lone token."""
+        redacted = _redact_secrets("cmd --password=NbspSecret99 run")
+        assert "NbspSecret99" not in redacted
+        assert _REDACTION_PLACEHOLDER in redacted
+
+    def test_whitespace_separators_preserved_exactly(self) -> None:
+        """Tokenising must not mangle the command for the audit log: the
+        original separators (including a mixed run of space+tab) must
+        reassemble byte-identical apart from the redacted value."""
+        cmd = "cmd \t --password=Sep4rat0rs123  run"
+        redacted = _redact_secrets(cmd)
+        assert redacted == "cmd \t --password={REDACTED}  run"
+
+
+# ---------------------------------------------------------------------------
+# Defect 1 (panel iteration 4, cursor): a credential flag NESTED inside
+# another token's value regressed — see _redact_credential_in_token.
+# ---------------------------------------------------------------------------
+
+
+class TestRedactSecretsNestedCredentialFlag:
+    """The original whole-text ``re.sub`` scanned every position in the
+    command string, so ``--flag=--password=secret`` was redacted: the
+    match simply started wherever ``--password=`` began, regardless of
+    what preceded it. The token-wise rewrite (Defect A) classified only
+    the flag NAME at a token's START (before the first ``=``), so
+    ``--flag`` (not credential-shaped) short-circuited the whole token
+    and the nested ``--password=secret`` was never even looked at —
+    silently leaking it. ``_redact_credential_in_token`` restores the
+    "scan every position within the token" behaviour.
+    """
+
+    @pytest.mark.parametrize(
+        "command,secret,expected",
+        [
+            (
+                "--flag=--password=secret",
+                "secret",
+                "--flag=--password={REDACTED}",
+            ),
+            (
+                "--config=--password=secret",
+                "secret",
+                "--config=--password={REDACTED}",
+            ),
+            (
+                "--flag=--api-key=x",
+                "x",
+                "--flag=--api-key={REDACTED}",
+            ),
+        ],
+        ids=["nested-password", "nested-password-config-prefix", "nested-api-key"],
+    )
+    def test_nested_credential_flag_redacted(
+        self, command: str, secret: str, expected: str
+    ) -> None:
+        redacted = _redact_secrets(command)
+        assert redacted == expected
+        assert secret not in redacted, f"Leaked: {command!r} -> {redacted!r}"
+
+    def test_non_credential_prefix_alone_still_passed_through(self) -> None:
+        """Control case: a non-credential flag with a non-credential
+        nested value must be left completely untouched (no
+        over-redaction introduced by scanning past offset 0)."""
+        assert _redact_secrets("--other=value") == "--other=value"
+
+    def test_credential_flag_at_token_start_still_works(self) -> None:
+        """Regression guard: the ordinary case (credential flag AT the
+        token start, e.g. ``--password=--flag=x``) must still redact
+        everything after the credential flag's '=' exactly as before —
+        _redact_credential_in_token's finditer finds this as the first
+        candidate."""
+        redacted = _redact_secrets("--password=--flag=x")
+        assert redacted == "--password={REDACTED}"
+
 
 # ---------------------------------------------------------------------------
 # fail_fast cancelled-result visibility (R5 finding #9)
@@ -1719,7 +2265,19 @@ mygroup = {{ description = "Test group" }}
         assert c.stdout == ""
         assert c.stderr == ""
         assert c.exit_code is None
-        assert c.error == "Cancelled: fail_fast triggered by an earlier failure"
+        # B3: the exact wording changed (was the bare string
+        # "Cancelled: fail_fast triggered by an earlier failure") to admit
+        # that _execute_impl awaits conn.create_process() before a task
+        # becomes locally cancellable, so a task caught mid-flight may
+        # already have dispatched the command to the remote host —
+        # cancelling the LOCAL asyncio task does not stop that. Assert the
+        # stable prefix plus the new disclosure rather than the old exact
+        # string.
+        assert c.error is not None
+        assert c.error.startswith(
+            "Cancelled: fail_fast triggered by an earlier failure"
+        )
+        assert "already have been" in c.error
 
     async def test_no_cancelled_results_when_all_succeed(self) -> None:
         """When no failure occurs, no cancelled entries should be appended."""
@@ -1765,6 +2323,11 @@ class TestAuditLogRedaction:
     Covers:
     - TEST #8: successful execution path
     - TEST #9: timeout execution path
+
+    S10 note: ``execute()`` no longer calls ``conn.run()`` — it drains
+    ``conn.create_process()``'s stdout/stderr itself, in bytes, under a
+    byte budget (see ``_drain_stream_bounded``). These tests mock
+    ``create_process`` accordingly rather than ``run``.
     """
 
     def _make_registry(self) -> ServerRegistry:
@@ -1782,6 +2345,46 @@ groups = ["t"]
         f.close()
         return ServerRegistry(f.name)
 
+    @staticmethod
+    def _make_mock_process(
+        stdout_chunks: tuple[bytes, ...] = (),
+        stderr_chunks: tuple[bytes, ...] = (),
+        exit_status: int | None = 0,
+        hang: bool = False,
+    ):
+        """Build a mock ``SSHClientProcess`` for the S10 bounded-drain loop.
+
+        ``hang=True`` makes both streams block forever on read(), so a
+        short ``timeout=`` passed to ``execute()`` reliably exercises the
+        real ``asyncio.timeout()`` path rather than racing a fixed sleep.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        process = MagicMock()
+
+        if hang:
+
+            async def _hang(_n: int) -> bytes:
+                await asyncio.sleep(3600)
+                return b""  # pragma: no cover - never reached
+
+            process.stdout = MagicMock()
+            process.stdout.read = AsyncMock(side_effect=_hang)
+            process.stderr = MagicMock()
+            process.stderr.read = AsyncMock(side_effect=_hang)
+        else:
+            stdout_iter = itertools.chain(stdout_chunks, itertools.repeat(b""))
+            stderr_iter = itertools.chain(stderr_chunks, itertools.repeat(b""))
+            process.stdout = MagicMock()
+            process.stdout.read = AsyncMock(side_effect=lambda n: next(stdout_iter))
+            process.stderr = MagicMock()
+            process.stderr.read = AsyncMock(side_effect=lambda n: next(stderr_iter))
+
+        process.wait_closed = AsyncMock(return_value=None)
+        process.terminate = MagicMock()
+        process.exit_status = exit_status
+        return process
+
     async def test_audit_log_redacts_credentials_on_success(
         self,
         caplog: pytest.LogCaptureFixture,
@@ -1792,13 +2395,10 @@ groups = ["t"]
 
         manager = SSHManager(self._make_registry(), sample_settings)
 
-        mock_result = MagicMock()
-        mock_result.stdout = "ok"
-        mock_result.stderr = ""
-        mock_result.exit_status = 0
+        mock_process = self._make_mock_process(stdout_chunks=(b"ok",))
 
         mock_conn = MagicMock()
-        mock_conn.run = AsyncMock(return_value=mock_result)
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
         mock_conn.is_closed = MagicMock(return_value=False)
 
         with patch.object(
@@ -1823,8 +2423,10 @@ groups = ["t"]
 
         manager = SSHManager(self._make_registry(), sample_settings)
 
+        mock_process = self._make_mock_process(hang=True)
+
         mock_conn = MagicMock()
-        mock_conn.run = AsyncMock(side_effect=asyncio.TimeoutError())
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
         mock_conn.is_closed = MagicMock(return_value=False)
 
         with patch.object(
@@ -1832,12 +2434,15 @@ groups = ["t"]
         ):
             with caplog.at_level("INFO", logger="ssh_mcp.audit"):
                 result = await manager.execute(
-                    "test-host", "mysql -u root -pSuperSecret mydb"
+                    "test-host", "mysql -u root -pSuperSecret mydb", timeout=0.05
                 )
 
         # The result must indicate a timeout occurred
         assert result.error is not None
         assert "timeout" in result.error.lower()
+        # S10 contract point 5: timeout must terminate + await cleanup.
+        mock_process.terminate.assert_called()
+        mock_process.wait_closed.assert_awaited()
 
         audit_msgs = [
             r.getMessage() for r in caplog.records if r.name == "ssh_mcp.audit"
@@ -1845,6 +2450,480 @@ groups = ["t"]
         assert any("command=" in m for m in audit_msgs), "No audit log found on timeout"
         assert not any("SuperSecret" in m for m in audit_msgs), (
             "Credential leaked on timeout"
+        )
+
+
+# ---------------------------------------------------------------------------
+# S10: max_output_bytes bounds ALLOCATION, not just the response
+# ---------------------------------------------------------------------------
+
+
+class TestBoundedOutputDraining:
+    """S10: ``conn.run()`` used to buffer the ENTIRE remote output before
+    ``max_output_bytes`` truncated it, so the setting bounded the
+    *response* handed back to the caller, never what was actually read off
+    the wire — a mistyped ``cat`` of a huge file could OOM the host
+    regardless of the configured limit. ``execute()`` now drains
+    ``conn.create_process()`` itself in bounded chunks via
+    ``_drain_stream_bounded`` and stops (terminating the process) the
+    instant the budget is exceeded.
+
+    Also covers the MEASURED half of the finding: the previous check was
+    ``len(str)`` — characters, not bytes — which overran the stated byte
+    limit by ~4x on multibyte/emoji output. Truncation must be byte-exact.
+    """
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[groups]
+test = { description = "Test group" }
+[servers.test-host]
+description = "Test server"
+groups = ["test"]
+"""
+        f = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        f.write(config_content)
+        f.close()
+        return ServerRegistry(f.name)
+
+    @staticmethod
+    def _make_bounded_reader(total_available_bytes: int, fill: bytes = b"x"):
+        """A reader whose read(n) honours n and never over-serves.
+
+        Simulates a real SSH stream: it will happily hand back up to
+        ``total_available_bytes`` in total, but never more than requested
+        per call. This lets a test assert on how much was ACTUALLY
+        consumed, not just on what the function returned.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        served = {"n": 0}
+
+        async def _read(n: int) -> bytes:
+            remaining = total_available_bytes - served["n"]
+            if remaining <= 0:
+                return b""
+            chunk_len = min(n, remaining)
+            served["n"] += chunk_len
+            return fill * chunk_len
+
+        reader = MagicMock()
+        reader.read = AsyncMock(side_effect=_read)
+        return reader, served
+
+    def _make_process(self, stdout_reader, stderr_reader):
+        from unittest.mock import AsyncMock, MagicMock
+
+        process = MagicMock()
+        process.stdout = stdout_reader
+        process.stderr = stderr_reader
+        process.wait_closed = AsyncMock(return_value=None)
+        process.terminate = MagicMock()
+        process.exit_status = 0
+        return process
+
+    async def test_multi_megabyte_output_never_allocates_beyond_budget(self) -> None:
+        """A 10 MiB "remote" stream against a 1 KiB budget must drain only
+        ~budget bytes off the wire, not anywhere close to the full 10 MiB
+        — this is the allocation bound, not merely the response bound."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        settings = Settings(max_output_bytes=1024)
+        manager = SSHManager(self._make_registry(), settings)
+
+        stdout_reader, stdout_served = self._make_bounded_reader(10 * 1024 * 1024)
+        stderr_reader, _ = self._make_bounded_reader(0)
+        mock_process = self._make_process(stdout_reader, stderr_reader)
+
+        mock_conn = MagicMock()
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
+        mock_conn.is_closed = MagicMock(return_value=False)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            result = await manager.execute("test-host", "cat hugefile")
+
+        assert result.exit_code == 0
+        assert "[... output truncated at 1024 bytes]" in result.stdout
+        # The RESPONSE is bounded...
+        content_only = result.stdout.split("\n[... output truncated")[0]
+        assert len(content_only) <= 1024
+        # ...and so is what was actually READ off the wire. A generous
+        # bound (2 KiB, vs. the 10 MiB available) proves this is an
+        # allocation bound, not a post-hoc slice of a fully-buffered read.
+        assert stdout_served["n"] <= 2048, (
+            f"drained {stdout_served['n']} bytes for a 1024-byte budget "
+            "against a 10 MiB stream — allocation is not bounded"
+        )
+        mock_process.terminate.assert_called_once()
+
+    async def test_output_under_budget_is_not_truncated(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        settings = Settings(max_output_bytes=1024)
+        manager = SSHManager(self._make_registry(), settings)
+
+        stdout_reader, _ = self._make_bounded_reader(10)
+        stderr_reader, _ = self._make_bounded_reader(0)
+        mock_process = self._make_process(stdout_reader, stderr_reader)
+
+        mock_conn = MagicMock()
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
+        mock_conn.is_closed = MagicMock(return_value=False)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            result = await manager.execute("test-host", "echo hi")
+
+        assert result.stdout == "x" * 10
+        assert "truncated" not in result.stdout
+        mock_process.terminate.assert_not_called()
+
+    async def test_multibyte_output_respects_byte_limit_not_character_limit(
+        self,
+    ) -> None:
+        """The measured half of S10: the previous character-based check
+        (``len(str)``) overran the stated byte limit by ~4x on emoji
+        output, since each emoji is 4 UTF-8 bytes. 512 emoji (2048 bytes)
+        against a 1024-byte budget must yield well under 256 emoji in the
+        result — 256+ would mean characters, not bytes, were counted.
+        Also proves truncation mid-codepoint does not crash (errors=
+        "replace" on decode).
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        emoji = "\U0001f600"
+        payload = (emoji * 512).encode("utf-8")  # 2048 bytes total
+        assert len(payload) == 2048
+
+        settings = Settings(max_output_bytes=1024)
+        manager = SSHManager(self._make_registry(), settings)
+
+        served = {"n": 0}
+
+        async def _read(n: int) -> bytes:
+            start = served["n"]
+            if start >= len(payload):
+                return b""
+            chunk = payload[start : start + n]
+            served["n"] += len(chunk)
+            return chunk
+
+        stdout_reader = MagicMock()
+        stdout_reader.read = AsyncMock(side_effect=_read)
+        stderr_reader, _ = self._make_bounded_reader(0)
+        mock_process = self._make_process(stdout_reader, stderr_reader)
+
+        mock_conn = MagicMock()
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
+        mock_conn.is_closed = MagicMock(return_value=False)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            result = await manager.execute("test-host", "print_emoji")
+
+        assert "[... output truncated at 1024 bytes]" in result.stdout
+        emoji_count = result.stdout.count(emoji)
+        assert emoji_count <= 256, (
+            f"{emoji_count} emoji present in a 1024-byte-budget result — "
+            "looks like character counting, not byte counting (the "
+            "measured 4x overrun this fix closes)"
+        )
+
+    async def test_stderr_over_budget_also_terminates(self) -> None:
+        """The terminate-on-exceed contract must apply to EITHER stream,
+        not only stdout — a chatty stderr can OOM the host just as
+        easily."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        settings = Settings(max_output_bytes=1024)
+        manager = SSHManager(self._make_registry(), settings)
+
+        stdout_reader, _ = self._make_bounded_reader(0)
+        stderr_reader, stderr_served = self._make_bounded_reader(5 * 1024 * 1024)
+        mock_process = self._make_process(stdout_reader, stderr_reader)
+
+        mock_conn = MagicMock()
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
+        mock_conn.is_closed = MagicMock(return_value=False)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            result = await manager.execute("test-host", "noisy-stderr-cmd")
+
+        assert "[... output truncated at 1024 bytes]" in result.stderr
+        assert stderr_served["n"] <= 2048
+        mock_process.terminate.assert_called_once()
+
+    async def test_terminate_called_promptly_when_peer_stream_stays_open(
+        self,
+    ) -> None:
+        """Defect 4(b) (panel iteration 2, codex): termination must not
+        wait for BOTH drains to finish. stdout exceeds its budget almost
+        immediately; stderr's reader blocks until ``terminate()`` is
+        ACTUALLY called (as a real SSH channel's stderr would once the
+        process is killed) — under the pre-fix TaskGroup shape,
+        termination was deferred until BOTH tasks completed, so stderr
+        would never unblock and the call would run out the full command
+        timeout instead of returning the in-band truncated result the
+        contract promises. The outer ``asyncio.wait_for`` is a pytest-level
+        safety net so a regression hangs this test for at most 5s instead
+        of the 30s command timeout below.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        settings = Settings(max_output_bytes=1024)
+        manager = SSHManager(self._make_registry(), settings)
+
+        stdout_reader, _ = self._make_bounded_reader(10_000)
+
+        terminated = asyncio.Event()
+
+        async def _stderr_read(n: int) -> bytes:
+            await terminated.wait()
+            return b""
+
+        stderr_reader = MagicMock()
+        stderr_reader.read = AsyncMock(side_effect=_stderr_read)
+
+        mock_process = self._make_process(stdout_reader, stderr_reader)
+        mock_process.terminate = MagicMock(side_effect=terminated.set)
+
+        mock_conn = MagicMock()
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
+        mock_conn.is_closed = MagicMock(return_value=False)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            result = await asyncio.wait_for(
+                manager.execute("test-host", "cmd", timeout=30), timeout=5
+            )
+
+        assert result.error is None, (
+            f"got a timeout/error result instead of the in-band truncated one: {result}"
+        )
+        assert "[... output truncated at 1024 bytes]" in result.stdout
+        mock_process.terminate.assert_called_once()
+
+    async def test_drain_exception_still_terminates_and_closes(self) -> None:
+        """Defect 4(a) (panel iteration 2, cursor): a raised read() must
+        not skip cleanup. The pre-fix TaskGroup shape let such an
+        exception surface as an ExceptionGroup straight past the
+        terminate()/wait_closed() calls below it, orphaning the remote
+        channel. terminate() and wait_closed() must still run, and the
+        exception must come back as an ExecResult (execute() never
+        raises), not propagate to the caller.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        settings = Settings(max_output_bytes=1024)
+        manager = SSHManager(self._make_registry(), settings)
+
+        async def _boom(n: int) -> bytes:
+            raise OSError("stream reset by peer")
+
+        stdout_reader = MagicMock()
+        stdout_reader.read = AsyncMock(side_effect=_boom)
+        stderr_reader, _ = self._make_bounded_reader(0)
+        mock_process = self._make_process(stdout_reader, stderr_reader)
+
+        mock_conn = MagicMock()
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
+        mock_conn.is_closed = MagicMock(return_value=False)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            result = await manager.execute("test-host", "cmd")
+
+        assert result.exit_code is None
+        assert result.error is not None
+        mock_process.terminate.assert_called_once()
+        mock_process.wait_closed.assert_called_once()
+
+    # --- Defect B (panel iteration 3): two remaining cleanup gaps ---
+
+    async def test_terminate_raising_does_not_skip_wait_closed(self) -> None:
+        """Defect B gap 1: a ``terminate()`` that itself raises must not
+        skip the rest of cleanup. The truncation branch calls
+        ``terminate()`` as soon as either stream exceeds budget — make
+        that call raise and prove ``wait_closed()`` still runs and the
+        command still comes back as a normal (truncated) ExecResult
+        rather than propagating the terminate() failure to the caller.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        settings = Settings(max_output_bytes=1024)
+        manager = SSHManager(self._make_registry(), settings)
+
+        stdout_reader, _ = self._make_bounded_reader(10 * 1024 * 1024)
+        stderr_reader, _ = self._make_bounded_reader(0)
+        mock_process = self._make_process(stdout_reader, stderr_reader)
+        mock_process.terminate = MagicMock(side_effect=OSError("channel already gone"))
+
+        mock_conn = MagicMock()
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
+        mock_conn.is_closed = MagicMock(return_value=False)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            result = await manager.execute("test-host", "cat hugefile")
+
+        mock_process.terminate.assert_called_once()
+        mock_process.wait_closed.assert_called_once()
+        assert result.error is None, (
+            f"terminate() raising must not surface as a command failure: {result}"
+        )
+        assert "truncated" in result.stdout
+
+    async def test_cancellation_during_final_wait_closed_still_terminates_and_closes(
+        self,
+    ) -> None:
+        """Defect B gap 2: the FINAL ``await process.wait_closed()`` on
+        the normal (non-truncated) completion path used to sit outside
+        any exception handler, so a cancellation landing exactly during
+        that await propagated immediately with no cleanup — the process
+        was never terminated on this path and its channel was never
+        confirmed closed. This must now (a) terminate defensively, and
+        (b) still let the shielded close run to completion, before the
+        cancellation is allowed to propagate.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        settings = Settings(max_output_bytes=1024)
+        manager = SSHManager(self._make_registry(), settings)
+
+        # Small output, no truncation: `terminated` stays False, so this
+        # exercises the un-terminated happy-path close, not the
+        # truncation branch (which already terminates unconditionally).
+        stdout_reader, _ = self._make_bounded_reader(4)
+        stderr_reader, _ = self._make_bounded_reader(0)
+        mock_process = self._make_process(stdout_reader, stderr_reader)
+
+        close_started = asyncio.Event()
+        close_may_finish = asyncio.Event()
+        close_completed = asyncio.Event()
+
+        async def _blocking_wait_closed() -> None:
+            close_started.set()
+            await close_may_finish.wait()
+            close_completed.set()
+
+        mock_process.wait_closed = AsyncMock(side_effect=_blocking_wait_closed)
+
+        mock_conn = MagicMock()
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
+        mock_conn.is_closed = MagicMock(return_value=False)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            task = asyncio.create_task(manager.execute("test-host", "echo hi"))
+
+            await asyncio.wait_for(close_started.wait(), timeout=1)
+            mock_process.terminate.assert_not_called()
+
+            task.cancel()
+            # Give the cancellation time to reach _await_process_closed's
+            # `except CancelledError` branch (which terminates and
+            # re-awaits the shielded close task) before we let the close
+            # itself actually finish.
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            close_may_finish.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        mock_process.terminate.assert_called_once()
+        assert close_completed.is_set(), (
+            "the shielded wait_closed() must run to completion even "
+            "though the outer call was cancelled — Defect B gap 2"
+        )
+
+    async def test_double_cancellation_during_final_wait_closed_still_confirms_close(
+        self,
+    ) -> None:
+        """Defect 2 (panel iteration 4, cursor, verified by executing code
+        with two cancels in a row): the FIRST cancel is absorbed by
+        ``asyncio.shield`` inside ``_await_process_closed``, landing in
+        its ``except CancelledError`` handler, which used to do a BARE
+        ``await close_task`` to confirm the close actually finished.
+        ``contextlib.suppress(Exception)`` around that bare await cannot
+        catch a SECOND ``CancelledError`` (it derives from
+        ``BaseException``), so a cancel arriving while that bare await
+        was still pending used to skip the wait entirely and propagate
+        past ``raise`` — the channel's close was never confirmed. This
+        reproduces exactly that timing (two ``task.cancel()`` calls
+        before the mocked ``wait_closed()`` is allowed to finish) and
+        asserts the close still runs to completion.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        settings = Settings(max_output_bytes=1024)
+        manager = SSHManager(self._make_registry(), settings)
+
+        stdout_reader, _ = self._make_bounded_reader(4)
+        stderr_reader, _ = self._make_bounded_reader(0)
+        mock_process = self._make_process(stdout_reader, stderr_reader)
+
+        close_started = asyncio.Event()
+        close_may_finish = asyncio.Event()
+        close_completed = asyncio.Event()
+
+        async def _blocking_wait_closed() -> None:
+            close_started.set()
+            await close_may_finish.wait()
+            close_completed.set()
+
+        mock_process.wait_closed = AsyncMock(side_effect=_blocking_wait_closed)
+
+        mock_conn = MagicMock()
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
+        mock_conn.is_closed = MagicMock(return_value=False)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            task = asyncio.create_task(manager.execute("test-host", "echo hi"))
+
+            await asyncio.wait_for(close_started.wait(), timeout=1)
+            mock_process.terminate.assert_not_called()
+
+            # First cancel: absorbed by `asyncio.shield`, lands in the
+            # `except CancelledError` handler and starts the
+            # `_await_shielded_until_done(close_task)` retry loop.
+            task.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            # Second cancel: hits the SAME handler while it is still
+            # waiting for `close_task` to finish (the underlying
+            # `wait_closed()` mock is still blocked on
+            # `close_may_finish`). This is the exact window the old bare
+            # `await close_task` could not survive.
+            task.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            close_may_finish.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        mock_process.terminate.assert_called_once()
+        assert close_completed.is_set(), (
+            "wait_closed() must still run to completion after a SECOND "
+            "cancellation — Defect 2"
         )
 
 
@@ -1907,15 +2986,23 @@ groups = ["test"]
     async def test_upload_rejects_oversized_file(
         self,
         tmp_path,
-        sample_settings: Settings,
     ) -> None:
-        """Upload must raise ValueError when local file exceeds _MAX_SFTP_BYTES."""
+        """Upload must raise ValueError when local file exceeds _MAX_SFTP_BYTES.
+
+        B1: the size guard now runs on ``os.fstat`` of the descriptor
+        ``open_beneath`` returns (see the TOCTOU note in ``_upload_impl``),
+        so there is no ``Path.stat`` left to mock. Instead ``_MAX_SFTP_BYTES``
+        is patched down to a tiny value and a real, small file is written
+        that exceeds it — exercising the real fstat path end to end.
+        """
         from unittest.mock import AsyncMock, MagicMock, patch
 
-        local = tmp_path / "big.bin"
-        local.write_bytes(b"x")  # real file — we'll mock stat
+        root = tmp_path / "transfers"
+        root.mkdir(mode=0o700)
+        settings = Settings(transfer_root=str(root))
+        (root / "big.bin").write_bytes(b"x" * 11)
 
-        manager = SSHManager(self._make_registry(), sample_settings)
+        manager = SSHManager(self._make_registry(), settings)
 
         mock_conn = MagicMock()
         mock_conn.is_closed = MagicMock(return_value=False)
@@ -1924,29 +3011,45 @@ groups = ["test"]
             manager, "_get_connection", AsyncMock(return_value=mock_conn)
         ):
             manager._connection_ids["test-host"] = "test-host-1-size"
-            # Mock Path.stat to return a size exceeding the limit
-            fake_stat = MagicMock()
-            fake_stat.st_size = _MAX_SFTP_BYTES + 1
-
-            with patch("ssh_mcp.ssh.Path.stat", return_value=fake_stat):
+            with patch("ssh_mcp.ssh._MAX_SFTP_BYTES", 10):
                 with pytest.raises(ValueError, match="File too large"):
-                    await manager.upload("test-host", str(local), "/tmp/big.bin")
+                    await manager.upload("test-host", "big.bin", "/tmp/big.bin")
 
     async def test_download_warns_on_oversized_file(
         self,
         tmp_path,
         caplog: pytest.LogCaptureFixture,
-        sample_settings: Settings,
     ) -> None:
-        """Download must log a warning when the file exceeds _MAX_SFTP_BYTES."""
+        """Download must log a warning when the file exceeds _MAX_SFTP_BYTES.
+
+        B1: the warning now uses the byte count actually WRITTEN by the
+        confined copy loop (``written``), not a re-stat of the destination
+        path — same TOCTOU-closing rationale as the upload side.
+        """
         from unittest.mock import AsyncMock, MagicMock, patch
 
-        local = tmp_path / "downloaded_big.bin"
-        local.write_bytes(b"x")  # pre-create so stat works after mocked get
+        from asyncssh.constants import FILEXFER_TYPE_REGULAR
 
-        manager = SSHManager(self._make_registry(), sample_settings)
+        root = tmp_path / "transfers"
+        root.mkdir(mode=0o700)
+        settings = Settings(transfer_root=str(root))
+
+        manager = SSHManager(self._make_registry(), settings)
+
+        mock_attrs = MagicMock()
+        mock_attrs.type = FILEXFER_TYPE_REGULAR
+
+        mock_remote_file = MagicMock()
+        mock_remote_file.read = AsyncMock(side_effect=[b"x" * 11, b""])
+
         mock_sftp = MagicMock()
-        mock_sftp.get = AsyncMock(return_value=None)
+        mock_sftp.stat = AsyncMock(return_value=mock_attrs)
+        mock_sftp.limits = MagicMock(max_read_len=16384)
+
+        file_ctx = MagicMock()
+        file_ctx.__aenter__ = AsyncMock(return_value=mock_remote_file)
+        file_ctx.__aexit__ = AsyncMock(return_value=None)
+        mock_sftp.open = MagicMock(return_value=file_ctx)
 
         sftp_ctx = MagicMock()
         sftp_ctx.__aenter__ = AsyncMock(return_value=mock_sftp)
@@ -1960,16 +3063,13 @@ groups = ["test"]
             manager, "_get_connection", AsyncMock(return_value=mock_conn)
         ):
             manager._connection_ids["test-host"] = "test-host-1-dlsize"
-
-            # Mock Path.stat to return a size exceeding the limit
-            fake_stat = MagicMock()
-            fake_stat.st_size = _MAX_SFTP_BYTES + 1024
-
-            with patch("ssh_mcp.ssh.Path.stat", return_value=fake_stat):
+            with patch("ssh_mcp.ssh._MAX_SFTP_BYTES", 10):
                 with caplog.at_level("WARNING", logger="ssh_mcp.ssh"):
                     await manager.download(
-                        "test-host", "/tmp/source_big.bin", str(local)
+                        "test-host", "/tmp/source_big.bin", "downloaded_big.bin"
                     )
+
+        assert (root / "downloaded_big.bin").read_bytes() == b"x" * 11
 
         warning_msgs = [
             r.message
@@ -1980,3 +3080,560 @@ groups = ["test"]
         assert len(warning_msgs) >= 1, (
             f"Expected size-limit warning, got: {[r.message for r in caplog.records]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Defect 5 (panel iteration 2): transfer-root fd lifetime vs. close_all()
+# ---------------------------------------------------------------------------
+
+
+class TestTransferRootLifecycle:
+    """The pinned transfer-root fd's lifetime must be safe against a
+    concurrent ``close_all()``: an in-flight transfer's fd must not be
+    closed out from under it (use-after-close, with descriptor-reuse
+    implications), and a root pinned during shutdown must not leak.
+    """
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[groups]
+test = { description = "Test group" }
+[servers.test-host]
+description = "Test server"
+groups = ["test"]
+"""
+        tmp = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        tmp.write(config_content)
+        tmp.flush()
+        tmp.close()
+        return ServerRegistry(tmp.name)
+
+    async def test_close_all_waits_for_in_flight_transfer_before_closing(
+        self, tmp_path
+    ) -> None:
+        """close_all() must not close the root fd while a transfer still
+        holds it. Deterministic via events, not timing: the holder proves
+        the fd is still valid immediately before releasing it, and
+        close_all() is asserted to still be in-flight (not yet returned)
+        while the holder is inside the context."""
+        root = tmp_path / "transfers"
+        root.mkdir(mode=0o700)
+        manager = SSHManager(self._make_registry(), Settings(transfer_root=str(root)))
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        observed_fd: list[int] = []
+
+        async def hold_transfer_root() -> None:
+            async with manager._transfer_root() as root_fd:
+                observed_fd.append(root_fd)
+                entered.set()
+                await release.wait()
+                # Proves the fd is STILL open at this point — if
+                # close_all() had raced past the refcount check, this
+                # would raise OSError instead.
+                os.fstat(root_fd)
+
+        holder = asyncio.create_task(hold_transfer_root())
+        await entered.wait()
+
+        closer = asyncio.create_task(manager.close_all())
+        await asyncio.sleep(0.05)
+        assert not closer.done(), (
+            "close_all() must wait for the in-flight transfer to release "
+            "the root fd, not close it out from under it"
+        )
+
+        release.set()
+        await holder
+        await closer
+
+        assert manager._transfer_root_fd is None
+        with pytest.raises(OSError):
+            os.fstat(observed_fd[0])
+
+    async def test_transfer_root_refuses_new_transfer_after_close_all(
+        self, tmp_path
+    ) -> None:
+        """A transfer that starts during/after shutdown must fail fast
+        instead of racing ensure_root() against os.close() — the other
+        half of Defect 5 (a late transfer's fd landing with nothing left
+        to ever close it)."""
+        root = tmp_path / "transfers"
+        root.mkdir(mode=0o700)
+        manager = SSHManager(self._make_registry(), Settings(transfer_root=str(root)))
+
+        await manager.close_all()
+
+        with pytest.raises(RuntimeError, match="shutting down"):
+            async with manager._transfer_root():
+                pass  # pragma: no cover - must not be reached
+
+    async def test_close_all_is_a_noop_when_no_transfer_ever_ran(
+        self, tmp_path
+    ) -> None:
+        """Control case: close_all() on a manager that never touched the
+        transfer root must complete immediately (refcount already 0, fd
+        already None) rather than hang."""
+        root = tmp_path / "transfers"
+        root.mkdir(mode=0o700)
+        manager = SSHManager(self._make_registry(), Settings(transfer_root=str(root)))
+
+        await asyncio.wait_for(manager.close_all(), timeout=1)
+
+        assert manager._transfer_root_fd is None
+
+    # --- Defect C (panel iteration 3): two remaining root-fd lifetime races ---
+
+    async def test_ensure_root_fd_not_leaked_when_cancelled_mid_creation(
+        self, tmp_path
+    ) -> None:
+        """Defect C gap 1 (verified by executing code): the worker
+        THREAD running ``ensure_root()`` cannot be interrupted once it
+        starts — it runs to completion regardless of what happens to the
+        awaiting coroutine. A cancellation landing while that thread is
+        still in flight must not let the (real) fd it goes on to create
+        leak — it must still be closed even though it was never stored
+        in ``self._transfer_root_fd``.
+        """
+        import threading
+        from unittest.mock import patch
+
+        root = tmp_path / "transfers"
+        root.mkdir(mode=0o700)
+        manager = SSHManager(self._make_registry(), Settings(transfer_root=str(root)))
+
+        thread_entered = threading.Event()
+        release_thread = threading.Event()
+        created_fds: list[int] = []
+
+        def _slow_ensure_root(path: str) -> int:
+            # Runs on a real worker thread via asyncio.to_thread — must
+            # use threading primitives, not asyncio ones, to coordinate
+            # with the test.
+            thread_entered.set()
+            assert release_thread.wait(timeout=5), "test setup timed out"
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            created_fds.append(fd)
+            return fd
+
+        async def _enter_transfer_root() -> None:
+            async with manager._transfer_root():
+                pass  # pragma: no cover - cancelled before reaching here
+
+        with patch("ssh_mcp.ssh.ensure_root", _slow_ensure_root):
+            task = asyncio.create_task(_enter_transfer_root())
+
+            await asyncio.to_thread(thread_entered.wait, 5)
+            task.cancel()
+            # Let the cancellation reach the `except CancelledError`
+            # branch inside `_transfer_root()` before the thread is
+            # allowed to actually finish.
+            await asyncio.sleep(0)
+
+            release_thread.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert created_fds, "ensure_root should have run to completion in the thread"
+        assert manager._transfer_root_fd is None, (
+            "a cancelled first-transfer must not leave a fd cached for "
+            "reuse — it was never actually stored"
+        )
+        with pytest.raises(OSError):
+            os.fstat(created_fds[0])  # closed, not leaked
+
+    async def test_ensure_root_fd_not_leaked_under_double_cancellation(
+        self, tmp_path
+    ) -> None:
+        """Defect 2 (panel iteration 4, cursor, verified by executing code
+        with two cancels in a row): the FIRST cancel is absorbed by the
+        outer ``asyncio.shield``, landing in the ``except
+        CancelledError`` handler, which used to retrieve the leaked fd
+        via a BARE ``await ensure_task``. ``contextlib.suppress(Exception)``
+        around that bare await cannot catch a SECOND ``CancelledError``
+        (it derives from ``BaseException``, not ``Exception``), so a
+        cancel arriving while that bare await was still pending (the
+        worker thread still running ``ensure_root()``) used to skip
+        ``os.close()`` entirely and leak the fd. This reproduces exactly
+        that timing — two ``task.cancel()`` calls while the thread is
+        still in flight — and asserts the fd is still closed, not
+        leaked.
+        """
+        import threading
+        from unittest.mock import patch
+
+        root = tmp_path / "transfers"
+        root.mkdir(mode=0o700)
+        manager = SSHManager(self._make_registry(), Settings(transfer_root=str(root)))
+
+        thread_entered = threading.Event()
+        release_thread = threading.Event()
+        created_fds: list[int] = []
+
+        def _slow_ensure_root(path: str) -> int:
+            thread_entered.set()
+            assert release_thread.wait(timeout=5), "test setup timed out"
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            created_fds.append(fd)
+            return fd
+
+        async def _enter_transfer_root() -> None:
+            async with manager._transfer_root():
+                pass  # pragma: no cover - cancelled before reaching here
+
+        with patch("ssh_mcp.ssh.ensure_root", _slow_ensure_root):
+            task = asyncio.create_task(_enter_transfer_root())
+
+            await asyncio.to_thread(thread_entered.wait, 5)
+
+            # First cancel: absorbed by the outer `asyncio.shield`, lands
+            # in the `except CancelledError` handler and starts the
+            # `_await_shielded_until_done(ensure_task)` retry loop while
+            # the worker thread is still blocked on `release_thread`.
+            task.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            # Second cancel: hits the SAME handler while it is still
+            # waiting for the worker thread to finish. This is the exact
+            # window the old bare `await ensure_task` could not survive.
+            task.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            release_thread.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert created_fds, "ensure_root should have run to completion in the thread"
+        assert manager._transfer_root_fd is None, (
+            "a cancelled first-transfer must not leave a fd cached for reuse"
+        )
+        with pytest.raises(OSError):
+            os.fstat(created_fds[0])  # closed, not leaked — Defect 2
+
+    async def test_close_all_sets_shutdown_latch_before_any_other_await(
+        self, tmp_path
+    ) -> None:
+        """Defect C gap 2 (verified by executing code): the shutdown
+        latch must be set before ANY other await in ``close_all()`` —
+        previously it was set only at the very end, after cancelling the
+        eviction task and closing every SSH connection (both of which
+        await), leaving a window during which a brand-new transfer could
+        slip in. Simulates that window with a slow ``conn.wait_closed()``
+        and proves a transfer attempted DURING it is refused immediately,
+        not merely after ``close_all()`` eventually returns.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        root = tmp_path / "transfers"
+        root.mkdir(mode=0o700)
+        manager = SSHManager(self._make_registry(), Settings(transfer_root=str(root)))
+
+        conn_close_started = asyncio.Event()
+        conn_close_may_finish = asyncio.Event()
+
+        async def _slow_wait_closed() -> None:
+            conn_close_started.set()
+            await conn_close_may_finish.wait()
+
+        mock_conn = MagicMock()
+        mock_conn.close = MagicMock()
+        mock_conn.wait_closed = AsyncMock(side_effect=_slow_wait_closed)
+        manager._connections["test-host"] = mock_conn
+        manager._connection_ids["test-host"] = "test-host-1"
+
+        closer = asyncio.create_task(manager.close_all())
+        await asyncio.wait_for(conn_close_started.wait(), timeout=1)
+
+        # close_all() is now blocked well past the point where the latch
+        # must already be set (inside the connection-closing loop).
+        assert manager._transfer_root_closing is True, (
+            "the shutdown latch must be set before close_all() reaches "
+            "any other await, including closing SSH connections"
+        )
+        with pytest.raises(RuntimeError, match="shutting down"):
+            async with manager._transfer_root():
+                pass  # pragma: no cover - must not be reached
+
+        conn_close_may_finish.set()
+        await closer
+
+
+# ---------------------------------------------------------------------------
+# Defect D (panel iteration 3): _unlink_beneath cannot prove identity
+# ---------------------------------------------------------------------------
+
+
+class TestUnlinkBeneathIdentity:
+    """``_unlink_beneath``'s O_NOFOLLOW per-component walk proves the
+    PATH is confined (no symlink component can redirect it outside
+    ``root_fd``), but on its own that proves nothing about IDENTITY:
+    nothing stopped a concurrent process from renaming an unrelated file
+    onto the exact same leaf name after this call's own file was
+    created but before cleanup ran. ``expected_ino`` — the
+    ``(st_dev, st_ino)`` pair the caller captured via ``os.fstat`` while
+    it still held the fd it created — closes that gap: immediately
+    before unlinking, the leaf's current identity is compared via
+    ``os.stat(dir_fd=parent, follow_symlinks=False)`` and a mismatch
+    raises ``PathConfinementError`` instead of unlinking.
+    """
+
+    def test_unlinks_when_no_expected_ino_given(self, tmp_path) -> None:
+        """Backward-compatible control case: omitting ``expected_ino``
+        keeps the original path-confinement-only behaviour — callers
+        that cannot capture an identity still get that guarantee."""
+        target = tmp_path / "victim.txt"
+        target.write_bytes(b"x")
+        root_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            _unlink_beneath(root_fd, "victim.txt")
+        finally:
+            os.close(root_fd)
+        assert not target.exists()
+
+    def test_unlinks_when_identity_matches(self, tmp_path) -> None:
+        """The common case: nothing raced this cleanup, so the leaf's
+        current identity matches what was captured at creation time, and
+        the unlink proceeds exactly as before."""
+        target = tmp_path / "victim.txt"
+        target.write_bytes(b"x")
+        st = target.stat()
+        root_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            _unlink_beneath(root_fd, "victim.txt", expected_ino=(st.st_dev, st.st_ino))
+        finally:
+            os.close(root_fd)
+        assert not target.exists()
+
+    def test_refuses_to_unlink_after_identity_mismatch(self, tmp_path) -> None:
+        """The headline case (Defect D, verified by executing code): a
+        DIFFERENT file now occupies the same leaf name — simulating a
+        concurrent rename that happened between this call's file
+        creation and its cleanup. The replacement must survive."""
+        original = tmp_path / "victim.txt"
+        original.write_bytes(b"original contents")
+        original_st = original.stat()
+
+        # Simulate the race: the original slot is replaced by an
+        # unrelated file via rename onto the exact same leaf name.
+        original.unlink()
+        replacement = tmp_path / "replacement.txt"
+        replacement.write_bytes(b"replacement contents")
+        os.replace(replacement, tmp_path / "victim.txt")
+
+        root_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(PathConfinementError, match="does not match"):
+                _unlink_beneath(
+                    root_fd,
+                    "victim.txt",
+                    expected_ino=(original_st.st_dev, original_st.st_ino),
+                )
+        finally:
+            os.close(root_fd)
+
+        target = tmp_path / "victim.txt"
+        assert target.exists(), "identity mismatch must refuse to unlink"
+        assert target.read_bytes() == b"replacement contents"
+
+    def test_identity_check_still_raises_on_symlink_component(self, tmp_path) -> None:
+        """The pre-existing path-confinement guarantee (a symlinked
+        intermediate directory) must still be enforced even when
+        ``expected_ino`` is supplied — identity-checking is additive,
+        not a replacement for the O_NOFOLLOW walk. A symlink component
+        surfaces as a plain OSError here (ELOOP/ENOTDIR depending on
+        platform) — see the updated docstring for why this function,
+        unlike ``open_beneath``, does not translate that into
+        ``PathConfinementError``."""
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        (real_dir / "victim.txt").write_bytes(b"x")
+        link = tmp_path / "link"
+        link.symlink_to(real_dir)
+
+        root_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(OSError):
+                _unlink_beneath(root_fd, "link/victim.txt", expected_ino=(0, 0))
+        finally:
+            os.close(root_fd)
+        assert (real_dir / "victim.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Defect 3 (panel iteration 4, cursor): identity capture must not be
+# lossy to cancellation, end-to-end through _download_impl.
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadIdentityCaptureEndToEnd:
+    """``_download_impl`` used to capture ``created_ino`` via ``await
+    asyncio.to_thread(os.fstat, local_fd)`` — an await point sitting
+    between ``local_file_created = True`` and ``created_ino`` actually
+    being set. A cancellation landing in that gap left ``created_ino``
+    at its initial ``None``, and the cleanup ``finally`` block further
+    down unconditionally unlinks whenever ``local_file_created`` is set,
+    passing whatever ``created_ino`` holds as ``expected_ino`` —
+    ``None`` there means "skip the identity check" (see
+    ``_unlink_beneath``'s docstring), reopening exactly the
+    replacement-file TOCTOU the check exists to close.
+
+    Fix: ``os.fstat`` on an already-open fd does no blocking I/O, so it
+    is now called INLINE (no ``await``, no ``to_thread`` hop) — there is
+    no longer any await point between "file created" and "identity
+    captured", so the race window is closed structurally rather than
+    merely narrowed. These tests prove the identity check still fires,
+    end-to-end through a real (failed) download.
+    """
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[groups]
+test = { description = "Test group" }
+[servers.test-host]
+description = "Test server"
+groups = ["test"]
+"""
+        f = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        f.write(config_content)
+        f.close()
+        return ServerRegistry(f.name)
+
+    async def test_failed_download_never_unlinks_a_renamed_replacement_file(
+        self, tmp_path
+    ) -> None:
+        """Headline scenario: the remote read fails partway through (so
+        the cleanup path runs), and — simulating a concurrent process
+        winning a race onto the exact same local leaf name — the local
+        file is replaced with unrelated content between creation and
+        cleanup. If ``created_ino`` were ever lost, the cleanup would
+        delete the REPLACEMENT instead of refusing. It must survive."""
+        import asyncssh
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from asyncssh.constants import FILEXFER_TYPE_REGULAR
+
+        root = tmp_path / "transfers"
+        root.mkdir(mode=0o700)
+        settings = Settings(transfer_root=str(root))
+        manager = SSHManager(self._make_registry(), settings)
+
+        mock_attrs = MagicMock()
+        mock_attrs.type = FILEXFER_TYPE_REGULAR
+
+        local_path = root / "dest.bin"
+
+        async def _read(_block: int, _offset: int) -> bytes:
+            # First chunk succeeds (so the local file is created and its
+            # identity captured), then simulate a concurrent process
+            # winning a race and replacing the local file's content on
+            # disk, then the remote read fails — forcing the cleanup
+            # path to run.
+            replacement = tmp_path / "replacement.bin"
+            replacement.write_bytes(b"REPLACEMENT CONTENT")
+            os.replace(replacement, local_path)
+            raise asyncssh.SFTPError(4, "connection lost mid-transfer")
+
+        mock_remote_file = MagicMock()
+        mock_remote_file.read = AsyncMock(side_effect=_read)
+
+        mock_sftp = MagicMock()
+        mock_sftp.stat = AsyncMock(return_value=mock_attrs)
+        mock_sftp.limits = MagicMock(max_read_len=16384)
+
+        file_ctx = MagicMock()
+        file_ctx.__aenter__ = AsyncMock(return_value=mock_remote_file)
+        file_ctx.__aexit__ = AsyncMock(return_value=None)
+        mock_sftp.open = MagicMock(return_value=file_ctx)
+
+        sftp_ctx = MagicMock()
+        sftp_ctx.__aenter__ = AsyncMock(return_value=mock_sftp)
+        sftp_ctx.__aexit__ = AsyncMock(return_value=None)
+
+        mock_conn = MagicMock()
+        mock_conn.is_closed = MagicMock(return_value=False)
+        mock_conn.start_sftp_client = MagicMock(return_value=sftp_ctx)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            manager._connection_ids["test-host"] = "test-host-1-identity"
+            with pytest.raises(RuntimeError, match="Download failed"):
+                await manager.download("test-host", "/tmp/source.bin", "dest.bin")
+
+        assert local_path.exists(), "identity mismatch must refuse to unlink — Defect 3"
+        assert local_path.read_bytes() == b"REPLACEMENT CONTENT", (
+            "the replacement file must survive the failed download's cleanup"
+        )
+
+    async def test_fstat_identity_capture_is_synchronous_not_via_to_thread(
+        self, tmp_path
+    ) -> None:
+        """Structural regression guard: ``os.fstat`` for identity capture
+        must be called INLINE, not hopped to a worker thread via
+        ``asyncio.to_thread`` — that hop is what introduced the await
+        point this defect exploited. Patches ``asyncio.to_thread`` to
+        flag any call whose target is ``os.fstat`` while still allowing
+        the real ``to_thread`` calls (``open_beneath``, file writes) the
+        rest of the download legitimately needs."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from asyncssh.constants import FILEXFER_TYPE_REGULAR
+
+        root = tmp_path / "transfers"
+        root.mkdir(mode=0o700)
+        settings = Settings(transfer_root=str(root))
+        manager = SSHManager(self._make_registry(), settings)
+
+        mock_attrs = MagicMock()
+        mock_attrs.type = FILEXFER_TYPE_REGULAR
+
+        mock_remote_file = MagicMock()
+        mock_remote_file.read = AsyncMock(side_effect=[b"hello", b""])
+
+        mock_sftp = MagicMock()
+        mock_sftp.stat = AsyncMock(return_value=mock_attrs)
+        mock_sftp.limits = MagicMock(max_read_len=16384)
+
+        file_ctx = MagicMock()
+        file_ctx.__aenter__ = AsyncMock(return_value=mock_remote_file)
+        file_ctx.__aexit__ = AsyncMock(return_value=None)
+        mock_sftp.open = MagicMock(return_value=file_ctx)
+
+        sftp_ctx = MagicMock()
+        sftp_ctx.__aenter__ = AsyncMock(return_value=mock_sftp)
+        sftp_ctx.__aexit__ = AsyncMock(return_value=None)
+
+        mock_conn = MagicMock()
+        mock_conn.is_closed = MagicMock(return_value=False)
+        mock_conn.start_sftp_client = MagicMock(return_value=sftp_ctx)
+
+        real_to_thread = asyncio.to_thread
+        fstat_hopped_to_thread = False
+
+        async def _tracking_to_thread(func, /, *args, **kwargs):
+            nonlocal fstat_hopped_to_thread
+            if func is os.fstat:
+                fstat_hopped_to_thread = True
+            return await real_to_thread(func, *args, **kwargs)
+
+        with patch.object(
+            manager, "_get_connection", AsyncMock(return_value=mock_conn)
+        ):
+            manager._connection_ids["test-host"] = "test-host-1-sync-fstat"
+            with patch("ssh_mcp.ssh.asyncio.to_thread", _tracking_to_thread):
+                await manager.download("test-host", "/tmp/source.bin", "dest2.bin")
+
+        assert not fstat_hopped_to_thread, (
+            "os.fstat for identity capture must be called inline, not via "
+            "asyncio.to_thread — Defect 3"
+        )
+        assert (root / "dest2.bin").read_bytes() == b"hello"
