@@ -2,7 +2,8 @@
 
 This module provides the ServerRegistry class that loads and validates
 server/group configuration from a TOML file, providing convenient lookup
-and filtering methods.
+and filtering methods, plus the ConfigError exception it raises on load
+and validation failures.
 """
 
 from __future__ import annotations
@@ -24,23 +25,31 @@ class ConfigError(ValueError):
     """Raised when configuration loading or validation fails.
 
     Subclass of ValueError for backward compatibility with existing callers
-    that catch ValueError, while allowing precise `except ConfigError` at
-    the MCP tool layer for actionable error messages.
+    that catch ValueError. It also carries an actionable message and lets a
+    caller narrow to `except ConfigError`, though no caller in this package
+    does so today: both the MCP server and the healthcheck construct
+    ``ServerRegistry`` without a handler and let the failure propagate.
     """
 
 
 def _format_validation_error(section: str, context: str, exc: ValidationError) -> str:
     """Flatten a Pydantic ValidationError into a single actionable message.
 
-    Pydantic lists each offending field with its error type and input value.
-    For ``extra_forbidden``, we surface both the offending field name AND
-    the list of valid keys for the section so operators can fix typos
-    without consulting the schema.
+    Pydantic lists each offending field with a location, an error type, and a
+    message; this flattening reads exactly those three (``loc``, ``type``,
+    ``msg``) and ignores the reported input value. For
+    ``extra_forbidden`` it surfaces the offending field name; the list of
+    valid keys for the section is appended by the call sites via
+    ``_valid_keys``, so operators can fix typos without consulting the schema.
 
     Args:
         section: TOML section label (``settings``, ``groups``, ``servers``).
-        context: Optional entity name (e.g. server/group name) for scoping.
+        context: Entity name (e.g. server/group name) for scoping; pass ``""``
+            when the section has no per-entity name.
         exc: The Pydantic ValidationError to flatten.
+
+    Returns:
+        A single-line message describing every offending field.
     """
     suffix = f" for '{context}'" if context else ""
     messages: list[str] = []
@@ -70,8 +79,11 @@ class ServerRegistry:
     """Registry for SSH server and group configurations.
 
     Loads configuration from a TOML file and provides lookup methods
-    for servers and groups. Validates all references and constraints
-    during initialization.
+    for servers and groups. Schema validation (unknown keys, missing keys,
+    numeric ranges) is fatal during initialization. Cross-reference checks —
+    undefined groups, server/group name collisions, dangling ``jump_host`` —
+    only log warnings, so such a config still loads; a circular jump host
+    chain is the one cross-reference failure that aborts.
 
     Attributes:
         settings: Global settings for SSH operations
@@ -80,8 +92,13 @@ class ServerRegistry:
     def __init__(self, config_path: str) -> None:
         """Initialize registry by loading and validating TOML config.
 
+        A leading ``~`` in ``config_path`` is expanded. The
+        ``SSH_MCP_TRANSFER_ROOT`` environment variable, if set, overrides the
+        ``transfer_root`` setting read from the file.
+
         Args:
-            config_path: Path to servers.toml configuration file
+            config_path: Path to servers.toml configuration file (supports
+                ``~`` expansion)
 
         Raises:
             FileNotFoundError: If config file doesn't exist
@@ -169,9 +186,13 @@ class ServerRegistry:
     def _load(self) -> None:
         """Load and validate configuration from TOML file.
 
+        Applies the ``SSH_MCP_TRANSFER_ROOT`` environment override on top of
+        the ``[settings]`` section before the model is constructed.
+
         Raises:
             FileNotFoundError: If config file doesn't exist
             ConfigError: If TOML is malformed or Pydantic validation fails
+            ValueError: If ``_validate`` finds a circular jump host chain
         """
         if not self._config_path.exists():
             raise FileNotFoundError(
@@ -197,9 +218,11 @@ class ServerRegistry:
         settings_dict = dict(config_data.get("settings", {}))
 
         # ``Settings`` is a plain pydantic dataclass, not ``BaseSettings``, so
-        # it reads no environment variables by itself. The transfer root is
-        # the one setting a container operator must be able to override
-        # without editing the mounted TOML, so it is applied explicitly here.
+        # no field of it is bound to an environment variable (its
+        # ``transfer_root`` default factory does consult ``XDG_DATA_HOME``, but
+        # only to compute the default). The transfer root is the one setting a
+        # container operator must be able to override without editing the
+        # mounted TOML, so that override is applied explicitly here.
         # Precedence: env > TOML > computed default.
         env_transfer_root = os.environ.get("SSH_MCP_TRANSFER_ROOT", "").strip()
         if env_transfer_root:
@@ -258,17 +281,23 @@ class ServerRegistry:
     def _validate(self) -> None:
         """Validate server/group references and constraints.
 
-        Logs warnings to stderr for validation issues.
+        Logs warnings to stderr for reference issues (no groups assigned,
+        undefined group, server/group name collision, undefined ``jump_host``)
+        and lets the config load anyway.
+
+        Raises:
+            ValueError: If a circular jump host chain is detected. This is the
+                only fatal check here, so it aborts ``__init__``.
         """
         server_names = set(self._servers.keys())
         group_names = set(self._groups.keys())
 
         for server_name, server in self._servers.items():
-            # Every server must reference at least one group
+            # A server should reference at least one group (advisory only)
             if not server.groups:
                 logger.warning("Server '%s' has no groups assigned", server_name)
 
-            # Every group referenced by a server must be defined
+            # A group referenced by a server should be defined (advisory only)
             for group in server.groups:
                 if group not in group_names:
                     logger.warning(
@@ -277,11 +306,11 @@ class ServerRegistry:
                         group,
                     )
 
-            # Server names must not collide with group names
+            # Server names should not collide with group names (advisory only)
             if server_name in group_names:
                 logger.warning("Server name '%s' collides with group name", server_name)
 
-            # jump_host value must reference another defined server
+            # jump_host should reference another defined server (advisory only)
             if server.jump_host and server.jump_host not in server_names:
                 logger.warning(
                     "Server '%s' references undefined jump_host '%s'",

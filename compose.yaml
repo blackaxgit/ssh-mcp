@@ -8,13 +8,23 @@
 #                     authentication, suitable for shared-team or
 #                     containerized deployments. Commented out by default.
 #
-# Run the stdio service:      docker compose run --rm ssh-mcp
+# Prerequisite for both services: create the config file mounted below. It is
+# gitignored, so a fresh clone does not have it and Docker would bind-mount an
+# empty *directory* in its place, which the server then fails to load.
+#   cp config/servers.example.toml config/servers.toml
+#
+# Run the stdio service:      docker compose run --rm -T ssh-mcp
+#   ``-T`` is required: stdio transport speaks newline-delimited JSON-RPC over
+#   stdin/stdout, and the pseudo-TTY ``docker compose run`` allocates by
+#   default can corrupt that framing.
 # Run the HTTP service:       uncomment the block below, set SSH_MCP_HTTP_TOKEN,
 #                             then: docker compose up ssh-mcp-http
 
 services:
   ssh-mcp:
-    # Build from local Dockerfile (production-ready multi-stage)
+    # Build from local Dockerfile (production-ready multi-stage).
+    # To use the published image instead, replace this build block with:
+    #   image: ghcr.io/blackaxgit/ssh-mcp:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -27,34 +37,70 @@ services:
     volumes:
       # Server configuration (read-only)
       # Contains host definitions, credentials, execution rules
+      # Gitignored — create it first (see the prerequisite at the top):
+      #   cp config/servers.example.toml config/servers.toml
       - ./config/servers.toml:/config/servers.toml:ro
 
       # User SSH keys and config (read-only)
       # Maps host machine ~/.ssh to container for key-based authentication
       - ~/.ssh:/home/sshmcp/.ssh:ro
 
+      # SFTP transfer root (read-write) — mount this if you use upload_file /
+      # download_file. Every local path those tools accept is RELATIVE to the
+      # transfer root and confined beneath it; absolute paths are rejected.
+      # Without a mount, downloads land in the container's own layer and are
+      # destroyed by ``--rm``, and uploads can only read files already inside
+      # the image. Default root in the image is
+      # /home/sshmcp/.local/share/ssh-mcp/transfers (the Dockerfile sets
+      # HOME=/home/sshmcp).
+      #
+      # Prepare the host directory first: ssh-mcp refuses a root it does not
+      # own, one that is group/other-accessible, or one that is a symlink.
+      #   mkdir -p ./transfers
+      #   sudo chown 1000:1000 ./transfers   # container user sshmcp is uid 1000
+      #   chmod 700 ./transfers
+      # - ./transfers:/home/sshmcp/.local/share/ssh-mcp/transfers
+
     # Environment configuration
     environment:
       # Point MCP server to the mounted config file
       SSH_MCP_CONFIG: /config/servers.toml
-      # Ensure Python logs and MCP protocol messages go to stderr for container logging
+      # Disable Python output buffering so container logs appear immediately.
+      # (Logs go to stderr; in stdio mode MCP protocol messages go to stdout.)
+      # The image already sets this — repeated here for visibility.
       PYTHONUNBUFFERED: "1"
+      # Only needed if the transfer root is mounted somewhere other than the
+      # default /home/sshmcp/.local/share/ssh-mcp/transfers:
+      # SSH_MCP_TRANSFER_ROOT: /transfers
 
-    # Restart policy: restart on failure but not if manually stopped
-    # Prevents thrashing on configuration errors while respecting manual stops
+    # Restart policy: applies to ``docker compose up`` only — Compose ignores
+    # it for the one-off containers ``docker compose run`` creates, which is
+    # the documented way to launch this stdio service. Under ``up`` with no
+    # client attached the server exits at stdin EOF and would restart in a
+    # loop; drop this key for that usage.
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
   # HTTP transport (commented out by default — uncomment to enable)
   #
   # SECURITY:
-  #   * Binding to 0.0.0.0 REQUIRES SSH_MCP_HTTP_TOKEN (enforced at startup).
-  #   * Generate a strong token:  openssl rand -hex 32
+  #   * With the default SSH_MCP_HTTP_AUTH=bearer, binding to anything other
+  #     than localhost REQUIRES a token (enforced at startup) — supplied via
+  #     either SSH_MCP_HTTP_TOKEN or SSH_MCP_HTTP_TOKEN_FILE.
+  #   * Minimum accepted token length is 16 characters; generate more:
+  #     openssl rand -hex 32
   #   * Pass via a Docker secret or an env file — do NOT hardcode here.
+  #   * Reverse-proxy mode: SSH_MCP_HTTP_AUTH=none drops the bearer middleware
+  #     entirely, and on a non-localhost bind additionally demands
+  #     SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK — an unauthenticated
+  #     SSH executor reachable over the network is a remote root shell. Use it
+  #     only when the proxy in front performs the authentication.
   #   * Put the service behind a TLS reverse proxy (Caddy, Traefik, nginx)
   #     for production — raw uvicorn on port 8000 is HTTP, not HTTPS.
-  #   * SSH_MCP_HTTP_ALLOWED_HOSTS must list any hostname clients will use
-  #     in the Host header (DNS rebinding protection).
+  #   * DNS-rebinding protection is always on and cannot be disabled; it
+  #     accepts only 127.0.0.1 / localhost / [::1] by default, so
+  #     SSH_MCP_HTTP_ALLOWED_HOSTS must list any other hostname clients send
+  #     in the Host header.
   #
   # Example client request:
   #   curl -H "Authorization: Bearer ${SSH_MCP_HTTP_TOKEN}" \
@@ -62,6 +108,7 @@ services:
   #        http://localhost:8000/mcp
   # ---------------------------------------------------------------------------
   # ssh-mcp-http:
+  #   # Or use the published image: image: ghcr.io/blackaxgit/ssh-mcp:latest
   #   build:
   #     context: .
   #     dockerfile: Dockerfile
@@ -69,8 +116,13 @@ services:
   #     # Publish the HTTP port to the host. Put nginx/Caddy in front for TLS.
   #     - "8000:8000"
   #   volumes:
+  #     # Gitignored: cp config/servers.example.toml config/servers.toml
   #     - ./config/servers.toml:/config/servers.toml:ro
   #     - ~/.ssh:/home/sshmcp/.ssh:ro
+  #     # Transfer root for upload_file / download_file — see the stdio
+  #     # service above for why this matters and how to prepare the directory
+  #     # (uid 1000, mode 0700, not a symlink).
+  #     # - ./transfers:/home/sshmcp/.local/share/ssh-mcp/transfers
   #   environment:
   #     SSH_MCP_CONFIG: /config/servers.toml
   #     PYTHONUNBUFFERED: "1"
@@ -83,14 +135,21 @@ services:
   #     SSH_MCP_HTTP_STATELESS: "true"
   #     # Structured JSON logs for centralized aggregation (Loki, Datadog, etc.)
   #     SSH_MCP_LOG_FORMAT: "json"
-  #     # uvicorn tuning — survive bursty keepalive traffic (v0.4.1+)
+  #     # uvicorn tuning — survive bursty keepalive traffic
   #     # Default in the image is already 2s keepalive / 256 concurrency /
   #     # 128 backlog. Override here only if your traffic pattern differs.
   #     # SSH_MCP_HTTP_KEEPALIVE_TIMEOUT: "2"
   #     # SSH_MCP_HTTP_LIMIT_CONCURRENCY: "256"
   #     # SSH_MCP_HTTP_BACKLOG: "128"
-  #     # Optional: extend DNS-rebinding allowlist for your internal hostname
-  #     # SSH_MCP_HTTP_ALLOWED_HOSTS: "ssh-mcp.internal:*"
+  #     # DNS-rebinding allowlist — required for any Host header other than
+  #     # localhost, including the one in the curl example above.
+  #     SSH_MCP_HTTP_ALLOWED_HOSTS: "ssh-mcp.internal:*"
+  #     # Transfer root, only if mounted outside the default path
+  #     # SSH_MCP_TRANSFER_ROOT: /transfers
+  #     # Reverse-proxy mode — no bearer token; both are required together and
+  #     # the proxy MUST authenticate every request:
+  #     # SSH_MCP_HTTP_AUTH: "none"
+  #     # SSH_MCP_HTTP_NETWORK_NO_AUTH: "I_ACCEPT_RCE_RISK"
   #   # Prefer file-based token delivery over environment variable.
   #   # With Docker secrets:
   #   # secrets:
@@ -105,7 +164,7 @@ services:
   #       soft: 65536
   #       hard: 65536
   #   # Load the bearer token from a .env file (never commit it)
-  #   # Create .env.ssh-mcp with: SSH_MCP_HTTP_TOKEN=<32+ char random value>
+  #   # Create .env.ssh-mcp with: SSH_MCP_HTTP_TOKEN=<random value, 16 char min>
   #   env_file:
   #     - .env.ssh-mcp
   #   restart: unless-stopped

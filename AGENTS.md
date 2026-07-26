@@ -49,7 +49,7 @@ uv run ssh-mcp healthcheck          # the only argv subcommand that exists
 
 | Path | Purpose |
 |---|---|
-| `src/ssh_mcp/server.py` | MCP tool definitions, stdio + HTTP transport dispatch, bearer-auth ASGI middleware, `_mcp_tool` decorator |
+| `src/ssh_mcp/server.py` | MCP tool definitions, stdio + HTTP transport dispatch, bearer-auth ASGI middleware, `_mcp_tool` decorator (init guard + `ToolError` conversion + an `mcp.tool.{name}` OTel span) |
 | `src/ssh_mcp/ssh.py` | `SSHManager`: connection pool, exec, SFTP — **and** the security policy (credential redaction, dangerous-command patterns, sensitive paths) |
 | `src/ssh_mcp/paths.py` | Symlink-safe path confinement beneath a pinned root fd. Read its module docstring before touching it |
 | `src/ssh_mcp/config.py` | `ServerRegistry`: TOML loading, validation, circular jump-host detection |
@@ -70,22 +70,26 @@ Config resolution order, as implemented in `server.py::_get_config_path`: `$SSH_
 | `command_timeout` | `30` | 1-3600 | seconds |
 | `max_output_bytes` | `51200` | 1024-10485760 | **per stream** — see Gotchas |
 | `max_command_bytes` | `65536` | 1024-1048576 | enforced at the tool boundary |
-| `transfer_root` | `$XDG_DATA_HOME/ssh-mcp/transfers`, else `~/.local/share/ssh-mcp/transfers` | — | SFTP confinement root; computed in `paths.py::default_transfer_root` |
+| `transfer_root` | `$XDG_DATA_HOME/ssh-mcp/transfers`, else `~/.local/share/ssh-mcp/transfers` | — | SFTP confinement root; computed in `paths.py::default_transfer_root`, but the settings loader in `config.py` applies `SSH_MCP_TRANSFER_ROOT` on top — precedence is **env > TOML > computed default** |
 | `connection_idle_timeout` | `300` | ≥10 | eviction scan runs every 60s |
 | `known_hosts` | `true` | — | `false` removes MITM protection |
 | `max_parallel_hosts` | `10` | 1-100 | process-wide, not per call |
 
-Environment variables (names only — `README.md` has the full table): `SSH_MCP_CONFIG`, `SSH_MCP_TRANSFER_ROOT`, `SSH_MCP_LOG_FORMAT`, `SSH_MCP_TRANSPORT`, and the HTTP-transport set `SSH_MCP_HTTP_{HOST,PORT,TOKEN,TOKEN_FILE,AUTH,NETWORK_NO_AUTH,STATELESS,ALLOWED_HOSTS,KEEPALIVE_TIMEOUT,LIMIT_CONCURRENCY,BACKLOG}`.
+Environment variables (names only — `README.md` has the full table): `SSH_MCP_CONFIG`, `SSH_MCP_TRANSFER_ROOT`, `SSH_MCP_LOG_FORMAT`, `SSH_MCP_TRANSPORT`, the HTTP-transport set `SSH_MCP_HTTP_{HOST,PORT,TOKEN,TOKEN_FILE,AUTH,NETWORK_NO_AUTH,STATELESS,ALLOWED_HOSTS,KEEPALIVE_TIMEOUT,LIMIT_CONCURRENCY,BACKLOG}`, plus three read outside the `SSH_MCP_` prefix: `XDG_CONFIG_HOME` (`server.py::_get_config_path`) and `XDG_DATA_HOME` (`paths.py::default_transfer_root`) — the two the config-resolution Gotcha calls load-bearing — and `HYPOTHESIS_PROFILE` (`tests/conftest.py`, `dev` = 50 examples / `ci` = 200). The conftest comment claims the CI workflow sets `HYPOTHESIS_PROFILE`; **it does not** — no workflow sets it, so CI runs the `dev` profile.
 
-**HTTP transport fails closed by design, and the gates are load-bearing.** Binding to anything other than loopback without `SSH_MCP_HTTP_TOKEN` raises at startup; a token shorter than 16 characters is rejected; DNS-rebinding protection is forced on, and a bare-wildcard `allowed_hosts` entry (`*`, `*:*`) is refused — though a *suffix* wildcard such as `*.internal.example.com` is deliberately permitted (`server.py:909`). Disabling auth on a non-loopback bind additionally requires `SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK` — a deliberately verbose opt-in, because the endpoint executes shell commands. Do not add a code path that relaxes any of these, and note the server speaks plain HTTP: TLS is the reverse proxy's job.
+Four module-level tunables in `ssh.py` are *deliberately* not `Settings` fields — lifted out of inline literals to be greppable and testable without widening the operator-facing config surface. Do not promote them without a reason: `_EVICTION_LOOP_INTERVAL_S` (60s), `_MAX_JUMP_HOST_DEPTH` (5 chained jump hosts), `_STREAM_READ_CHUNK_BYTES`, and `_MAX_SFTP_BYTES` — a **100 MiB hard cap per SFTP transfer**, which `_upload_impl` refuses to exceed while `_download_impl` only warns, the bytes being already on disk by then.
+
+**HTTP transport fails closed by design, and the gates are load-bearing.** Binding to anything other than loopback without `SSH_MCP_HTTP_TOKEN` raises at startup; a token shorter than 16 characters is rejected; DNS-rebinding protection is forced on, and a bare-wildcard `allowed_hosts` entry (`*`, `*:*`) is refused — though a *suffix* wildcard such as `*.internal.example.com` is deliberately permitted (the `allowed_hosts` gate in `server.py::_run_http`). Read that refusal set carefully before editing it: `"*.*"` is listed in it, but the `entry.startswith("*.")` `continue` on the next line fires first, so `*.*` currently lands on the **permitted** side. Disabling auth on a non-loopback bind additionally requires `SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK` — a deliberately verbose opt-in, because the endpoint executes shell commands. Do not add a code path that relaxes any of these, and note the server speaks plain HTTP: TLS is the reverse proxy's job.
 
 ## Testing
 
 Tests mirror modules (`test_ssh.py` ↔ `ssh.py`). `pytest-asyncio` runs in `asyncio_mode = "auto"`, so `async def test_*` needs no decorator. Hypothesis drives the redaction and dangerous-command property tests.
 
+Not every test file mirrors a module. `tests/test_input_limits.py` (18 tests) guards `max_command_bytes` at the tool boundary; `tests/test_logging.py` (7) and `tests/test_otel.py` (7) cover the observability wiring in `server.py`.
+
 Three test files assert *invariants* rather than behaviour, and are load-bearing — read them before changing what they guard:
 
-- `tests/test_ci_lint_determinism.py` — CI must not invoke a linter via `uvx`, lint tools must be `==`-pinned, and the `docker` job must depend on `audit`.
+- `tests/test_ci_lint_determinism.py` — CI must not invoke a linter via `uvx`, lint tools must be `==`-pinned, and the `docker` job must depend on `audit`. It guards considerably more than that: every action pinned to a 40-char commit SHA, every `uv sync` carrying `--locked`, `setup-uv` version-pinned, the `docker` job building exactly once, and `release.yml`'s `build` gating on test/lint/audit plus Trusted Publishing and the `pypi` environment. Assume any workflow edit is machine-checked.
 - `tests/test_dependency_floors.py` — every security-motivated version floor must hold *and* be declared in `pyproject.toml`.
 - `tests/test_sftp_confinement.py` — asserts `sftp.get`/`sftp.put` are **never called**, which is the whole point of the confinement design.
 
@@ -106,6 +110,8 @@ if result.error:            # SSH failure, timeout, blocked command, unknown ser
 
 The full state matrix is documented on `ExecResult` in `models.py`. Do not "normalise" one side to match the other without changing both the docstring and `formatting.py`.
 
+**`execute`, `upload` and `download` in `ssh.py` are thin tracing wrappers — the behaviour lives in `_execute_impl` / `_upload_impl` / `_download_impl`.** If you are told to change what `execute()` does, edit `_execute_impl`; the public method only opens an OTel span and delegates. Editing the wrapper is the obvious wrong turn here. OpenTelemetry is optional throughout: the `otel` extra in `pyproject.toml` installs the API only (operators bring their own SDK/exporter; the SDK is a dev dep for the in-memory exporter in `tests/test_otel.py`), and both `server.py::_span` and `ssh.py::_ssh_tracer` soft-import it and no-op when absent. **Spans are a leak surface — treat them like logs.** They record `ssh.command_length`, never the command itself, and error text is `_redact_secrets`'d and truncated to 200 characters. Do not add an attribute carrying a command, a path, or raw error output.
+
 **Comments explain *why*, and cite the incident.** The codebase carries its own history inline — `# Production incident 2026-04-11`, `# R5 finding #3`, `# panel iteration 2`. Match that register. A comment restating what the code does is noise; a comment naming the failure that motivated the code is why this repo is auditable.
 
 **Settings are frozen and reject unknown keys.** `models.py` uses `extra="forbid"` with `Field(ge=…, le=…)` ranges, so a typo in `servers.toml` fails loudly at load. Add validation there, not at call sites — and note that Pydantic does **not** validate defaults unless the field sets `validate_default=True`.
@@ -118,7 +124,9 @@ The full state matrix is documented on `ExecResult` in `models.py`. Do not "norm
 | `audit.yml` | daily cron + manual | `pip-audit` against `main`, so a new advisory surfaces on its own schedule instead of reddening an unrelated PR |
 | `release.yml` | tag `v*` | re-runs test/lint/audit → `build` (asserts tag == packaged version, emits CycloneDX SBOM) → `publish-pypi` → `github-release` |
 
-All third-party actions are pinned to a full commit SHA with a `# vX` comment, and `astral-sh/setup-uv` additionally pins a `version:` so `uv` itself cannot float. Keep both — an unpinned tool is how this repo previously had CI go red on commits that had passed days earlier. Never replace a SHA with a tag reference.
+**Every push to `main` publishes a container image.** The `docker` job's `PUBLISH` is `github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))` (`ci.yml:160`), so a merged PR pushes `latest` + `type=sha` tags to GHCR with **no environment gate and no human approval** — a tag is not the only path to a publish. PRs build and scan only. Two Trivy steps (CRITICAL severity) gate the promote, both reading `.trivyignore`.
+
+All third-party actions are pinned to a full commit SHA with a `# vX` comment, and `astral-sh/setup-uv` additionally pins a `version:` so `uv` itself cannot float. Keep both — an unpinned tool is how this repo previously had CI go red on commits that had passed days earlier. Never replace a SHA with a tag reference. None of this is prose-only convention: `tests/test_ci_lint_determinism.py` asserts it, so a workflow edit that drops a pin fails the suite.
 
 Publishing to PyPI uses **Trusted Publishing** (OIDC) behind a reviewer-gated `pypi` environment. PEP 740 attestations are on by default in the publish action — do not add an `attestations:` input.
 
@@ -134,9 +142,11 @@ Publishing to PyPI uses **Trusted Publishing** (OIDC) behind a reviewer-gated `p
 
 Most of these will break a build, a release, or production if ignored. The last two are different in kind — known debt and one unconfirmed suspicion — and are labelled as such so they are not mistaken for work to pick up.
 
-- **SFTP local paths are relative to `transfer_root`, not absolute (0.6.0, breaking).** `upload_file`/`download_file` reject absolute paths and `..`. Local files are opened one component at a time beneath a pinned root fd, refusing symlinks at *every* component, and `sftp.get`/`sftp.put` are deliberately never used — they re-resolve the path inside asyncssh, which is what made arbitrary writes to the operator's machine possible. Do not "simplify" this back to a path string.
+- **SFTP local paths are relative to `transfer_root`, not absolute (0.6.0, breaking).** `upload_file`/`download_file` reject absolute paths and `..`. Local files are opened one component at a time beneath a pinned root fd, refusing symlinks at *every* component, and `sftp.get`/`sftp.put` are deliberately never used — they re-resolve the path inside asyncssh, which is what made arbitrary writes to the operator's machine possible. Do not "simplify" this back to a path string. Four behaviour contracts ride along and are easy to break by accident: download is **no-clobber** (`O_CREAT|O_EXCL`) and *raises* rather than overwriting an existing local file; a failed download unlinks its own partial file via `_unlink_beneath`, which proves inode identity so a concurrent rename cannot redirect the unlink; intermediate directories under `transfer_root` must already exist — neither tool creates them (documented in the `upload_file`/`download_file` docstrings); and both directions refuse non-regular remote files via `sftp.stat(follow_symlinks=False)`. `transfer_root` itself is created `0700`, must be owned by the running user and must not be a symlink, and the whole subsystem is **POSIX-only** — `paths.py::ensure_root` fails closed without `dir_fd`/`O_NOFOLLOW`, so SFTP does not work on Windows at all.
 
 - **Do not optimise `_redact_secrets` without running the adversarial tests.** It has had four implementations; the first was a denial of service and the next two leaked credentials. A quadratic regex was a DoS; bounding the quantifiers made it stop matching past the bound; a positional scanner skipped a credential flag that followed a boolean flag (`docker run --rm --password=X`). It is now a token-wise scan where every token is classified independently, which is what makes skipping impossible. Redaction covers the **command string only, never command output**, and multi-word quoted values are only partially redacted — it is a tripwire, and the documented mitigation is to pass credentials via env files or stdin rather than argv.
+
+- **Never lower the `asyncssh` log levels — that suppression *is* a credential control.** `server.py::_configure_logging` raises the `asyncssh`, `asyncssh.sftp` and `asyncssh.connection` loggers to WARNING because asyncssh logs the full raw command, credentials included, at INFO via its own channel logger. That is "Production incident 2026-04-11 (round 2)", and `_redact_secrets` did **not** fix it: redaction only sanitizes the ssh-mcp logger, so the password leaked anyway. Turning those loggers back down to INFO to debug an SSH problem reopens the leak. Note also that `_configure_logging()` is called at *import* time and clears root handlers, so anything configuring logging around it will be overwritten.
 
 - **The dangerous-command list is a tripwire, not a security boundary.** `README.md` and `SECURITY.md` say so explicitly, and base64 / hex-escape / homoglyph / `$(...)` bypasses are acknowledged. Do not describe it as a security control, and do not widen it into a claim it cannot keep.
 
@@ -154,7 +164,7 @@ Most of these will break a build, a release, or production if ignored. The last 
 
 - **A test that touches config resolution must pin `$HOME` *and* `$XDG_CONFIG_HOME`.** `_get_config_path` consults `$XDG_CONFIG_HOME` first; GitHub runners set it and macOS usually does not, so pinning only `$HOME` produces a test that passes locally and fails in CI while resolving the developer's real config. The same class applies to inode-identity assertions: create a replacement file *before* unlinking the original, because ext4 reuses the freed inode number and APFS does not.
 
-- **`docs/` is gitignored.** Anything written there is local-only, so never reference a `docs/` path from committed documentation or code comments.
+- **`docs/` is gitignored** — along with `wiki/`, `claude/`, `codex/`, `.codex/`, `.claude/`, `logs/` and `.mcp.json`, all local-only working directories. Do not add a *new* reference to any of them from committed documentation or code. Two comments in `ssh.py` already cite one (`grep -n "01-approach" src/ssh_mcp/ssh.py`); they are pre-existing dangling references, not a pattern to follow. Note that gitignoring a directory does not untrack files already committed under it.
 
 - **`server.py` chains the MCP session-manager lifespan via the SDK's public `FastMCP.session_manager`.** An earlier version reached into Starlette's private `router.lifespan_context`; do not go back to it.
 
@@ -174,13 +184,14 @@ The dev loop is safe; **operating the tool is not**. Running the test suite touc
 **Ask first**
 - Changing anything under `.github/workflows/`, the `Dockerfile`, or `compose.yaml`
 - Bumping dependencies, or editing `uv.lock` / `pyproject.toml` version floors
-- Widening `[tool.ruff.lint] select`, or adding a `.gitleaksignore` entry
+- Widening `[tool.ruff.lint] select`, or adding a `.gitleaksignore` or `.trivyignore` entry — a `.trivyignore` line suppresses the CRITICAL-severity Trivy gate standing between a build and GHCR
 - Editing `SECURITY.md`, or the security-policy tables in `ssh.py` (`_DANGEROUS_PATTERNS`, `_SENSITIVE_PATHS`, the redaction rules)
 
 **Never without explicit approval**
 - **Calling the MCP tools against a real server** — `execute`, `execute_on_group`, `upload_file`, `download_file` run commands on live hosts. Use tests and fakes.
 - Reading, writing, or copying `~/.ssh/config`, `~/.ssh/*`, or `~/.config/ssh-mcp/servers.toml` — these hold real infrastructure details and key paths
 - `git push`, force-push, branch deletion, or committing to `main`
-- **Creating a `v*` tag — it publishes.** A tag starts *both* workflows: `release.yml` (PyPI, behind the reviewer-gated `pypi` environment) **and** `ci.yml`, whose `docker` job sets `PUBLISH=true` for `refs/tags/v*` and has **no environment gate** — so the container image reaches GHCR with no human approval. Do not treat a tag as safe merely because PyPI asks for a reviewer.
+- **Anything that lands a commit on `main` — merging a PR publishes a container image.** `ci.yml`'s `docker` job sets `PUBLISH=true` for pushes to `refs/heads/main` *as well as* `refs/tags/v*`, with **no environment gate**, so `latest` reaches GHCR with no human approval. Publishing is not gated on tagging.
+- **Creating a `v*` tag — it publishes twice.** A tag starts *both* workflows: `release.yml` (PyPI, behind the reviewer-gated `pypi` environment) **and** `ci.yml`'s ungated `docker` job. Do not treat a tag as safe merely because PyPI asks for a reviewer.
 - Rotating or printing any credential, or adding a real hostname to a tracked file
 - `docker push`, or anything that publishes an artifact

@@ -1,20 +1,36 @@
 # SSH MCP Server Inventory Example
 #
 # Connection details (host, port, user, key) are sourced from ~/.ssh/config automatically.
-# Server names below MUST match SSH config Host entries.
+# Server names below are looked up as SSH config Host entries, unless the block
+# sets `hostname` explicitly — then the name is just a label.
 
 [settings]
 # Path to SSH config file (supports ~ expansion). Host aliases, port, user,
 # identity file, and ProxyJump chains are read from here.
 ssh_config_path = "~/.ssh/config"
 
-# Default command execution timeout in SECONDS. Range 1..3600. Individual
-# servers may override via `timeout = N` in their [servers.*] block.
+# SSH connection-establishment timeout in SECONDS. Range 1..3600. This is NOT
+# the command execution timeout: that is the `timeout` argument of the
+# execute / execute_on_group tools (default 30), which individual servers may
+# override via `timeout = N` in their [servers.*] block.
 command_timeout = 30
 
-# Maximum bytes to capture from stdout/stderr per command. Longer output is
-# truncated with a `[... output truncated]` marker. Minimum 1024.
+# Maximum bytes to capture PER STREAM: stdout and stderr are each capped at
+# this value independently, so the combined worst case is 2x. Longer output is
+# truncated with a `[... output truncated at N bytes]` marker.
+# Range 1024..10485760.
 max_output_bytes = 51200
+
+# Maximum size in bytes of a command string accepted by the execute tools.
+# Rejected at the tool boundary before the command is processed further.
+# Range 1024..1048576.
+max_command_bytes = 65536
+
+# Directory that SFTP transfers are confined to: every local path passed to
+# upload_file / download_file must resolve beneath it. Defaults to
+# $XDG_DATA_HOME/ssh-mcp/transfers, else ~/.local/share/ssh-mcp/transfers.
+# The SSH_MCP_TRANSFER_ROOT environment variable takes precedence over this.
+# transfer_root = "~/.local/share/ssh-mcp/transfers"
 
 # Seconds an SSH connection may be idle before the background eviction loop
 # closes it to free resources. Minimum 10. Eviction scan interval is 60s.
@@ -40,6 +56,7 @@ staging = { description = "Staging servers" }
 web = { description = "Web application servers" }
 database = { description = "Database servers" }
 monitoring = { description = "Monitoring and observability" }
+bastions = { description = "Bastion / jump hosts" }
 
 # =============================================================================
 # SERVER DEFINITIONS
@@ -56,11 +73,29 @@ description = "Production database: PostgreSQL 15 (Ubuntu 22.04)"
 groups = ["production", "database"]
 user = "dbadmin"
 
-# Server accessed via jump host (bastion)
+# Jump host, defined explicitly with connection overrides instead of relying on
+# ~/.ssh/config. Any name used as a `jump_host` below MUST have its own
+# [servers.*] block in THIS file — an SSH config Host entry alone is not enough,
+# and a dangling reference warns at load and fails the connection. Chains are
+# capped at 5 hops; cycles are rejected at load time. Kept in its own group so
+# fleet-wide `execute_on_group` calls do not sweep it in.
+[servers.bastion]
+description = "Bastion host fronting the staging VPC"
+groups = ["bastions"]
+hostname = "bastion.example.com"
+port = 22
+user = "jump"
+identity_file = "~/.ssh/id_ed25519_bastion"
+
+# Server accessed via jump host (bastion), with a default working directory
+# (prepended as `cd` to every command) and a per-server timeout override that
+# wins over the caller's `timeout` argument. Range 1..3600.
 [servers.web-staging-01]
 description = "Staging web server: nginx, node.js (Ubuntu 22.04)"
 groups = ["staging", "web"]
 jump_host = "bastion"
+default_dir = "/srv/app"
+timeout = 120
 
 # Server with multiple groups and custom user
 [servers.monitor-01]

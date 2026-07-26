@@ -14,10 +14,13 @@ def format_server_table(servers: list[ServerConfig], filter_label: str = "") -> 
 
     Args:
         servers: List of server configurations to display
-        filter_label: Optional filter description for footer (e.g., "group: prod")
+        filter_label: Optional filter description, rendered in parentheses in
+            the footer. Callers supply the whole phrase including any leading
+            space — ``server.py`` passes ``" in group 'prod'"``.
 
     Returns:
-        Formatted text table with columns: SERVER, GROUPS, DESCRIPTION
+        Formatted text table with columns: SERVER, GROUPS, DESCRIPTION, or
+        the bare string "No servers found." when ``servers`` is empty
 
     Example:
         >>> servers = [ServerConfig(name="web1", description="Web server", groups=("prod",))]
@@ -68,7 +71,8 @@ def format_group_table(groups: list[GroupConfig], server_counts: dict[str, int])
         server_counts: Mapping of group name to number of servers in that group
 
     Returns:
-        Formatted text table with columns: GROUP, SERVERS, DESCRIPTION
+        Formatted text table with columns: GROUP, SERVERS, DESCRIPTION, or
+        the bare string "No groups found." when ``groups`` is empty
 
     Example:
         >>> groups = [GroupConfig(name="prod", description="Production servers")]
@@ -104,18 +108,18 @@ def format_group_table(groups: list[GroupConfig], server_counts: dict[str, int])
 def format_exec_result(result: ExecResult) -> str:
     """Format a single command execution result.
 
-    N3 fix: ``models.py`` (``ExecResult`` docstring) documents FOUR reachable
-    states of the ``(error, exit_code)`` pair, including ``error is not
-    None`` + ``exit_code >= 0`` — "command ran but had issues" (e.g. a
-    tripwire warning attached to output that still exit-coded 0, or a
-    partial-output condition). The previous version of this function
+    N3 fix: ``models.py`` (``ExecResult`` docstring) documents the states of
+    the ``(error, exit_code)`` pair. The previous version of this function
     treated *any* non-empty ``error`` as a pure execution failure and
     returned immediately, discarding ``stdout``/``stderr``/``exit_code`` —
     exactly the diagnostic evidence a user needs when a command ran but the
     server also flagged an issue. This version renders every field that is
-    actually populated, for all four documented states:
+    actually populated, for all four states of the pair:
 
-      * ``error is None`` + ``exit_code >= 0``: command + output + exit code.
+      * ``error is None`` + numeric ``exit_code``: command + output + exit
+        code. ``-1`` lands here too — asyncssh reports it for a process
+        killed by a signal, most often our own terminate() after the output
+        budget was spent, so the output carries the truncation marker.
       * ``error is None`` + ``exit_code is None``: same as above with an
         "unknown" exit code (should not happen per the model contract, but
         rendered rather than crashing).
@@ -123,16 +127,19 @@ def format_exec_result(result: ExecResult) -> str:
         produced a result (SSH error, timeout, server not found, tripwire
         block, fail_fast cancellation) — no exit-code line, since there
         isn't one.
-      * ``error is not None`` + ``exit_code >= 0``: command + output +
-        ERROR line + exit code, so the user sees both what happened and
-        what the server flagged about it.
+      * ``error is not None`` + numeric ``exit_code``: not reachable today —
+        ``models.py`` guarantees every path that sets ``error`` also sets
+        ``exit_code=None`` — but handled defensively rather than swallowed:
+        command + output + ERROR line + exit code, so a future "ran, but the
+        server flagged it" state would still show both.
 
     Args:
         result: Execution result to format
 
     Returns:
         Formatted text showing command, output, error (if any), and exit
-        status (if a command actually ran)
+        status — the exit line is omitted only when ``error`` is set and
+        there is no exit code to report
 
     Example:
         >>> result = ExecResult(
@@ -169,8 +176,8 @@ def format_exec_result(result: ExecResult) -> str:
     # A None exit_code alongside an error means the command never completed
     # (see docstring above) — there is no exit status to report. Otherwise
     # (including the "should not happen" error-is-None/exit_code-is-None
-    # case) report the exit code, using "unknown" as the documented
-    # fallback rather than fabricating a value.
+    # case) report the exit code, falling back to the literal "unknown"
+    # rather than fabricating a value.
     if result.exit_code is None and result.error:
         return "\n".join(lines)
 
@@ -184,12 +191,21 @@ def format_exec_result(result: ExecResult) -> str:
 def format_group_results(results: list[ExecResult], group_name: str) -> str:
     """Format multiple command execution results from a group.
 
+    This is a per-server digest, not the full diagnostic dump that
+    ``format_exec_result`` produces: a result carrying an ``error`` is
+    rendered as a lone ``[server] ERROR: ...`` line, and its ``stdout``,
+    ``stderr``, ``exit_code`` and ``duration_ms`` are deliberately dropped.
+
     Args:
         results: List of execution results to format
         group_name: Name of the group that was executed
 
     Returns:
-        Formatted text showing all results with a summary
+        Formatted text showing all results with a summary. A result counts as
+        succeeded only when ``error`` is None and ``exit_code == 0``; a
+        non-zero code and a missing one (``None``, rendered "unknown") both
+        count as failed. When ``results`` is empty, returns a "(0 servers)"
+        header followed by "No servers in group."
 
     Example:
         >>> results = [

@@ -7,6 +7,11 @@ This module defines the MCP server entry point with 6 tools for SSH operations:
 - execute_on_group: Run command on multiple servers in parallel
 - upload_file: Upload via SFTP
 - download_file: Download via SFTP
+
+It also hosts the process entry point ``main``, which serves those tools over
+either the stdio or the streamable HTTP transport (see ``_run_http``) and
+dispatches the ``ssh-mcp healthcheck`` CLI subcommand used by the container
+health check.
 """
 
 from __future__ import annotations
@@ -227,7 +232,7 @@ _atexit_registered: bool = False
 
 
 def _cleanup_connections() -> None:
-    """Best-effort SSH cleanup on process exit (stdio transport only).
+    """Best-effort SSH cleanup on process exit (registered for all transports).
 
     R5 audit: the ``loop.create_task()`` branch was dead code — by the
     time ``atexit`` fires the event loop is already torn down, so
@@ -252,7 +257,9 @@ async def _init() -> None:
     """Initialize registry and SSH manager on first tool call.
 
     Uses SSH_MCP_CONFIG environment variable if set, otherwise falls back to
-    XDG standard path (~/.config/ssh-mcp/servers.toml) or development path.
+    the XDG standard path (``$XDG_CONFIG_HOME``, or ``~/.config`` when that is
+    unset, + ``/ssh-mcp/servers.toml``) or the development path — see
+    ``_get_config_path`` for the full chain.
     """
     global _registry, _ssh
 
@@ -301,7 +308,9 @@ def _mcp_tool(func: F) -> F:
 
     Collapses the duplicated try/except boilerplate from each MCP tool into a
     single declarative wrapper. Preserves ToolError passthrough so structured
-    errors raised by inner code propagate unchanged. Any other exception is
+    errors raised by inner code propagate unchanged, and re-raises
+    ``asyncio.CancelledError`` untouched so a cancelled call stays cancelled
+    instead of being converted into a tool failure. Any other exception is
     logged with a traceback and re-raised as a ToolError so the MCP client
     receives `isError=true` with a useful message.
 
@@ -342,7 +351,10 @@ async def list_servers(group: str | None = None) -> str:
                Use list_groups to see available group names.
 
     Returns:
-        Formatted table of servers with name, groups, and description.
+        Formatted table of servers with name, groups, and description. An
+        unknown ``group`` is reported as a plain ``"Error: ..."`` string
+        rather than raised as a tool error, and a group with no members
+        returns ``"No servers found in group '<name>'"``.
     """
     registry = _get_registry()
 
@@ -430,13 +442,23 @@ async def execute(
         command: Shell command to execute on the remote server (exactly as it
                 would be typed at a bash prompt). Rejected if it exceeds
                 ``max_command_bytes`` (default 65536 encoded UTF-8 bytes).
-        timeout: Command timeout in **seconds**. Default 30. Range 1–3600.
+        timeout: Command timeout in **seconds**. Default 30. Not range-checked,
+                and NOT authoritative: a ``timeout`` set on the server's entry
+                in servers.toml overrides this argument outright, so a
+                per-server 30 wins over a caller-supplied 600.
         working_dir: Absolute remote directory to cd into before running the
                 command. Uses the server's ``default_dir`` from servers.toml
                 if omitted, or the SSH login directory if neither is set.
-        force: If True, bypass the dangerous-command detection regex. Use only
-                for audited bulk operations — the block list catches rm -rf /,
-                mkfs, dd-to-disk, chmod 777 /, and fork bombs. Default False.
+        force: If True, bypass the dangerous-command detection patterns. Use
+                only for audited bulk operations. The block list is ~25 regexes
+                and is broader than "obviously destructive": besides rm -rf /,
+                mkfs, dd-to-disk, chmod 777 /, redirects into /dev/sd* and
+                /etc/{passwd,shadow,gshadow,sudoers}, find -delete / -exec rm,
+                shred / wipefs / blkdiscard / sgdisk on /dev/, partition-table
+                edits, and fork bombs, it also rejects ordinary interpreter
+                wrappers — ``bash -c ...``, ``python3 -c ...`` (also perl/ruby
+                ``-c``/``-e``), ``eval "..."``, and ``base64 -d | sh``. Harmless
+                commands in those forms need ``force=True`` too. Default False.
         dry_run: If True, do NOT connect or execute. Return a preview describing
                 what would run (server, command, working_dir, timeout, force).
                 Dangerous-command detection still runs so rejection can be
@@ -445,7 +467,11 @@ async def execute(
 
     Returns:
         Formatted command execution result with stdout, stderr, and exit code.
-        Long output is truncated at ``max_output_bytes`` (default 50 KiB).
+        Long output is truncated at ``max_output_bytes`` (default 50 KiB) PER
+        STREAM — stdout and stderr get independent budgets, so the combined
+        worst case is 2x that setting. A truncated stream ends with
+        ``[... output truncated at N bytes]``, and hitting the cap TERMINATES
+        the remote process rather than letting it keep writing.
     """
     ssh = _get_ssh()
     _check_command_length(command, _get_registry().settings.max_command_bytes)
@@ -467,7 +493,9 @@ async def execute_on_group(
     """Execute a shell command on all servers in a group in parallel.
 
     Concurrency is capped by the ``max_parallel_hosts`` setting (default 10;
-    configure in ``[settings]`` of servers.toml, range 1–100).
+    configure in ``[settings]`` of servers.toml, range 1–100). The semaphore is
+    PROCESS-WIDE, not per call: concurrent execute_on_group calls share the same
+    slots and therefore serialise against each other for their share of them.
 
     Args:
         group: Group name (e.g. 'production', 'web'). Use list_groups to see
@@ -475,7 +503,9 @@ async def execute_on_group(
         command: Shell command to execute on every server in the group.
                 Rejected if it exceeds ``max_command_bytes`` (default 65536
                 encoded UTF-8 bytes).
-        timeout: Per-server command timeout in **seconds**. Default 30.
+        timeout: Per-server command timeout in **seconds**. Default 30. Not
+                range-checked, and overridden per server by a ``timeout`` set
+                on that server's entry in servers.toml.
                 Each server has its own timer; slow servers do NOT extend the
                 per-server limit for others.
         working_dir: Absolute remote directory to cd into on each server.
@@ -483,8 +513,10 @@ async def execute_on_group(
         fail_fast: If True, cancel remaining tasks as soon as any server
                 returns a non-zero exit code or errors. Default False —
                 run all servers to completion and report each result.
-        force: If True, bypass the dangerous-command detection regex. Use only
-                for audited bulk operations. Default False.
+        force: If True, bypass the dangerous-command detection patterns. Use
+                only for audited bulk operations. The same broad block list
+                described under ``execute`` applies here — including plain
+                ``bash -c`` / ``python3 -c`` / ``eval`` wrappers. Default False.
         dry_run: If True, do NOT connect or execute anywhere. Return a
                 per-server preview describing what would run. Dangerous-
                 command detection still applies. Useful for previewing
@@ -511,16 +543,32 @@ async def upload_file(
 ) -> str:
     """Upload a file to a remote server via SFTP.
 
+    Files larger than 100 MiB are refused outright — use rsync or scp for those.
+
     Args:
         server: Server name (e.g. 'pro-dicentra').
         local_path: Path to the local file, RELATIVE to the configured
                 ``transfer_root`` (see [settings] in servers.toml, or the
                 ``SSH_MCP_TRANSFER_ROOT`` environment variable). Absolute
-                paths and ``..`` are rejected. Sub-directories are allowed
-                (e.g. ``'reports/q1.csv'``), but every intermediate
+                paths, ``..``, ``.`` components and embedded NUL bytes are
+                rejected, as is a symlink at ANY component of the path.
+                Sub-directories are allowed (e.g. ``'reports/q1.csv'``),
+                but every intermediate
                 directory must already exist under ``transfer_root`` —
-                upload_file does not create them.
-        remote_path: Absolute destination path on remote server.
+                upload_file does not create them. ``transfer_root`` itself must
+                be a real directory owned by the running user with mode 0700,
+                or every transfer fails.
+        remote_path: Destination path on the remote server — normally absolute,
+                though a relative path is not rejected, just resolved by the
+                remote SFTP server against the SSH login directory. Rejected if
+                it contains ``..`` anywhere (even inside an otherwise legitimate
+                filename) or matches the sensitive-path denylist
+                (``/etc/shadow``, ``/etc/passwd``, ``.ssh/*``,
+                ``.aws/credentials``, ``.kube/config``, ``.netrc``, …). An
+                existing REGULAR file at the destination is silently
+                OVERWRITTEN — unlike download_file, upload does not no-clobber;
+                an existing non-regular target (symlink, device, FIFO) is
+                refused.
 
     Returns:
         Confirmation message with file size.
@@ -540,17 +588,27 @@ async def download_file(
 
     Args:
         server: Server name (e.g. 'pro-dicentra').
-        remote_path: Absolute path to remote file. Must be a regular file —
+        remote_path: Path to the remote file — normally absolute, though a
+                relative path is not rejected, just resolved by the remote SFTP
+                server against the SSH login directory. Must be a regular file —
                 symlinks, devices, FIFOs, and other non-regular remote
-                files are refused.
+                files are refused. Rejected if it contains ``..`` anywhere or
+                matches the same sensitive-path denylist upload_file enforces.
+                Size is NOT capped here (upload's 100 MiB limit has no download
+                counterpart) — an oversized transfer only logs a warning, after
+                the bytes are already on disk.
         local_path: Destination path, RELATIVE to the configured
                 ``transfer_root`` (see [settings] in servers.toml, or the
                 ``SSH_MCP_TRANSFER_ROOT`` environment variable). Absolute
-                paths and ``..`` are rejected. Sub-directories are allowed,
+                paths, ``..``, ``.`` components and embedded NUL bytes are
+                rejected, as is a symlink at any component of the path.
+                Sub-directories are allowed,
                 but every intermediate directory must already exist under
                 ``transfer_root``. NO-CLOBBER: if a file already exists at
                 the destination, the download fails rather than silently
                 overwriting it — remove or rename the existing file first.
+                A failed or cancelled download unlinks the partial file it
+                created, so a retry is not blocked by its own leftovers.
 
     Returns:
         Confirmation message with file size.
@@ -794,13 +852,22 @@ def _run_http() -> None:
     * ``SSH_MCP_HTTP_TOKEN`` — shared bearer secret (required when
       ``SSH_MCP_HTTP_AUTH=bearer`` and bind is non-localhost). When set,
       every request must carry ``Authorization: Bearer <token>`` or 401.
+    * ``SSH_MCP_HTTP_TOKEN_FILE`` — path read for the bearer secret when
+      ``SSH_MCP_HTTP_TOKEN`` is empty or unset (Docker/Compose secret
+      mounts). An unreadable path aborts startup.
     * ``SSH_MCP_HTTP_NETWORK_NO_AUTH`` — magic-string opt-out for the
       ``auth=none`` + non-localhost combination. Must equal literal
       ``I_ACCEPT_RCE_RISK`` to take effect.
     * ``SSH_MCP_HTTP_STATELESS`` — if ``true``, FastMCP runs in stateless
       mode. Recommended for load-balanced or serverless deployments.
     * ``SSH_MCP_HTTP_ALLOWED_HOSTS`` — comma-separated extra Host headers
-      for DNS-rebinding protection (in addition to localhost).
+      for DNS-rebinding protection (in addition to localhost). Protection is
+      always ON and cannot be disabled; bare wildcard entries (``*``, ``*:*``,
+      ``*.*``) abort startup because they would silently defeat it. Wildcard
+      SUFFIXES such as ``*.internal.example.com`` are accepted.
+    * ``SSH_MCP_HTTP_KEEPALIVE_TIMEOUT`` / ``SSH_MCP_HTTP_LIMIT_CONCURRENCY``
+      / ``SSH_MCP_HTTP_BACKLOG`` — uvicorn tuning knobs, see
+      ``_parse_http_tuning`` for defaults and accepted ranges.
     """
     import uvicorn
 
@@ -1013,8 +1080,9 @@ def _parse_http_tuning() -> tuple[int, int, int]:
     ``SSH_MCP_HTTP_LIMIT_CONCURRENCY``, and ``SSH_MCP_HTTP_BACKLOG``.
 
     Raises:
-        RuntimeError: if any value is non-numeric, negative, or (for
-            ``limit_concurrency``) zero.
+        RuntimeError: if any value is non-numeric or negative, or is zero for
+            ``limit_concurrency`` or ``backlog`` — only
+            ``SSH_MCP_HTTP_KEEPALIVE_TIMEOUT`` accepts 0.
     """
 
     def _parse_int(name: str, default: int, *, min_value: int) -> int:
@@ -1040,7 +1108,11 @@ def _parse_http_tuning() -> tuple[int, int, int]:
 def main() -> None:
     """Entry point for console script (uvx ssh-mcp).
 
-    Dispatches on ``SSH_MCP_TRANSPORT``:
+    Handles one CLI subcommand before anything else: ``ssh-mcp healthcheck``
+    runs ``ssh_mcp.healthcheck.run()`` and exits 0 or 1 without opening a socket
+    or starting a transport. This is what the Dockerfile HEALTHCHECK invokes.
+
+    Otherwise dispatches on ``SSH_MCP_TRANSPORT``:
 
     * ``stdio`` (default) — classic MCP stdio subprocess transport,
       used by Claude Desktop / Claude Code via ``uvx ssh-mcp``.

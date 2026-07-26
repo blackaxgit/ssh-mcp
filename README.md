@@ -20,6 +20,11 @@ Connection details are read from your existing `~/.ssh/config`. No credentials a
 - Server groups for organizing hosts (production, staging, per-service)
 - SSH config integration — reads host, port, user, and identity from `~/.ssh/config`
 - Custom config path via `SSH_MCP_CONFIG` environment variable
+- `dry_run` previews — see which server, command, working directory and timeout would be used, without connecting
+- SFTP local-path confinement — every local path stays inside a configured `transfer_root`
+- stdio or streamable-HTTP transport, with bearer-token auth for network deployments
+- Built-in `ssh-mcp healthcheck` subcommand for Docker's `HEALTHCHECK`
+- Optional OpenTelemetry tracing via the `otel` extra
 
 ## Quick Start
 
@@ -58,7 +63,7 @@ services:
       - ~/.ssh:/home/sshmcp/.ssh:ro
 ```
 
-The image uses a non-root `sshmcp` user (uid 1000). Mount your SSH keys and config file read-only. See [compose.yaml](compose.yaml) in the repo for a working example.
+The image uses a non-root `sshmcp` user (uid 1000). Mount your SSH keys and config file read-only. [compose.yaml](compose.yaml) in the repo carries a fuller example — it builds from the local Dockerfile rather than pulling the published image, and includes the HTTP-transport service, `ulimits` and healthcheck guidance omitted above.
 
 ### Create a config file
 
@@ -146,6 +151,12 @@ claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx ssh-mcp
 | `SSH_MCP_HTTP_KEEPALIVE_TIMEOUT` | `2` | uvicorn `timeout_keep_alive` in seconds. Idle HTTP/1.1 connections are closed after this many seconds. v0.4.0 default (5s) accumulated enough concurrent connections under bursty n8n traffic to exhaust the container's 1024 fd limit — v0.4.1 default 2s is safer for spiky clients. Increase to 5–10 for long-polling MCP clients behind a load balancer. |
 | `SSH_MCP_HTTP_LIMIT_CONCURRENCY` | `256` | uvicorn `limit_concurrency`. Max simultaneous in-flight requests before returning HTTP 503. Prevents unbounded growth under burst load. Tune up for high-QPS deployments; tune down on small containers. |
 | `SSH_MCP_HTTP_BACKLOG` | `128` | uvicorn `backlog` — TCP listen backlog for the accept queue. Smaller caps SYN-flood exposure. |
+| `SSH_MCP_HTTP_STATELESS` | `false` | Set to `true` for stateless sessions (recommended for load-balanced or serverless deployments). Default is stateful with server-side sessions. |
+| `SSH_MCP_HTTP_ALLOWED_HOSTS` | — | Comma-separated extra Host-header values the SDK's DNS-rebinding protection should permit (e.g. `ssh-mcp.internal:*,api.example.com:8000`). Localhost aliases are always permitted. |
+| `SSH_MCP_TRANSFER_ROOT` | `$XDG_DATA_HOME/ssh-mcp/transfers` | Directory SFTP transfers are confined to. Takes precedence over `transfer_root` in `[settings]`. See [Local path confinement](#security). |
+| `XDG_CONFIG_HOME` | `~/.config` | Honoured when searching for `ssh-mcp/servers.toml` (see [Config file location](#config-file-location)). |
+| `XDG_DATA_HOME` | `~/.local/share` | Base directory for the default transfer root. |
+| `HYPOTHESIS_PROFILE` | `dev` | For local development / CI only. Set to `ci` to run property-based tests with `max_examples=200` instead of `50`. |
 
 **fd exhaustion mitigation:** the Docker base image inherits a 1024 fd limit by default. Under sustained burst traffic that can run out quickly. Raise it in your compose file:
 
@@ -159,9 +170,6 @@ ssh-mcp:
 ```
 
 Pair that with the `SSH_MCP_HTTP_KEEPALIVE_TIMEOUT` / `SSH_MCP_HTTP_LIMIT_CONCURRENCY` knobs above for a full fix.
-| `SSH_MCP_HTTP_STATELESS` | `false` | Set to `true` for stateless sessions (recommended for load-balanced or serverless deployments). Default is stateful with server-side sessions. |
-| `SSH_MCP_HTTP_ALLOWED_HOSTS` | — | Comma-separated extra Host-header values the SDK's DNS-rebinding protection should permit (e.g. `ssh-mcp.internal:*,api.example.com:8000`). Localhost aliases are always permitted. |
-| `HYPOTHESIS_PROFILE` | `dev` | For local development / CI only. Set to `ci` to run property-based tests with `max_examples=200` instead of `50`. |
 
 ### Running over HTTP
 
@@ -225,7 +233,7 @@ Docker's `HEALTHCHECK` directive invokes automatically. No inline Python, no
 - Reads the same auth env vars as the server (`SSH_MCP_HTTP_TOKEN`, `SSH_MCP_HTTP_TOKEN_FILE`, `SSH_MCP_HTTP_AUTH`) — never logs the token
 - Exits 0 if healthy, 1 otherwise
 - Uses Python stdlib only (no `curl`/`wget` dependency)
-- 3-second hard timeout per probe
+- Applies a 3-second timeout to the HTTP probe. The stdio probe has no timeout of its own and relies on Docker's `--timeout=5s` (importing the server costs ~0.3s)
 
 Run manually for debugging:
 
@@ -249,6 +257,23 @@ healthcheck:
   retries: 3
   start_period: 10s
 ```
+
+### Tracing (OpenTelemetry)
+
+Tracing is optional and off unless `opentelemetry-api` is importable:
+
+```bash
+uv pip install 'ssh-mcp[otel]'
+```
+
+The extra installs the **API layer only** — the SDK and exporter are yours to choose, so ssh-mcp stays lightweight for anyone who does not trace. Install and configure `opentelemetry-sdk` plus an exporter (OTLP, Jaeger, Tempo) yourself; without an SDK the API is a no-op and nothing is emitted.
+
+Spans produced:
+
+- `mcp.tool.<name>` — one per MCP tool call, tagged `mcp.tool.name`. Exceptions are recorded with `StatusCode.ERROR`.
+- `ssh.execute`, `ssh.upload`, `ssh.download` — the SSH/SFTP operation inside the tool call.
+
+Span attributes go through the same credential redaction as the audit log (see [Security](#security)).
 
 ### Reverse proxy deployment (auth at the edge)
 
@@ -281,7 +306,7 @@ For localhost binds without auth, no acknowledgement is needed — that matches 
 Checked in order:
 
 1. `$SSH_MCP_CONFIG` environment variable
-2. `~/.config/ssh-mcp/servers.toml` (default)
+2. `$XDG_CONFIG_HOME/ssh-mcp/servers.toml`, falling back to `~/.config/ssh-mcp/servers.toml` (default)
 3. `config/servers.toml` relative to the package (development only)
 
 Example `servers.toml`:
@@ -289,11 +314,12 @@ Example `servers.toml`:
 ```toml
 [settings]
 ssh_config_path = "~/.ssh/config"
-command_timeout = 30          # seconds, range 1..3600
-max_output_bytes = 51200      # truncate captured output at this many bytes
+command_timeout = 30          # SSH *connect* timeout in seconds, range 1..3600
+max_output_bytes = 51200      # truncate captured output at this many bytes, per stream
+max_command_bytes = 65536     # reject longer command strings at the tool boundary (1024..1048576)
 connection_idle_timeout = 300 # seconds; eviction scan runs every 60s
 known_hosts = true            # false removes MITM protection
-max_parallel_hosts = 10       # concurrency cap for execute_on_group (1..100)
+max_parallel_hosts = 10       # process-wide concurrency cap for group execution (1..100)
 
 [groups]
 production = { description = "Production servers" }
@@ -314,7 +340,14 @@ groups      = ["production"]
 user        = "dbadmin"
 ```
 
-Per-server overrides (`user`, `jump_host`) take precedence over `~/.ssh/config`. See [config/servers.example.toml](config/servers.example.toml) for the full reference.
+Note two things about the timeouts, because the names invite confusion:
+
+- `command_timeout` is the **SSH connection-establishment** timeout, not the command execution timeout.
+- Per-command timeout comes from the `timeout` argument of `execute` / `execute_on_group` (default 30) — unless the server block sets `timeout = N`, which **wins over the caller's argument**.
+
+`max_parallel_hosts` bounds the whole process, not a single call: the semaphore is built once at startup, so concurrent `execute_on_group` calls share the same budget rather than each getting their own.
+
+Per-server overrides (`hostname`, `port`, `user`, `identity_file`, `jump_host`, `default_dir`, `timeout`) take precedence over `~/.ssh/config`. See [config/servers.example.toml](config/servers.example.toml) for the annotated reference.
 
 Restrict config file permissions to your user:
 
@@ -328,30 +361,48 @@ chmod 600 ~/.config/ssh-mcp/servers.toml
 |------|-------------|
 | `list_servers` | List configured servers; optionally filter by group |
 | `list_groups` | List server groups with member counts |
-| `execute` | Run a shell command on a single server (supports `force` to bypass dangerous-command detection) |
-| `execute_on_group` | Run a command on all servers in a group (parallel; supports `fail_fast` and `force`) |
+| `execute` | Run a shell command on a single server (supports `force` to bypass dangerous-command detection, and `dry_run`) |
+| `execute_on_group` | Run a command on all servers in a group (parallel; supports `fail_fast`, `force` and `dry_run`) |
 | `upload_file` | Upload a file to a server via SFTP. Local path is relative to `transfer_root` |
 | `download_file` | Download a file from a server via SFTP. Local path is relative to `transfer_root`; will not overwrite |
 
+`dry_run=true` on either execute tool returns a `[DRY RUN]` preview of the server, command, working directory, timeout and `force` flag without opening a connection. Dangerous-command detection still runs, so a rejection can be previewed; if `force=true` *would* bypass a match, the preview carries an explicit `⚠️ DANGEROUS` banner.
+
+Command strings longer than `max_command_bytes` (default 65536 encoded UTF-8 bytes) are rejected at the tool boundary, before redaction or dangerous-command matching runs. Single SFTP transfers are capped at 100 MiB: an oversized upload is refused outright, an oversized download only logs a warning (the bytes are already on disk). Use `rsync` or `scp` for anything larger.
+
 ## Security
 
-**Dangerous command blocking.** ssh-mcp rejects commands that match known destructive patterns — `rm -rf /`, `rm -rf ~`, `find / -delete`, `find / -exec rm`, `shred /dev/*`, `wipefs /dev/*`, `mkfs`, `dd if=...`, `> /dev/sd*`, `chmod 777 /`, fork bombs (spaced and adjacent variants) — unless the tool caller passes `force=true`. ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normalized to spaces before matching, so `rm\x00-rf /` is caught just like `rm -rf /`. The regex is fuzz-tested with Hypothesis on every CI run.
+**Dangerous command blocking.** ssh-mcp rejects commands that match known destructive patterns unless the tool caller passes `force=true`:
+
+- Recursive deletes of `/`, `~`, `$HOME`, `$USER` — combined (`rm -rf /`) and split (`rm -r -f /`, `rm --recursive --force /`) flag forms, in any flag order
+- `find / -delete`, `find / -exec rm`
+- Block-device wipes: `shred /dev/*`, `wipefs /dev/*`, `blkdiscard /dev/*`, `sgdisk -Z /dev/*`
+- Partition-table destruction: `parted /dev/… mklabel`, `fdisk /dev/sd*`
+- `mkfs`, `dd if=…` and the reordered `dd of=… if=…` form
+- Redirects into a block device or auth database: `> /dev/sd*`, `> /dev/nvme*`, `> /dev/hd*`, `> /etc/{passwd,shadow,gshadow,sudoers}`
+- `chmod 777 /` — flag before *or* after the mode (`chmod -R 777 /`, `chmod 777 -R /`)
+- Fork bombs (spaced and adjacent variants)
+- Payload-execution wrappers: `base64 -d | bash|sh|zsh|python|perl|ruby`, `eval "…"`, `python|python3|perl|ruby -c`, `bash -c`
+
+> **Note the last bullet — it catches ordinary commands too.** `bash -c '…'`, `python3 -c '…'` and `eval …` are blocked by default even when entirely benign. Wrap them differently (a script file, a heredoc) or pass `force=true` for an audited call.
+
+ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normalized to spaces before matching, so `rm\x00-rf /` is caught just like `rm -rf /`. The regex is fuzz-tested with Hypothesis on every CI run.
 
 > **This is a TRIPWIRE, not a security boundary.** The regex catches obvious accidents and shortcut destructive commands. It does NOT defend against a motivated attacker:
-> - Base64-encoded payloads (`echo <b64> | base64 -d | bash`) bypass by design
+> - The base64/`eval`/`-c` wrappers above are matched *literally*; any rewrite the regex does not spell out (a different decoder, a temp file, `sh <<'EOF'`) gets through
 > - Shell hex escapes (`$'\x72\x6d -rf /'`) are interpreted AFTER regex matching
 > - Unicode homoglyphs (Cyrillic `р`, Greek `ρ`) do not match Latin `r`
-> - Indirection via `$(...)`, `` `...` ``, `eval`, `python -c`, etc. can hide intent
+> - Indirection via `$(...)` and `` `...` `` can hide intent — those are not matched at all
 >
 > If you need real isolation for untrusted tool callers, sandbox at a lower layer: run ssh-mcp inside a container with a restricted SSH config, use `ForceCommand` on the managed servers, or audit `force=false` usage via the structured logs. The dangerous-command filter exists to stop LLM accidents and typos, not adversaries.
 
-When `force=true` is used, the audit log records the bypass explicitly so the operator has a clean paper trail. Do not grant `force=true` to untrusted MCP clients.
+**The bypass is not recorded in the audit log.** Audit records carry `server`, `command`, `exit_code` and `duration_ms` only; `force` is emitted solely as an OpenTelemetry span attribute (`ssh.force`), and therefore only when the optional `otel` extra is installed and an exporter is configured. A block is logged as a warning on the operational logger, not the audit logger. If you need a paper trail for bypasses, export traces or withhold `force=true` at the MCP client. Do not grant `force=true` to untrusted MCP clients.
 
 **Credential redaction in logs.** ssh-mcp automatically redacts known credential patterns (MySQL `-p<pass>`, `--password=`, `PGPASSWORD=`, `Authorization: Bearer`, URL basic-auth `user:pass@host`, plus any env var ending in `_PASSWORD`, `_SECRET`, `_TOKEN`, `_KEY`, `_CREDENTIAL`, `_PWD`) from audit logs and OTel span attributes before they reach stderr or trace backends. The asyncssh internal channel logger is suppressed to WARNING level so it never emits the raw command.
 
 > **Known limitation: command OUTPUT is NOT redacted.** If you run `cat /etc/mysql/my.cnf`, `env | grep PASSWORD`, or `kubectl get secret X -o yaml`, the stdout/stderr returned to the MCP client will contain plaintext secrets. The redaction pipeline only filters the COMMAND string (what you asked to run), not the OUTPUT (what it printed). Avoid running commands that print secrets via ssh-mcp — pass credentials through env vars, Docker/K8s secrets, or dedicated config files instead.
 
-**Local path confinement (changed in 0.6.0).** SFTP `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Every local path is **relative to a configured transfer root** and is resolved one component at a time beneath it, refusing a symbolic link at *any* component:
+**Local path confinement (new in 0.6.0; versions ≤ 0.5.6 are affected by the flaw it fixes — see [CHANGELOG.md](CHANGELOG.md)).** SFTP `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Every local path is **relative to a configured transfer root** and is resolved one component at a time beneath it, refusing a symbolic link at *any* component:
 
 ```toml
 [settings]
@@ -365,7 +416,7 @@ Consequences, all deliberate:
 - **Absolute local paths and `..` are rejected.** Sub-directories are allowed, but they must already exist.
 - **Downloads do not overwrite.** An existing destination fails rather than being silently replaced. A failed transfer removes its own partial file.
 - **Remote non-regular files** (symlinks, devices, FIFOs) are refused on a best-effort basis. SFTP protocol v3 offers no atomic no-follow open, so a remote server that swaps the file between the check and the open can still win that race; the *local* destination stays confined regardless.
-- Remote paths keep the existing sensitive-path denylist.
+- Remote paths keep the existing sensitive-path denylist — a tripwire, not a boundary, matched as a substring after normalizing `//` and `./` away, case-insensitively. It covers `/etc/{shadow,gshadow,passwd,sudoers}` and `/etc/ssh/ssh_host_*`; `.ssh/{authorized_keys,id_rsa,id_ed25519,id_ecdsa,id_dsa,identity,config,known_hosts}`; `.aws/{credentials,config}`, `.azure/accesstokens.json`, `.config/gcloud/{credentials,access_tokens}.db`; `.kube/config`, `/etc/kubernetes/{admin,kubelet}.conf`, `/var/lib/kubelet/pki/`; `.netrc`, `.pgpass`, `.git-credentials`, `.docker/config.json`; `/proc/{self,<pid>}/{environ,mem,cmdline,maps,stack,status}`, `/proc/{kcore,kallsyms}`; the MySQL / PostgreSQL / MongoDB data directories under `/var/lib/`; and the Windows SAM / SECURITY hives plus `\users\administrator\.ssh\`. Public keys are **not** exempt — the old `*.pub` carve-out was a string check on a caller-supplied name and was removed.
 
 Prior versions validated the caller's path *string* against a denylist and then handed that string to asyncssh, which resolved it independently — so anything not enumerated was writable. Confinement replaces enumeration: ssh-mcp opens the local file itself and never lets a caller-supplied path reach the SFTP library.
 
@@ -378,7 +429,7 @@ Prior versions validated the caller's path *string* against a denylist and then 
 For production log aggregation, set `SSH_MCP_LOG_FORMAT=json` to emit single-line JSON events:
 
 ```json
-{"event": "sftp.upload.complete bytes=4096 duration_ms=183", "level": "info", "timestamp": "2026-04-08T16:00:11.761575Z", "server": "web-prod-01", "operation": "upload", "local_path": "/tmp/app.tar.gz", "remote_path": "/var/www/release.tar.gz", "connection_id": "web-prod-01-4242-a3f1c9d2"}
+{"event": "sftp.upload.complete bytes=4096 duration_ms=183", "level": "info", "timestamp": "2026-04-08T16:00:11.761575Z", "server": "web-prod-01", "operation": "upload", "local_path": "releases/app.tar.gz", "remote_path": "/var/www/release.tar.gz", "connection_id": "web-prod-01-4242-a3f1c9d2"}
 ```
 
 When running in Docker, capture stderr with `docker logs` for the audit trail.
@@ -390,9 +441,9 @@ For vulnerability reports, see [SECURITY.md](SECURITY.md). Do not open public Gi
 ```bash
 git clone https://github.com/blackaxgit/ssh-mcp.git
 cd ssh-mcp
-uv sync --extra dev
+uv sync --locked --extra dev
 uv run pytest
-uv run ruff check .
+uv run ruff check src/ tests/
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on making changes and submitting pull requests.

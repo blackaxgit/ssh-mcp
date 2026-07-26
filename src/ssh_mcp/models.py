@@ -5,12 +5,15 @@ dataclasses with ``extra='forbid'`` strict key validation, plus a mutable
 ``ExecResult`` stdlib dataclass used to shuttle execution output.
 
 Pydantic validates at construction time, so:
-  * Unknown TOML keys raise a ``ValidationError`` that names the offender
-    and lists valid fields — the config loader converts this into a
-    ``ConfigError`` with section / host context.
+  * Unknown TOML keys raise a ``ValidationError`` that names the offender —
+    the config loader converts this into a ``ConfigError`` carrying the
+    section label plus, for the per-entity sections, the host / group name,
+    and appends the list of valid keys itself via ``_valid_keys``.
   * Numeric ranges (``command_timeout``, ``max_output_bytes``,
-    ``connection_idle_timeout``, ``max_parallel_hosts``) are enforced by
-    ``Field(ge=..., le=...)`` — no manual ``__post_init__`` guards needed.
+    ``max_command_bytes``, ``max_parallel_hosts``, ``ServerConfig.port``,
+    ``ServerConfig.timeout``) are enforced by ``Field(ge=..., le=...)``, and
+    ``connection_idle_timeout`` by a lower bound alone — no manual
+    ``__post_init__`` guards needed.
 """
 
 from __future__ import annotations
@@ -50,15 +53,27 @@ class Settings:
 
     Attributes:
         ssh_config_path: Path to SSH config file (supports ~ expansion)
-        command_timeout: Default command execution timeout in seconds
-        max_output_bytes: Maximum **bytes** to capture from command output.
+        command_timeout: Timeout in seconds for *establishing* a connection —
+            it wraps ``asyncssh.connect`` and nothing else. It does NOT bound
+            command execution: that comes from the ``timeout`` parameter of
+            the execute tools (default 30s), overridden per server by
+            ``ServerConfig.timeout``. Raising this will not keep a long
+            command alive.
+        max_output_bytes: Maximum **bytes** to capture from command output,
+            applied to stdout and stderr *independently* rather than as a
+            shared pool, so the combined worst case is 2x this setting — an
+            accepted trade-off that mirrors the pre-S10 ``conn.run()``
+            semantics.
             This is a genuine byte bound, and it bounds *allocation*, not
             merely the response: output is consumed incrementally and the
             process is terminated once the budget is spent. Previously the
             check was character-based (``len(str)``) and ran only after
             asyncssh had already buffered the entire output, so a multibyte
             stream overran the stated limit ~4x and a large ``cat`` could
-            exhaust memory regardless of the setting.
+            exhaust memory regardless of the setting. A
+            ``[... output truncated at N bytes]`` marker is appended *after*
+            the cut, so a truncated stream's returned string is a little
+            longer than the budget itself.
         max_command_bytes: Maximum length of a command string accepted by the
             execute tools. Enforced at the MCP tool boundary before the
             command reaches redaction or dangerous-command matching, both of
@@ -69,11 +84,24 @@ class Settings:
             resolved beneath it, refusing symlinks at every component.
             Defaults under ``$XDG_DATA_HOME`` (or ``~/.local/share``);
             override with the ``SSH_MCP_TRANSFER_ROOT`` environment variable.
+            ``paths.ensure_root`` pins it on the first transfer and fails
+            closed unless the platform offers POSIX ``openat``/``O_NOFOLLOW``
+            (non-POSIX platforms therefore refuse *all* transfers) and the
+            root is a real directory rather than a symlink, owned by the
+            running uid, with mode ``0700`` — any group or other bit raises
+            ``PathConfinementError``.
         connection_idle_timeout: Seconds before idle connection is closed
         known_hosts: Whether to enforce strict known_hosts checking
-        max_parallel_hosts: Maximum concurrent SSH connections during
-            group execution. Bounded to 1..100 to prevent accidentally
-            exhausting file descriptors or triggering fleet-wide load spikes.
+        max_parallel_hosts: Maximum concurrent in-flight ``execute()`` calls
+            under group execution. The semaphore is built once per
+            ``SSHManager``, so the bound is process-wide: independent
+            ``execute_on_group()`` calls serialise against each other instead
+            of each receiving their own budget (an intentional behaviour
+            change). It caps executions, not pooled connections — entries in
+            ``_connections`` outlive the semaphore release until the idle
+            reaper closes them, so open descriptors can still exceed this
+            number. Bounded to 1..100 to keep fleet-wide load spikes and
+            descriptor growth in check.
     """
 
     # ``validate_default=True`` is load-bearing on the path fields: pydantic
@@ -125,20 +153,22 @@ class GroupConfig:
 class ServerConfig:
     """Configuration for a managed SSH server.
 
-    All optional overrides default to None, allowing SSH config file or
-    system defaults to take precedence.
+    Every optional override except ``groups`` defaults to None, allowing SSH
+    config file or system defaults to take precedence; ``groups`` defaults to
+    an empty tuple.
 
     Attributes:
         name: Unique server identifier (SSH host alias)
         description: Human-readable server description
         groups: Tuple of group names this server belongs to
         hostname: Override SSH config hostname
-        port: Override SSH config port
+        port: Override SSH config port (1..65535)
         user: Override SSH config user
         identity_file: Override SSH config identity file path
         jump_host: Override SSH config ProxyJump/bastion host
         default_dir: Default working directory for commands
-        timeout: Override command timeout for this server
+        timeout: Override command timeout for this server, in seconds
+            (1..3600)
     """
 
     name: str
@@ -170,18 +200,34 @@ class ExecResult:
     constructed from trusted ``asyncssh`` output — and Pydantic validation
     would add runtime cost for every command execution.
 
-    ExecResult is returned by execute() and execute_on_group() — these methods
-    NEVER raise exceptions. All errors are embedded in the ``error`` field:
-    - ``error is None`` + ``exit_code >= 0``: command succeeded
+    ExecResult is returned by execute() and execute_on_group(), which embed
+    every ordinary error in the ``error`` field rather than raising. That
+    promise is strong but not absolute: the broad handler in
+    ``_execute_impl`` is ``except Exception``, so ``asyncio.CancelledError``
+    still propagates out of execute() — which is exactly why
+    execute_on_group() normalises any ``BaseException`` from a child task into
+    an error-carrying ExecResult of its own.
+    - ``error is None`` + ``exit_code >= 0``: the command ran to completion. A
+      non-zero code is an ordinary command failure, not an execution failure.
+      A ``dry_run`` preview also lands here, with ``exit_code=0`` and the
+      preview text in ``stdout``.
+    - ``error is None`` + ``exit_code == -1``: the remote process was killed by
+      a signal — asyncssh reports -1 for an exit signal. Most commonly our own
+      terminate() after the output budget was spent, so ``stdout``/``stderr``
+      carry the truncation marker.
     - ``error is None`` + ``exit_code is None``: should not happen
     - ``error is not None`` + ``exit_code is None``: execution failed (SSH error,
       timeout, server not found, blocked by dangerous-command tripwire, cancelled
       by fail_fast)
-    - ``error is not None`` + ``exit_code >= 0``: command ran but had issues
 
-    SFTP operations (upload_file, download_file) follow a DIFFERENT contract:
+    Every path that sets ``error`` also sets ``exit_code=None``, so
+    ``error is not None`` alongside a numeric ``exit_code`` never occurs.
+
+    SFTP operations (``SSHManager.upload``/``download``, surfaced as the
+    ``upload_file``/``download_file`` MCP tools) follow a DIFFERENT contract:
     they RAISE ValueError or RuntimeError on failure. The _mcp_tool decorator
-    converts all exceptions to ToolError for the MCP protocol.
+    converts those into ToolError for the MCP protocol, but re-raises an
+    already-raised ToolError and ``asyncio.CancelledError`` unchanged.
 
     Attributes:
         server: Server name where command was executed

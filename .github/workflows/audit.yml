@@ -10,18 +10,36 @@ name: Scheduled Audit
 #
 # This workflow adds a daily run against the default branch so new advisories
 # get discovered on their own schedule and can be remediated in a dedicated
-# PR. It does NOT replace the `audit` job in ci.yml, which runs on every push
-# and pull request and unconditionally gates the GHCR image publish via
-# `docker: needs: [test, lint, audit]`. Note that blocking a PR *merge* on
-# that job additionally requires `Dependency audit` to be listed in the
-# repository's branch-protection required checks — that is a settings change,
-# not something either workflow file can enforce.
+# PR. It does NOT replace either of the two commit-triggered `audit` jobs:
+#
+#   * ci.yml's `audit` runs on pushes to `main`, on `v*` tags, and on PRs
+#     targeting `main` — note that a push to a feature branch gets no audit at
+#     all — and unconditionally gates the GHCR image publish via
+#     `docker: needs: [test, lint, audit]`.
+#   * release.yml's `audit` runs on `v*` tags only and unconditionally gates
+#     the PyPI publish via `build: needs: [test, lint, audit]`; it is the audit
+#     that guards the release path.
+#
+# Note that blocking a PR *merge* on ci.yml's job additionally requires
+# `Dependency audit` to be listed in the repository's branch-protection
+# required checks — that is a settings change, not something either workflow
+# file can enforce. (release.yml deliberately names its audit job
+# `Dependency audit` as well, so the two are indistinguishable by name.)
+#
+# Caveat on the "proactive" claim: this workflow's only failure signal is a red
+# scheduled run on `main` — there is no notification step and no
+# .github/dependabot.yml — and GitHub disables `schedule:` triggers after 60
+# days of repository inactivity, silently, so on a quiet repo the daily gate
+# stops running with no signal at all.
 on:
   schedule:
     # 06:00 UTC daily. Cron in GitHub Actions is best-effort, not exact.
     - cron: "0 6 * * *"
   workflow_dispatch:
 
+# Scheduled runs always use the default branch, so a `workflow_dispatch` on
+# `main` shares this group and cancels an in-flight scheduled audit. Harmless —
+# both runs do exactly the same thing.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
