@@ -6,6 +6,8 @@ including defaults, custom values, immutability, and field validation.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from ssh_mcp.models import ExecResult, GroupConfig, ServerConfig, Settings
@@ -18,7 +20,12 @@ class TestSettings:
         """Test Settings uses correct default values."""
         settings = Settings()
 
-        assert settings.ssh_config_path == "~/.ssh/config"
+        # v0.6.0: path fields are expanded at the model boundary (finding S5).
+        # Previously expansion happened only in the config loader and only
+        # when a [settings] block existed, so this default stayed literal and
+        # every connection died with FileNotFoundError: '~/.ssh/config'.
+        assert settings.ssh_config_path == os.path.expanduser("~/.ssh/config")
+        assert "~" not in settings.ssh_config_path
         assert settings.command_timeout == 30
         assert settings.max_output_bytes == 51200
         assert settings.connection_idle_timeout == 300
@@ -106,7 +113,12 @@ class TestSettings:
 
         assert settings.command_timeout == 120
         # Other fields should retain defaults
-        assert settings.ssh_config_path == "~/.ssh/config"
+        # v0.6.0: path fields are expanded at the model boundary (finding S5).
+        # Previously expansion happened only in the config loader and only
+        # when a [settings] block existed, so this default stayed literal and
+        # every connection died with FileNotFoundError: '~/.ssh/config'.
+        assert settings.ssh_config_path == os.path.expanduser("~/.ssh/config")
+        assert "~" not in settings.ssh_config_path
         assert settings.max_output_bytes == 51200
 
 
@@ -177,7 +189,10 @@ class TestServerConfig:
         assert server.hostname == "192.168.1.10"
         assert server.port == 2222
         assert server.user == "deploy"
-        assert server.identity_file == "~/.ssh/deploy_key"
+        # v0.6.0: expanded at the model boundary (finding S14). asyncssh's
+        # client_keys does no ~ expansion, so an unexpanded value silently
+        # failed to authenticate.
+        assert server.identity_file == os.path.expanduser("~/.ssh/deploy_key")
         assert server.jump_host == "bastion"
         assert server.default_dir == "/var/www"
         assert server.timeout == 60

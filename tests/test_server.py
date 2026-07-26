@@ -83,6 +83,11 @@ class TestGetConfigPath:
     ) -> None:
         """Test XDG config path is used when env var is absent."""
         monkeypatch.delenv("SSH_MCP_CONFIG", raising=False)
+        # `_get_config_path` checks $XDG_CONFIG_HOME before falling back to
+        # Path.home(); without unsetting it, patching Path.home has no effect
+        # on a machine that sets it (CI does), so this test resolved the real
+        # user config and failed there while passing locally.
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
 
         xdg_config = tmp_path / ".config" / "ssh-mcp" / "servers.toml"
         xdg_config.parent.mkdir(parents=True)
@@ -92,6 +97,28 @@ class TestGetConfigPath:
             result = server_module._get_config_path()
 
         assert result == str(xdg_config)
+
+    def test_xdg_config_home_is_honoured_when_set(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """$XDG_CONFIG_HOME takes precedence over ~/.config.
+
+        The XDG branch previously had no positive test — only one that
+        unset the variable — so the behaviour it adds was unverified while
+        being load-bearing enough to break two other tests in CI.
+        """
+        monkeypatch.delenv("SSH_MCP_CONFIG", raising=False)
+        xdg_home = tmp_path / "xdg"
+        cfg = xdg_home / "ssh-mcp" / "servers.toml"
+        cfg.parent.mkdir(parents=True)
+        cfg.touch()
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
+
+        # Point HOME somewhere with no config, so a pass can only come from
+        # the XDG branch rather than the ~/.config fallback.
+        monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+
+        assert server_module._get_config_path() == str(cfg)
 
     def test_dev_path_fallback(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -550,11 +577,18 @@ groups = []
     async def test_ssh_exceptions_return_exec_result_with_error(
         self, tmp_path: Path, exc_class: type, exc_args: tuple[object, ...]
     ) -> None:
-        """Each SSH-layer exception must produce ExecResult with error, not raise."""
+        """Each SSH-layer exception must produce ExecResult with error, not raise.
+
+        S10: ``execute()`` no longer calls ``conn.run()`` — it calls
+        ``conn.create_process()`` and drains stdout/stderr itself. A
+        connection-layer failure (disconnect, auth, network) surfaces at
+        the ``create_process()`` call itself, before any draining starts,
+        which is where the mock now raises.
+        """
         manager = self._make_manager(tmp_path)
 
         mock_conn = AsyncMock()
-        mock_conn.run = AsyncMock(side_effect=exc_class(*exc_args))
+        mock_conn.create_process = AsyncMock(side_effect=exc_class(*exc_args))
 
         with patch.object(manager, "_get_connection", return_value=mock_conn):
             result = await manager.execute("test-srv", "whoami")
@@ -567,14 +601,33 @@ groups = []
     async def test_timeout_error_returns_exec_result_with_error(
         self, tmp_path: Path
     ) -> None:
-        """asyncio.TimeoutError (inner try) must produce ExecResult with error."""
+        """asyncio.TimeoutError (inner try) must produce ExecResult with error.
+
+        S10: the timeout now comes from the real ``asyncio.timeout()``
+        around the bounded stdout/stderr drain loop, not from
+        ``conn.run(timeout=...)``. The mocked process's streams never
+        yield EOF, so a short ``timeout=`` reliably trips it.
+        """
         manager = self._make_manager(tmp_path)
 
+        async def _hang(_n: int) -> bytes:
+            await asyncio.sleep(3600)
+            return b""  # pragma: no cover - never reached
+
+        mock_process = MagicMock()
+        mock_process.stdout = MagicMock()
+        mock_process.stdout.read = AsyncMock(side_effect=_hang)
+        mock_process.stderr = MagicMock()
+        mock_process.stderr.read = AsyncMock(side_effect=_hang)
+        mock_process.wait_closed = AsyncMock(return_value=None)
+        mock_process.terminate = MagicMock()
+        mock_process.exit_status = None
+
         mock_conn = AsyncMock()
-        mock_conn.run = AsyncMock(side_effect=asyncio.TimeoutError())
+        mock_conn.create_process = AsyncMock(return_value=mock_process)
 
         with patch.object(manager, "_get_connection", return_value=mock_conn):
-            result = await manager.execute("test-srv", "sleep 9999")
+            result = await manager.execute("test-srv", "sleep 9999", timeout=0.05)
 
         assert isinstance(result, ExecResult)
         assert result.exit_code is None

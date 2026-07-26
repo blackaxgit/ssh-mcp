@@ -1,0 +1,33 @@
+# Synthetic credential fixtures in the redaction test corpus.
+#
+# Every fingerprint below is an INPUT to a test in
+# tests/test_ssh.py::TestRedactSecrets, which asserts that _redact_secrets()
+# replaces it. They exist precisely so the redaction control has something to
+# redact -- none is a real credential and none requires rotation. tests/ ships
+# in neither distributed artifact: hatchling packages src/ only, and
+# .dockerignore excludes tests/.
+#
+# Recorded so a genuinely new finding is never lost in known noise. Generated
+# from an actual `gitleaks git` run rather than by hand. Re-generate if
+# TestRedactSecrets is restructured.
+
+# tests/test_ssh.py:1322 (generic-api-key)
+5093aca667d6aa461ea34e58a21b5d643b77e86a:tests/test_ssh.py:generic-api-key:1322
+
+# tests/test_ssh.py:1327 (curl-auth-header)
+5093aca667d6aa461ea34e58a21b5d643b77e86a:tests/test_ssh.py:curl-auth-header:1327
+
+# tests/test_ssh.py:1424 (generic-api-key)
+0bef32afb10f421075792663c21128d638ede7c4:tests/test_ssh.py:generic-api-key:1424
+
+# tests/test_ssh.py:1426 (generic-api-key)
+0bef32afb10f421075792663c21128d638ede7c4:tests/test_ssh.py:generic-api-key:1426
+
+# tests/test_ssh.py:1437 (generic-api-key)
+0bef32afb10f421075792663c21128d638ede7c4:tests/test_ssh.py:generic-api-key:1437
+
+# tests/test_ssh.py:1438 (curl-auth-user)
+0bef32afb10f421075792663c21128d638ede7c4:tests/test_ssh.py:curl-auth-user:1438
+
+# tests/test_ssh.py:2058 (generic-api-key)
+e09955c2be3c55dfd10d041e88c91569f65ba591:tests/test_ssh.py:generic-api-key:2058

@@ -187,20 +187,30 @@ class ServerRegistry:
                 f"Check TOML syntax near the reported position."
             ) from e
 
-        # Load settings
-        if "settings" in config_data:
-            settings_dict = dict(config_data["settings"])
-            # Expand ~ in ssh_config_path before validation
-            if "ssh_config_path" in settings_dict:
-                settings_dict["ssh_config_path"] = os.path.expanduser(
-                    settings_dict["ssh_config_path"]
-                )
-            try:
-                self._settings = Settings(**settings_dict)
-            except ValidationError as e:
-                detail = _format_validation_error("settings", "", e)
-                valid = ", ".join(_valid_keys(Settings))
-                raise ConfigError(f"{detail}. Valid keys: {valid}") from e
+        # Load settings.
+        #
+        # Constructed unconditionally, even with no ``[settings]`` block: the
+        # ``~`` expansion now lives in the model validator, and the previous
+        # "only if the section exists" shape meant a minimal servers.toml
+        # left the default ``~/.ssh/config`` unexpanded and broke every
+        # connection with ``FileNotFoundError: '~/.ssh/config'``.
+        settings_dict = dict(config_data.get("settings", {}))
+
+        # ``Settings`` is a plain pydantic dataclass, not ``BaseSettings``, so
+        # it reads no environment variables by itself. The transfer root is
+        # the one setting a container operator must be able to override
+        # without editing the mounted TOML, so it is applied explicitly here.
+        # Precedence: env > TOML > computed default.
+        env_transfer_root = os.environ.get("SSH_MCP_TRANSFER_ROOT", "").strip()
+        if env_transfer_root:
+            settings_dict["transfer_root"] = env_transfer_root
+
+        try:
+            self._settings = Settings(**settings_dict)
+        except ValidationError as e:
+            detail = _format_validation_error("settings", "", e)
+            valid = ", ".join(_valid_keys(Settings))
+            raise ConfigError(f"{detail}. Valid keys: {valid}") from e
 
         # Warn if known_hosts verification is disabled
         if not self._settings.known_hosts:

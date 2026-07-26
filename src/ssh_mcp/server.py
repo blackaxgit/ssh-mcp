@@ -182,7 +182,9 @@ def _get_config_path() -> str:
 
     Priority order:
     1. SSH_MCP_CONFIG environment variable (explicit override)
-    2. ~/.config/ssh-mcp/servers.toml (XDG standard user config)
+    2. $XDG_CONFIG_HOME/ssh-mcp/servers.toml, falling back to
+       ~/.config/ssh-mcp/servers.toml when XDG_CONFIG_HOME is unset
+       (XDG standard user config)
     3. config/servers.toml relative to package (development mode)
 
     Returns:
@@ -195,8 +197,13 @@ def _get_config_path() -> str:
     if "SSH_MCP_CONFIG" in os.environ:
         return os.path.expanduser(os.environ["SSH_MCP_CONFIG"])
 
-    # 2. XDG standard user config directory
-    user_config = Path.home() / ".config" / "ssh-mcp" / "servers.toml"
+    # 2. XDG standard user config directory. Honors $XDG_CONFIG_HOME when
+    # set — this used to always resolve under ~/.config regardless of the
+    # env var, which was inconsistent with transfer_root's XDG_DATA_HOME
+    # handling (paths.py:default_transfer_root) elsewhere in this codebase.
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    config_base = Path(xdg_config_home) if xdg_config_home else Path.home() / ".config"
+    user_config = config_base / "ssh-mcp" / "servers.toml"
     if user_config.exists():
         return str(user_config)
 
@@ -378,6 +385,33 @@ async def list_groups() -> str:
     return format_group_table(groups, server_counts)
 
 
+def _check_command_length(command: str, max_bytes: int) -> None:
+    """Reject an over-long ``command`` before it reaches the SSH layer.
+
+    B2-cap: ``_redact_secrets`` and ``_is_dangerous_command`` in ``ssh.py``
+    are both superlinear in input length, and Python's ``re`` has no
+    timeout — a ~10 KB command measurably stalls the single-threaded event
+    loop for over 6 seconds, reachable via ``dry_run=True`` before any SSH
+    connection or authentication. This check is the other half of that
+    fix: it is O(n) in the encoded length and runs before either function
+    is reached, so a regex fix alone (bounding the quantifiers) cannot
+    provide the same guarantee on its own.
+
+    Compares the ENCODED byte length, not ``len(command)`` — the setting
+    is named ``max_command_bytes`` and a multibyte UTF-8 string would
+    otherwise slip well past the intended limit despite having fewer
+    ``str`` characters than bytes.
+    """
+    actual_bytes = len(command.encode("utf-8"))
+    if actual_bytes > max_bytes:
+        raise ToolError(
+            f"command is {actual_bytes} bytes, exceeding the "
+            f"{max_bytes}-byte limit set by max_command_bytes (configure "
+            "in [settings] of servers.toml, range 1024-1048576). Shorten "
+            "the command or raise the limit."
+        )
+
+
 @mcp.tool()
 @_mcp_tool
 async def execute(
@@ -394,7 +428,8 @@ async def execute(
         server: Server name (e.g. 'web-prod-01'). Must match a configured server.
                 Use list_servers to see available servers.
         command: Shell command to execute on the remote server (exactly as it
-                would be typed at a bash prompt).
+                would be typed at a bash prompt). Rejected if it exceeds
+                ``max_command_bytes`` (default 65536 encoded UTF-8 bytes).
         timeout: Command timeout in **seconds**. Default 30. Range 1–3600.
         working_dir: Absolute remote directory to cd into before running the
                 command. Uses the server's ``default_dir`` from servers.toml
@@ -413,6 +448,7 @@ async def execute(
         Long output is truncated at ``max_output_bytes`` (default 50 KiB).
     """
     ssh = _get_ssh()
+    _check_command_length(command, _get_registry().settings.max_command_bytes)
     result = await ssh.execute(server, command, timeout, working_dir, force, dry_run)
     return format_exec_result(result)
 
@@ -437,6 +473,8 @@ async def execute_on_group(
         group: Group name (e.g. 'production', 'web'). Use list_groups to see
                available groups.
         command: Shell command to execute on every server in the group.
+                Rejected if it exceeds ``max_command_bytes`` (default 65536
+                encoded UTF-8 bytes).
         timeout: Per-server command timeout in **seconds**. Default 30.
                 Each server has its own timer; slow servers do NOT extend the
                 per-server limit for others.
@@ -457,6 +495,7 @@ async def execute_on_group(
         and aggregate exit status.
     """
     ssh = _get_ssh()
+    _check_command_length(command, _get_registry().settings.max_command_bytes)
     results = await ssh.execute_on_group(
         group, command, timeout, working_dir, fail_fast, force, dry_run
     )
@@ -474,7 +513,13 @@ async def upload_file(
 
     Args:
         server: Server name (e.g. 'pro-dicentra').
-        local_path: Absolute path to local file.
+        local_path: Path to the local file, RELATIVE to the configured
+                ``transfer_root`` (see [settings] in servers.toml, or the
+                ``SSH_MCP_TRANSFER_ROOT`` environment variable). Absolute
+                paths and ``..`` are rejected. Sub-directories are allowed
+                (e.g. ``'reports/q1.csv'``), but every intermediate
+                directory must already exist under ``transfer_root`` —
+                upload_file does not create them.
         remote_path: Absolute destination path on remote server.
 
     Returns:
@@ -495,8 +540,17 @@ async def download_file(
 
     Args:
         server: Server name (e.g. 'pro-dicentra').
-        remote_path: Absolute path to remote file.
-        local_path: Absolute local destination path.
+        remote_path: Absolute path to remote file. Must be a regular file —
+                symlinks, devices, FIFOs, and other non-regular remote
+                files are refused.
+        local_path: Destination path, RELATIVE to the configured
+                ``transfer_root`` (see [settings] in servers.toml, or the
+                ``SSH_MCP_TRANSFER_ROOT`` environment variable). Absolute
+                paths and ``..`` are rejected. Sub-directories are allowed,
+                but every intermediate directory must already exist under
+                ``transfer_root``. NO-CLOBBER: if a file already exists at
+                the destination, the download fails rather than silently
+                overwriting it — remove or rename the existing file first.
 
     Returns:
         Confirmation message with file size.
@@ -517,10 +571,10 @@ def _build_http_app(token: str | None) -> Any:
     Assembles a SINGLE outer Starlette app containing:
 
     1. The FastMCP streamable HTTP app mounted under ``/``
-    2. A ``lifespan`` that chains the FastMCP session-manager lifespan
-       so its internal task group is initialized — without this every
-       request returns HTTP 500 with ``RuntimeError('Task group is
-       not initialized')``.
+    2. A ``lifespan`` that starts FastMCP's session-manager task group
+       via the PUBLIC ``FastMCP.session_manager`` property — without
+       this every request returns HTTP 500 with ``RuntimeError('Task
+       group is not initialized')``.
     3. On shutdown, drains the pooled SSH manager BEFORE exiting the
        inner lifespan so ``_ssh.close_all()`` can still dispatch
        traffic on a live event loop.
@@ -542,25 +596,46 @@ def _build_http_app(token: str | None) -> Any:
 
     inner_app = mcp.streamable_http_app()
 
-    # R5 finding #8: assert the FastMCP app exposes the lifespan we chain.
-    # This is a private Starlette attribute — if the MCP SDK restructures
-    # its app in a major version, we want a loud startup crash, not a
-    # silent 500-on-every-request like the v0.3.0 incident.
-    lifespan_ctx = getattr(getattr(inner_app, "router", None), "lifespan_context", None)
-    if not callable(lifespan_ctx):
+    # N4: this used to reach into `inner_app.router.lifespan_context` — a
+    # PRIVATE Starlette attribute, not ours or the MCP SDK's to depend on
+    # (Starlette itself went 0.52.1 -> 1.3.1 during this release cycle,
+    # unconstrained by this project). `streamable_http_app()` above wires
+    # its own inner Starlette app with `lifespan=lambda app:
+    # self.session_manager.run()` (mcp/server/fastmcp/server.py) — calling
+    # `lifespan_ctx(inner_app)` therefore did nothing but reach `.run()`
+    # through a private indirection. `FastMCP.session_manager` is the
+    # SDK-documented public accessor for the exact same object, and
+    # `.run()` takes no arguments, so we call it directly from OUR outer
+    # lifespan instead — Starlette only ever runs the outermost lifespan,
+    # never a mounted sub-app's, which is why we must invoke this
+    # ourselves rather than relying on the inner app's own wiring.
+    #
+    # The check below is a fast, loud, startup-time sanity signal that
+    # `streamable_http_app()` did its documented job of populating the
+    # session manager. R5 finding #8's original guard could not detect
+    # the actual semantic break it was written for — a present, callable
+    # `lifespan_context` attribute proves nothing about whether it
+    # functionally starts the task group. The real verification of that
+    # is the request-through tests in tests/test_http_transport.py, which
+    # drive real requests through this app and assert the absence of the
+    # "Task group is not initialized" failure signature.
+    try:
+        session_manager = mcp.session_manager
+    except RuntimeError as exc:
         raise RuntimeError(
-            "FastMCP streamable_http_app() does not expose "
-            "router.lifespan_context — the MCP SDK may have changed "
-            "its internal structure. ssh-mcp requires this to chain "
-            "the session-manager lifespan. Pin mcp[cli]<2.0.0 or "
-            "update the lifespan wiring in server.py."
-        )
+            "FastMCP's session manager was not initialized by "
+            "streamable_http_app() — this used to also populate "
+            "Starlette's private router.lifespan_context, which "
+            "ssh-mcp no longer depends on. The MCP SDK may have changed "
+            "its internal wiring; update the lifespan wiring in "
+            "server.py._build_http_app or pin a known-good mcp[cli]."
+        ) from exc
 
     @asynccontextmanager
     async def _lifespan(_app: Starlette) -> Any:
-        # Step 1: start the FastMCP session manager's task group via
-        # its own lifespan context.
-        async with lifespan_ctx(inner_app):
+        # Step 1: start the FastMCP session manager's task group via the
+        # public session_manager.run() API (see note above).
+        async with session_manager.run():
             try:
                 yield
             finally:
@@ -658,9 +733,20 @@ def _make_bearer_auth_middleware() -> Any:
                 return
 
             headers = dict(scope.get("headers", []))
-            auth = headers.get(b"authorization", b"").decode("latin-1")
-            parts = auth.split(maxsplit=1)
-            if len(parts) != 2 or parts[0].lower() != "bearer":
+            raw_auth = headers.get(b"authorization", b"")
+            # N5: split and compare in BYTES space rather than decoding the
+            # credential portion to str. The header used to be decoded
+            # wholesale with "latin-1" (which never itself raises — every
+            # byte 0x00-0xFF has a latin-1 codepoint) and then compared via
+            # hmac.compare_digest(str, str). compare_digest restricts str
+            # comparison to ASCII-only and raises TypeError on anything
+            # else, so a non-ASCII token turned into an unhandled 500 from
+            # inside auth middleware instead of a clean 401. Only the
+            # "Bearer" scheme keyword — always ASCII — is decoded; the
+            # token bytes are compared directly, which hmac.compare_digest
+            # accepts unconditionally for bytes-like arguments.
+            parts = raw_auth.split(maxsplit=1)
+            if len(parts) != 2 or parts[0].decode("latin-1").lower() != "bearer":
                 await _send_401(
                     send,
                     {"error": "missing bearer token"},
@@ -671,7 +757,8 @@ def _make_bearer_auth_middleware() -> Any:
                 )
                 return
             supplied = parts[1]
-            if not hmac.compare_digest(supplied, self._expected):
+            expected = self._expected.encode("utf-8")
+            if not hmac.compare_digest(supplied, expected):
                 await _send_401(
                     send,
                     {"error": "invalid bearer token"},
