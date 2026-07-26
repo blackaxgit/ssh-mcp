@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-26
+
+### Changed — BREAKING (install command)
+
+**The PyPI distribution is now `blc-ssh-mcp`. It was never published as `ssh-mcp`, and could not be.** That name on PyPI belongs to an unrelated project by a different author (`czyhandsome`, MIT-licensed, last release 0.1.4 in June 2025); this repository has never owned it, and PyPI names are globally unique and first-come. No trusted publisher or credential can change that — an upload under `ssh-mcp` is simply rejected.
+
+The consequence was a documentation defect with a security dimension: `README.md` instructed users to run `uvx ssh-mcp`, `pip install ssh-mcp`, and `claude mcp add ssh-mcp -- uvx ssh-mcp`, all of which install **that stranger's package**. Because it is also an SSH tool, the substitution was not obvious. Every install instruction now names `blc-ssh-mcp`, including the two Claude Desktop JSON examples whose `"args": ["ssh-mcp"]` form was easy to miss.
+
+**Migration:** if you installed by following an earlier README, you have the wrong package. `pip uninstall ssh-mcp` and `pip install blc-ssh-mcp`. Nothing else changes: the import package is still `ssh_mcp`, the container image is still `ghcr.io/blackaxgit/ssh-mcp`, config paths are still `~/.config/ssh-mcp/`, and the environment prefix is still `SSH_MCP_`.
+
+A `blc-ssh-mcp` console script is added so `uvx blc-ssh-mcp` resolves; `ssh-mcp` is retained as an alias, because the Dockerfile `HEALTHCHECK` and `release.yml`'s artifact smoke test both invoke it and existing installs have it on `PATH`.
+
+### Fixed
+
+- **A failed PyPI upload no longer takes the GitHub Release with it.** `github-release` had `needs: [publish-pypi]` and no `if:`, so when 0.6.0's trusted-publisher exchange failed — before uploading anything — the release record and its artifacts were skipped too, and could not be recovered by re-running, because a tag's workflow is pinned at the tag ref. It now gates on `build` with `if: always() && needs.build.result == 'success'`.
+
+### Note on 0.6.0
+
+0.6.0 was tagged and published as a container image (`ghcr.io/blackaxgit/ssh-mcp:0.6.0`) with a GitHub Release, but **never reached PyPI** for the reason above. All of its security fixes are included here.
+
 ## [0.6.0] - 2026-07-26
 
 > **Why 0.6.0 and not 0.5.7:** two independent reasons — the `mcp` floor in `[project.dependencies]` is narrowed from `>=1.27.0` to `>=1.28.1`, and the SFTP path contract is a **breaking change** (see everything under *Changed — BREAKING* below).

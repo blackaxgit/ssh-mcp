@@ -59,7 +59,7 @@ Every function and method needs type hints, not just public ones — mypy runs w
 
 Open a [GitHub issue](https://github.com/blackaxgit/ssh-mcp/issues) with:
 
-- ssh-mcp version — `uv run python -c "import ssh_mcp; print(ssh_mcp.__version__)"` from a clone, or `pip show ssh-mcp` for an installed copy. There is no `--version` flag; the only CLI subcommand is `healthcheck`.
+- ssh-mcp version — `uv run python -c "import ssh_mcp; print(ssh_mcp.__version__)"` from a clone, or `pip show blc-ssh-mcp` for an installed copy. There is no `--version` flag; the only CLI subcommand is `healthcheck`.
 - Python version
 - Steps to reproduce
 - Expected vs. actual behavior
