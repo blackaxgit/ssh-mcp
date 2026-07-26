@@ -203,13 +203,32 @@ jobs:
         uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
 
   # ---------------------------------------------------------------------------
-  # GitHub Release: attach the SBOM + the exact artifacts that went to PyPI, and
+  # GitHub Release: attach the SBOM + the exact artifacts that were built, and
   # a GitHub-native build provenance attestation over the distributions only
   # (`subject-path: dist/*` below — the SBOM is attached but NOT attested).
+  #
+  # Release incident 2026-07-26 (v0.6.0): this job used `needs: [publish-pypi]`
+  # alone, so when the PyPI trusted-publisher exchange failed with
+  # `invalid-publisher` — a registry-side configuration problem, before any
+  # upload happened — the GitHub Release was SKIPPED too. The tag was pushed and
+  # the container image was published, but the release record and its artifacts
+  # were lost, and re-running could not recover them for that tag because a
+  # tag's workflow is pinned at the tag ref. The release had to be created by
+  # hand from the run's artifacts.
+  #
+  # A GitHub Release documents the TAG; PyPI is a separate distribution channel
+  # whose failure modes are independent (registry outage, publisher config, a
+  # version already present). So this job now gates on `build` and runs even
+  # when `publish-pypi` failed — `if: always()` plus an explicit `build` result
+  # check, because `always()` alone would also run it after a failed `build`,
+  # when there is no artifact to attach. Keep `publish-pypi` in `needs:` for
+  # ordering only, so the release is still created after the upload attempt
+  # rather than racing it.
   # ---------------------------------------------------------------------------
   github-release:
     name: GitHub Release
-    needs: [publish-pypi]
+    needs: [build, publish-pypi]
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write        # create the release
