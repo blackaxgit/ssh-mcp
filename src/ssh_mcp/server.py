@@ -897,7 +897,14 @@ def _run_http() -> None:
                 ) from e
     token = raw_token or None
     stateless = os.environ.get("SSH_MCP_HTTP_STATELESS", "false").lower() == "true"
-    allowed_hosts_env = os.environ.get("SSH_MCP_HTTP_ALLOWED_HOSTS", "").strip()
+    # Keep the raw (pre-strip) value around so we can tell "unset" apart
+    # from "explicitly set to whitespace" below — os.environ.get(..., "")
+    # collapses both to "", which would let a blank templated env var
+    # (e.g. "${EXTRA_HOSTS:- }") silently fall back to the localhost-only
+    # default instead of failing loud on what is almost always a config
+    # generation mistake.
+    _allowed_hosts_raw = os.environ.get("SSH_MCP_HTTP_ALLOWED_HOSTS")
+    allowed_hosts_env = (_allowed_hosts_raw or "").strip()
 
     # Auth-mode dispatch. Default ``bearer`` preserves v0.3.1 behavior.
     # ``none`` disables the bearer middleware entirely — useful when a
@@ -963,17 +970,48 @@ def _run_http() -> None:
 
     base_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
     extra_hosts: list[str] = []
+    if (
+        _allowed_hosts_raw is not None
+        and _allowed_hosts_raw != ""
+        and not allowed_hosts_env
+    ):
+        # Explicitly set but whitespace-only after stripping. Distinct from
+        # "unset" (which falls through to the localhost-only default below)
+        # — a whitespace value almost always means a broken env-file
+        # substitution, and silently treating it as "no extra hosts" would
+        # mask that from the operator.
+        raise RuntimeError(
+            "SSH_MCP_HTTP_ALLOWED_HOSTS is set but contains only whitespace. "
+            "Unset the variable to use the localhost-only default, or "
+            "provide a concrete hostname (e.g. 'ssh-mcp.internal:*')."
+        )
     if allowed_hosts_env:
         extra_hosts = [h.strip() for h in allowed_hosts_env.split(",") if h.strip()]
         # H4: reject wildcards — they silently disable DNS-rebinding
         # protection. An operator setting "*" almost certainly means
         # "match my specific hostname" and doesn't realize the security
         # implication. Fail loud instead of silently letting it through.
+        #
+        # Ordering trap (regression found on ci/fix-digest-verification):
+        # the previous implementation special-cased entries starting with
+        # "*." as "always a permitted suffix wildcard, skip refusal" via a
+        # `continue` evaluated before the `entry in {"*", "*:*", "*.*"}`
+        # refusal was reached. "*.*" itself starts with "*." too, so that
+        # `continue` fired first and let "*.*" — which matches essentially
+        # any dotted hostname and is semantically identical to the bare
+        # "*" this gate exists to block — through as PERMITTED even though
+        # it was listed in the refusal set. Do not reintroduce a
+        # startswith("*.")-first shortcut. The fix below strips the two
+        # deliberately-permitted wildcard *forms* (a trailing ":*" port
+        # wildcard, then a leading "*." subdomain wildcard) and only
+        # afterwards demands a concrete, wildcard-free remainder.
         for entry in extra_hosts:
-            bare = entry.replace(":*", "").replace("*", "")
-            if not bare or entry in {"*", "*:*", "*.*"} or entry.startswith("*."):
-                if entry.startswith("*."):
-                    continue  # wildcard suffixes like *.internal.example.com are OK
+            remainder = entry
+            if remainder.endswith(":*"):
+                remainder = remainder[:-2]
+            if remainder.startswith("*."):
+                remainder = remainder[2:]
+            if not remainder or "*" in remainder or not remainder.strip("."):
                 raise RuntimeError(
                     f"SSH_MCP_HTTP_ALLOWED_HOSTS wildcard entry {entry!r} "
                     "would disable DNS-rebinding protection. "

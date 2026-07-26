@@ -408,10 +408,27 @@ def _redact_long_flags(text: str) -> str:
       1) redacts from that ``=`` to the end of THIS token.
     * ``--<name>`` alone — credential-shaped ``<name>`` looks at exactly
       the next non-whitespace token and redacts it, UNLESS that token
-      itself starts with ``-`` (then this flag was boolean/valueless;
+      itself starts with ``--`` (then this flag was boolean/valueless;
       the next token is left untouched here and gets its own turn on
       the next loop iteration — it is never silently skipped).
     * anything else — passed through unchanged.
+
+    Defect (found 2026-07-25, reported against ``main``): the guard
+    above used to test for a single leading ``-``, not ``--``. A
+    credential VALUE that itself begins with ``-`` (e.g. a numeric
+    argument like ``-0000000``, or any dash-led token) is
+    indistinguishable from a flag under a single-dash test, so it was
+    passed through unredacted — ``mysql --password -0000000 somedb``
+    leaked the password verbatim. Narrowing the guard to ``--`` fixes
+    this without reopening the original skip-leak it exists to
+    prevent: a ``--``-prefixed token is still almost certainly a long
+    flag, AND it still gets its own classification turn on the next
+    loop iteration (so ``--password --token=x`` still redacts
+    ``--token=x`` — no skip). A single-dash token (``-p``, ``-rf``,
+    bare ``-``, or ``-0000000``) is now treated as the credential's
+    value and redacted; for a tripwire, over-redaction is strictly
+    safer than under-redaction (see the module docstring above
+    ``_REDACTION_PLACEHOLDER``).
 
     Note (Defect 1 follow-up, scope note): a credential value that is
     itself shell-quoted and contains whitespace (``--password="a b"``)
@@ -444,7 +461,11 @@ def _redact_long_flags(text: str) -> str:
             j = i + 1
             if j < n and chunks[j][1]:  # skip exactly one whitespace run
                 j += 1
-            if j < n and not chunks[j][1] and not chunks[j][0].startswith("-"):
+            # Guard narrowed from "-" to "--" (defect above): a
+            # dash-prefixed VALUE (e.g. "-0000000") must still be
+            # redacted; only a genuine "--"-prefixed long flag is
+            # treated as this flag being boolean/valueless.
+            if j < n and not chunks[j][1] and not chunks[j][0].startswith("--"):
                 out[j] = _REDACTION_PLACEHOLDER
                 i = j + 1
                 continue
@@ -2570,16 +2591,29 @@ class SSHManager:
                 _safe_log_value(str(e)),
             )
             raise
-        except OSError as e:
+        # `except asyncio.TimeoutError` MUST precede `except OSError`: on
+        # Python >=3.11 `asyncio.TimeoutError is TimeoutError`, and
+        # `TimeoutError` is itself a subclass of `OSError`. With OSError
+        # listed first (the previous ordering) the TimeoutError handler
+        # below was unreachable dead code — every `asyncio.wait_for`
+        # timeout was silently caught by the OSError branch and logged
+        # with the less specific "OS error connecting" message instead
+        # of "Timeout connecting". Reordering (rather than deleting the
+        # TimeoutError branch) preserves the more specific message for
+        # the common "server unreachable within command_timeout" case,
+        # while a genuine OSError that is NOT a timeout (e.g.
+        # ConnectionRefusedError) still falls through to the OSError
+        # branch below.
+        except asyncio.TimeoutError as e:
             logger.error(
-                "OS error connecting to %s: %s",
+                "Timeout connecting to %s: %s",
                 _safe_log_value(server.name),
                 _safe_log_value(str(e)),
             )
             raise
-        except asyncio.TimeoutError as e:
+        except OSError as e:
             logger.error(
-                "Timeout connecting to %s: %s",
+                "OS error connecting to %s: %s",
                 _safe_log_value(server.name),
                 _safe_log_value(str(e)),
             )
