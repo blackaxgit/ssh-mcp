@@ -276,18 +276,30 @@ jobs:
           done <<< "$TAGS"
           docker buildx imagetools create "${TAG_ARGS[@]}" "${IMAGE}@${DIGEST}"
 
-      # Intended as proof, in the job log, that every published tag resolves to
-      # the bytes Trivy cleared. As written the check cannot pass: `imagetools
-      # create` above wraps the single-platform manifest in a NEW OCI index, so
-      # the tag's digest legitimately differs from the scanned one (and hashing
-      # `inspect --raw` stdout folds in a trailing newline the registry's
-      # manifest bytes do not have). Since 2026-07-26 it fails on every publish
-      # run — after the tags are already live — which also stops the attest step
-      # below from running. A failure here means the comparison is broken, NOT
-      # that the scan gate was bypassed. FIXME: compare the manifest digest the
-      # registry reports (`imagetools inspect --format '{{.Manifest.Digest}}'`),
-      # accounting for the index wrapping.
-      - name: Verify every tag resolves to the scanned digest
+      # Proof, in the job log, that every published tag serves the bytes Trivy
+      # cleared — nothing more.
+      #
+      # Production incident 2026-07-26: the original check compared
+      # `sha256sum` of `imagetools inspect --raw` against the build digest and
+      # failed on EVERY publish run, taking the attest step below down with it
+      # (images published between 2026-07-26 and this fix carry no provenance
+      # attestation). Confirmed cause: `imagetools create` does NOT reuse the
+      # source digest — it wraps the single-platform manifest in a NEW OCI
+      # index, so the tag's own digest legitimately differs from the scanned
+      # manifest's. Verified against the live registry: `:latest` was index
+      # sha256:8204263e… whose sole child was the scanned sha256:12db37ce…,
+      # and re-hashing those bytes reproduces 8204263e exactly.
+      # (Piping `inspect --raw` into `sha256sum` is separately fragile if the
+      # CLI appends a newline — not the cause here, but a reason not to go back
+      # to hashing stdout.)
+      #
+      # So compare the right thing: the set of image manifests the tag actually
+      # serves must be exactly {scanned digest}. Attestation manifests that
+      # buildx/attest may attach are excluded — they are metadata about the
+      # image, not another runnable image. Do not "simplify" this back to
+      # comparing the tag's own digest; that asserts an invariant the promote
+      # step deliberately does not hold.
+      - name: Verify every tag serves only the scanned digest
         if: env.PUBLISH == 'true'
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
@@ -296,17 +308,33 @@ jobs:
           set -euo pipefail
           while IFS= read -r tag; do
             [ -z "$tag" ] && continue
-            resolved="$(docker buildx imagetools inspect --raw "$tag" | sha256sum | cut -d' ' -f1)"
-            echo "${tag} -> sha256:${resolved} (scanned ${DIGEST})"
-            if [ "sha256:${resolved}" != "${DIGEST}" ]; then
-              echo "::error::${tag} does not resolve to the scanned digest ${DIGEST}" >&2
+            raw="$(docker buildx imagetools inspect --raw "$tag")"
+            # An index lists children under .manifests; a bare manifest has none.
+            served="$(printf '%s' "$raw" | jq -r '
+              if .manifests then
+                [ .manifests[]
+                  | select((.annotations["vnd.docker.reference.type"] // "")
+                           != "attestation-manifest")
+                  | .digest ] | join(" ")
+              else
+                empty
+              end')"
+            if [ -z "$served" ]; then
+              served="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$tag")"
+            fi
+            echo "${tag} serves: ${served} (scanned ${DIGEST})"
+            for d in $served; do
+              if [ "$d" != "${DIGEST}" ]; then
+                echo "::error::${tag} serves ${d}, which is not the scanned digest ${DIGEST}" >&2
+                exit 1
+              fi
+            done
+            if [ -z "$served" ]; then
+              echo "::error::${tag} resolved to no image manifest at all" >&2
               exit 1
             fi
           done <<< "$TAGS"
 
-      # Unreachable on the publish path today: the verify step above fails
-      # first, so images pushed to GHCR since 2026-07-26 carry no provenance
-      # attestation. Fixing verify restores this.
       - name: Attest build provenance for the image
         if: env.PUBLISH == 'true'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
