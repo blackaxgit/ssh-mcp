@@ -496,6 +496,50 @@ def test_release_workflow_uses_environment_gate() -> None:
     )
 
 
+def test_github_release_survives_a_failed_pypi_publish() -> None:
+    """Release incident 2026-07-26 (v0.6.0): ``github-release`` had
+    ``needs: [publish-pypi]`` and no ``if:``, so a PyPI-side trusted-publisher
+    misconfiguration — which fails the token exchange *before* any upload —
+    also SKIPPED the GitHub Release. The tag and container image were published
+    but the release record and its artifacts were lost, and re-running could not
+    recover them, because a tag's workflow is pinned at the tag ref. The release
+    had to be recreated by hand.
+
+    A GitHub Release documents the tag; PyPI is an independent distribution
+    channel. So the job must still run when ``publish-pypi`` fails, while not
+    running when there is no artifact to attach.
+    """
+    workflow = _load_workflow(RELEASE_WORKFLOW_PATH)
+    job = workflow["jobs"].get("github-release")
+    assert job, "release.yml does not define a github-release job"
+
+    needs = _needs(job)
+    assert "build" in needs, (
+        "github-release does not depend on `build`, so it can run with no "
+        "distribution artifact to attach"
+    )
+
+    condition = str(job.get("if", ""))
+    assert condition, (
+        "github-release has no `if:`, so it inherits the default "
+        "'skip if any dependency failed'. A failed PyPI upload — including a "
+        "registry-side config error that uploads nothing — would silently take "
+        "the GitHub Release down with it. Use `always()` plus an explicit "
+        "`needs.build.result` check."
+    )
+    assert "always()" in condition, (
+        f"github-release `if:` is {condition!r}, which does not use always(); "
+        "it will still be skipped when publish-pypi fails"
+    )
+    # always() alone would also run the job after a FAILED build, when there is
+    # no artifact — so the build result must be checked explicitly.
+    assert "needs.build.result" in condition, (
+        f"github-release `if:` is {condition!r}. With always() but no "
+        "needs.build.result check, the job also runs after a failed build and "
+        "fails confusingly on a missing artifact instead of being skipped."
+    )
+
+
 # --- failure-path coverage for the helpers ---------------------------------
 
 
