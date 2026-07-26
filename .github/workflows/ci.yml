@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -10,10 +11,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -21,15 +26,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+        with:
+          version: "0.11.32"
+          enable-cache: true
 
       - name: Install Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
 
       - name: Run tests
         run: uv run python -m pytest tests/ -v --cov=ssh_mcp --cov-report=term-missing
@@ -37,18 +47,25 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+        with:
+          version: "0.11.32"
+          enable-cache: true
 
       - name: Install Python
         run: uv python install 3.13
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
 
       # ruff and bandit come from the LOCKED dev env at a pinned version.
       # `uvx` was used here previously; it floats to the newest release, so
@@ -84,18 +101,25 @@ jobs:
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+        with:
+          version: "0.11.32"
+          enable-cache: true
 
       - name: Install Python
         run: uv python install 3.13
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
 
       - name: Audit dependencies
         run: uv run pip-audit
@@ -111,14 +135,24 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write        # sign the provenance/SBOM attestations
+      attestations: write    # record them
+    env:
+      # Single source of truth. Used by build, scan, promote and attest so the
+      # four steps cannot drift apart.
+      IMAGE: ghcr.io/${{ github.repository }}
+      # Publishing is the exception, not the default. PRs build + scan only.
+      PUBLISH: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4
 
       - name: Log in to GHCR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: env.PUBLISH == 'true'
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4
         with:
           registry: ghcr.io
@@ -129,12 +163,38 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build Docker image (local)
+      # -----------------------------------------------------------------------
+      # ONE build. On the publish path it goes straight to GHCR *by digest* —
+      # no tag is attached, so nothing in the registry is reachable by name
+      # until Trivy has passed. On PRs the same build is loaded locally.
+      #
+      # provenance/sbom are disabled on purpose: BuildKit's inline attestations
+      # wrap the image in an index, which complicates digest promotion, and
+      # GHCR's Referrers API support for them is incomplete. GitHub Artifact
+      # Attestations (below) cover the same ground with a working verifier.
+      # -----------------------------------------------------------------------
+      - name: Build image (publish path — push by digest, no tags)
+        id: build
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
+        with:
+          context: .
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build image (PR path — local only)
+        id: build_local
+        if: env.PUBLISH != 'true'
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
         with:
           context: .
@@ -144,20 +204,69 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+      # -----------------------------------------------------------------------
+      # Scan the EXACT digest that was pushed. `${IMAGE}@sha256:…` is content-
+      # addressed: there is no tag in the reference, so nothing can have been
+      # substituted between the build step and this one.
+      # -----------------------------------------------------------------------
+      - name: Scan published digest with Trivy
+        if: env.PUBLISH == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL
+          exit-code: 1
+          trivyignores: .trivyignore
+
+      - name: Scan local image with Trivy
+        if: env.PUBLISH != 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: ssh-mcp:ci
           severity: CRITICAL
           exit-code: 1
           trivyignores: .trivyignore
 
-      - name: Push to GHCR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
+      # -----------------------------------------------------------------------
+      # Only now does a human-readable tag come into existence, and it is
+      # created FROM the scanned digest. No rebuild, no second BuildKit run.
+      # -----------------------------------------------------------------------
+      - name: Promote scanned digest to tags
+        if: env.PUBLISH == 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          TAG_ARGS=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && TAG_ARGS+=(--tag "$tag")
+          done <<< "$TAGS"
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${IMAGE}@${DIGEST}"
+
+      # Proof, in the job log, that every published tag resolves to the bytes
+      # Trivy cleared. If this ever fails, the scan gate has been bypassed.
+      - name: Verify every tag resolves to the scanned digest
+        if: env.PUBLISH == 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            resolved="$(docker buildx imagetools inspect --raw "$tag" | sha256sum | cut -d' ' -f1)"
+            echo "${tag} -> sha256:${resolved} (scanned ${DIGEST})"
+            if [ "sha256:${resolved}" != "${DIGEST}" ]; then
+              echo "::error::${tag} does not resolve to the scanned digest ${DIGEST}" >&2
+              exit 1
+            fi
+          done <<< "$TAGS"
+
+      - name: Attest build provenance for the image
+        if: env.PUBLISH == 'true'
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
+          subject-name: ${{ env.IMAGE }}   # no tag — the digest identifies the subject
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

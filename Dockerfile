@@ -43,9 +43,11 @@ WORKDIR /app
 # Copy virtual environment from builder with proper ownership
 COPY --from=builder --chown=sshmcp:sshmcp /app/.venv /app/.venv
 
-# Add venv to PATH
+# Add venv to PATH and set HOME for expanduser() to resolve ~ correctly
+# when the transfer_root setting defaults under $XDG_DATA_HOME or ~/.local/share.
 ENV PATH=/app/.venv/bin:$PATH \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/sshmcp
 
 # Switch to non-root user
 USER sshmcp
