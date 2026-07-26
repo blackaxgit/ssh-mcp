@@ -330,8 +330,8 @@ chmod 600 ~/.config/ssh-mcp/servers.toml
 | `list_groups` | List server groups with member counts |
 | `execute` | Run a shell command on a single server (supports `force` to bypass dangerous-command detection) |
 | `execute_on_group` | Run a command on all servers in a group (parallel; supports `fail_fast` and `force`) |
-| `upload_file` | Upload a local file to a server via SFTP (validates both local and remote paths) |
-| `download_file` | Download a file from a server via SFTP (validates both local and remote paths) |
+| `upload_file` | Upload a file to a server via SFTP. Local path is relative to `transfer_root` |
+| `download_file` | Download a file from a server via SFTP. Local path is relative to `transfer_root`; will not overwrite |
 
 ## Security
 
@@ -351,13 +351,25 @@ When `force=true` is used, the audit log records the bypass explicitly so the op
 
 > **Known limitation: command OUTPUT is NOT redacted.** If you run `cat /etc/mysql/my.cnf`, `env | grep PASSWORD`, or `kubectl get secret X -o yaml`, the stdout/stderr returned to the MCP client will contain plaintext secrets. The redaction pipeline only filters the COMMAND string (what you asked to run), not the OUTPUT (what it printed). Avoid running commands that print secrets via ssh-mcp — pass credentials through env vars, Docker/K8s secrets, or dedicated config files instead.
 
-**Path validation.** SFTP `upload_file` and `download_file` validate **both** remote and local paths. Any of these block the transfer:
+**Local path confinement (changed in 0.6.0).** SFTP `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Every local path is **relative to a configured transfer root** and is resolved one component at a time beneath it, refusing a symbolic link at *any* component:
 
-- Sensitive Unix paths: `/etc/shadow`, `/etc/passwd`
-- SSH key material: `~/.ssh/authorized_keys`, `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, `~/.ssh/id_dsa`
-- Any path containing `..` (parent traversal)
+```toml
+[settings]
+transfer_root = "~/.local/share/ssh-mcp/transfers"   # default; honours $XDG_DATA_HOME
+```
 
-This prevents an LLM client from exfiltrating secrets on either the MCP host or a managed server.
+Override with the `SSH_MCP_TRANSFER_ROOT` environment variable. The directory is created `0700` on demand, must be owned by the user running ssh-mcp, and must not itself be a symlink — ssh-mcp refuses to start a transfer otherwise.
+
+Consequences, all deliberate:
+
+- **Absolute local paths and `..` are rejected.** Sub-directories are allowed, but they must already exist.
+- **Downloads do not overwrite.** An existing destination fails rather than being silently replaced. A failed transfer removes its own partial file.
+- **Remote non-regular files** (symlinks, devices, FIFOs) are refused on a best-effort basis. SFTP protocol v3 offers no atomic no-follow open, so a remote server that swaps the file between the check and the open can still win that race; the *local* destination stays confined regardless.
+- Remote paths keep the existing sensitive-path denylist.
+
+Prior versions validated the caller's path *string* against a denylist and then handed that string to asyncssh, which resolved it independently — so anything not enumerated was writable. Confinement replaces enumeration: ssh-mcp opens the local file itself and never lets a caller-supplied path reach the SFTP library.
+
+**Migrating from ≤ 0.5.x:** replace absolute local paths with names relative to `transfer_root`, or set `transfer_root` to the directory you were already using. There is no flag to restore the old behaviour.
 
 **Host key verification** is on by default (`known_hosts = true`). Disabling `StrictHostKeyChecking` in `~/.ssh/config` weakens MITM protection and should be avoided in production.
 

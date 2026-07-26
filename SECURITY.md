@@ -4,9 +4,17 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | Yes       |
+| 0.6.x   | Yes       |
+| ≤ 0.5.6 | No        |
 
-Older versions are not supported. Please upgrade to the latest 0.1.x release before reporting an issue.
+Older versions are not supported. Please upgrade to the latest 0.6.x release before reporting an issue.
+
+**0.6.0 contains security fixes. Versions ≤ 0.5.6 are affected by a local-path
+confinement flaw in the SFTP tools that allows an MCP client to write to
+arbitrary paths on the machine running ssh-mcp, including files that lead to
+code execution there.** See the CHANGELOG entry for 0.6.0. Upgrade rather than
+patching in place; the fix changes the `upload_file`/`download_file` path
+contract.
 
 ## Reporting a Vulnerability
 
@@ -46,7 +54,9 @@ The `execute` and `execute_on_group` tools run arbitrary shell commands on remot
 
 ### Dangerous Command Detection
 
-ssh-mcp warns before executing commands that are commonly destructive (e.g., `rm -rf`, disk wipes, shutdown). These warnings are a safety feature, not a vulnerability. They are intentionally non-blocking to preserve tool utility; the responsibility for authorizing commands lies with the operator.
+ssh-mcp **blocks** commands matching a list of commonly destructive patterns (e.g. `rm -rf /`, `mkfs`, disk wipes) and returns an error instead of executing them. A caller may bypass the block by passing `force=true`, which is recorded in the audit log. This is a safety feature, not a vulnerability.
+
+The pattern list is a **tripwire for accidents, not a security boundary**: base64-encoded payloads, shell hex escapes, Unicode homoglyphs and indirection via `$(...)`/`eval` are acknowledged bypasses. See the README for the full statement of what it does and does not defend against. The responsibility for authorizing commands lies with the operator.
 
 ### known_hosts Verification
 
@@ -68,6 +78,6 @@ The `upload_file` and `download_file` tools transfer files using SFTP over the s
 
 The following behaviors are intentional design decisions, not security flaws:
 
-- Dangerous command warnings that can be bypassed — warnings are informational guardrails, not hard blocks
+- Dangerous-command blocks bypassed via the documented `force=true` parameter, or via obfuscation (base64, hex escapes, homoglyphs, subshell indirection) — the pattern list is a documented tripwire, not a security boundary
 - The tool executing whatever command the invoking AI assistant sends — access control is the operator's responsibility via SSH permissions
 - Lack of a built-in allowlist/blocklist for commands — this is a general-purpose infrastructure tool

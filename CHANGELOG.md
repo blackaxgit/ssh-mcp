@@ -7,11 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-> **Release note for whoever cuts this:** the `mcp` floor in `[project.dependencies]` is narrowed from `>=1.27.0` to `>=1.28.1`. Narrowing a declared dependency range is a **minor**-level change, so this should ship as **0.6.0**, not 0.5.7.
+> **Release note for whoever cuts this:** ship as **0.6.0**, not 0.5.7. Two independent reasons: the `mcp` floor in `[project.dependencies]` is narrowed from `>=1.27.0` to `>=1.28.1`, and the SFTP local-path contract is a **breaking change** (see *Local path confinement* below).
 
-### Security
+### Security — please read if you run ssh-mcp
 
-Cleared every advisory reported by `pip-audit`. **None of the four is exploitable in ssh-mcp** — this is defence-in-depth and a CI unblock, not an incident response. Being precise, because the two are not the same thing: three of the four are *unreachable* (the vulnerable code is never imported or never called), while CVE-2026-52869's session manager **is** in the HTTP request path — it is reachable but its exploit precondition cannot be satisfied by ssh-mcp's authentication model. Details per advisory below. Reachability was verified by grep over `src/` and the non-exploitability argument for CVE-2026-52869 was independently stress-tested by two external models.
+**Versions ≤ 0.5.6 are affected by a local-path confinement flaw in the SFTP tools. Upgrade.** An MCP client — including one steered by prompt injection — could use `download_file` to write to effectively any path on the machine running ssh-mcp, and from there to code execution on that machine. This is the operator's own workstation or container, not the managed fleet, and it was reachable in the default `uvx ssh-mcp` stdio deployment. There is no configuration that mitigates it on an affected version.
+
+The cause was that `upload_file`/`download_file` validated the caller's path *string* against a denylist of sensitive paths and then handed that string to asyncssh, which resolved it independently. Three consequences, all verified against a live SFTP server:
+
+1. Anything not enumerated in the denylist was permitted — shell startup files, `~/Library/LaunchAgents/*.plist`, ssh-mcp's own `servers.toml`, and the installed package itself were all writable.
+2. asyncssh rewrites an existing-*directory* destination to `<dir>/<basename>`, a path validation never saw. So `~/.ssh` passed while `~/.ssh/config` was blocked, and the file landed at `~/.ssh/config` anyway — from which a planted `ProxyCommand` executes on the next connection.
+3. A downloaded symlink was recreated locally, and asyncssh's local writer follows symlinks, so a later write went *through* it.
+
+**Fixed by confining the operation rather than validating the name.** ssh-mcp now opens the local file itself, one path component at a time beneath a configured transfer root, refusing a symlink at any component, and drives the remote side through the public `sftp.open()` API with its own copy loop. asyncssh never resolves a local path, so consequences (2) and (3) are unreachable code rather than defended-against behaviour. **This changes the `upload_file`/`download_file` contract — see *Local path confinement* under Changed.**
+
+Two further hardening fixes in the same area: the audit record now reports the file actually written (it previously reported the destination *directory* on a directory destination, concealing exactly this exploitation), and a failed download removes its own partial file instead of leaving attacker-supplied bytes behind.
+
+**Denial of service in credential redaction.** `_redact_secrets` ran in quadratic time, so a ~10 KB command stalled the single-threaded server for over six seconds, reachable without an SSH connection or SSH authentication via `dry_run=true`. There was no length limit on a command anywhere. Redaction is now a linear token-wise scan (~0.007 s for 100 KB), and `max_command_bytes` (default 64 KiB) caps command length at the tool boundary. Multi-word *quoted* credential values remain only partially redacted — unchanged from previous behaviour; redaction is a tripwire, and credentials should be passed via env files or stdin rather than argv.
+
+**Audit records could be forged.** The success and timeout audit paths interpolated the command without escaping control characters, so an embedded newline produced a convincing fake log line. All audit paths now escape.
+
+Also cleared every advisory reported by `pip-audit`. **None of the four is exploitable in ssh-mcp** — this is defence-in-depth and a CI unblock, not an incident response. Being precise, because the two are not the same thing: three of the four are *unreachable* (the vulnerable code is never imported or never called), while CVE-2026-52869's session manager **is** in the HTTP request path — it is reachable but its exploit precondition cannot be satisfied by ssh-mcp's authentication model. Details per advisory below. Reachability was verified by grep over `src/` and the non-exploitability argument for CVE-2026-52869 was independently stress-tested by two external models.
 
 - **PYSEC-2026-2132 / CVE-2026-7246** (click, CVSS 7.2 HIGH, CWE-78) — command injection in `click.edit()`: the `filename` argument was interpolated into a shell string with its quotes unescaped. Bumped 8.3.1 → **8.4.2** (advisory fix floor is 8.3.3). `click` reaches ssh-mcp only via `mcp[cli]` → `typer` → `click` and `uvicorn` → `click`; ssh-mcp never imports it (its CLI parses `sys.argv` directly), so `click.edit()` is unreachable.
 - **PYSEC-2026-3481 / CVE-2026-52870** (mcp, High 7.6, CWE-862) — missing authorization in the experimental tasks handlers. Unreachable: requires opt-in `enable_tasks()`, never called.
@@ -20,7 +36,35 @@ Cleared every advisory reported by `pip-audit`. **None of the four is exploitabl
 - **`mcp` bumped 1.27.0 → 1.28.1** in both `uv.lock` and `[project.dependencies]`. The `pyproject.toml` floor is the load-bearing half: `[project.dependencies]` is the only declaration that reaches the published wheel's `METADATA`, so a lockfile-only bump would have left `pip install ssh-mcp` free to resolve a vulnerable 1.27.0. stdio mode was unaffected by all three `mcp` advisories.
 - Added **`[tool.uv] constraint-dependencies = ["click>=8.3.3"]`** to record the transitive floor. Deliberately *not* added to `[project.dependencies]`, which would assert a dependency edge ssh-mcp does not have. Without this, a future `uv lock` regeneration could silently drop back below the fix.
 
+### Changed — BREAKING
+
+**Local path confinement.** `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Local paths are now **relative to a `transfer_root`** (new `[settings]` key; defaults under `$XDG_DATA_HOME` or `~/.local/share`; override with `SSH_MCP_TRANSFER_ROOT`). The directory is created `0700`, must be owned by the running user, and must not itself be a symlink.
+
+- Absolute local paths and `..` are rejected. Sub-directories are allowed but must already exist.
+- **Downloads no longer overwrite** — an existing destination fails rather than being silently replaced.
+- Remote non-regular files (symlinks, devices, FIFOs) are refused on a best-effort basis. SFTP v3 has no atomic no-follow open, so a remote server can still win the check-to-open race; the local destination stays confined regardless.
+- **Migrating:** replace absolute local paths with names relative to `transfer_root`, or point `transfer_root` at the directory you were already using. There is no flag to restore the previous behaviour.
+
+**`max_output_bytes` now bounds memory, not just the response.** Output is consumed incrementally and the remote process is terminated once the budget is spent, where previously the entire output was buffered before truncation — so a large `cat` could exhaust memory regardless of the setting. The limit is now counted in real bytes; it was previously character-based, which overran the stated limit roughly 4x on multibyte output. Note the budget is per-stream, so the combined ceiling is 2x the setting.
+
+**`max_parallel_hosts` now bounds the process, not one call.** The concurrency semaphore was created per `execute_on_group` invocation, so N concurrent calls allowed N x the limit — up to 2560 in HTTP mode against a container with a 1024 file-descriptor limit, which is the exhaustion this setting exists to prevent. It is now shared. Independent group calls therefore queue behind one another, which is the documented intent but a behaviour change.
+
 ### Fixed
+
+**`execute_on_group(fail_fast=true)` reported hosts that had run the command as "Cancelled".** After the first failure, results from hosts that had already completed successfully were discarded and those hosts were labelled cancelled — in 60 of 60 trials with uniform timing. For a destructive fleet command this told the operator a host was skipped when it had executed. Completed results are now reported, and the wording for the remainder admits the command may already have been dispatched: cancelling a local task does not stop a command already on the wire.
+
+**`~` was not expanded unless `[settings]` was present.** A minimal `servers.toml` left the default `ssh_config_path` as the literal `~/.ssh/config`, so every connection failed with `FileNotFoundError`. `identity_file` was never expanded at all, so a `~`-prefixed key silently failed to authenticate. Expansion now happens at the model boundary, for every path field.
+
+**Connection-pool defects.** A lock was created for a server name *before* the name was validated, so unknown names — reachable straight from tool arguments — accumulated locks permanently. The idle-eviction loop also removed a lock while holding it, orphaning any waiter and letting two callers enter the same critical section, which could leak an unclosed connection.
+
+**The dangerous-command tripwire missed plain variants.** `rm -r -f /`, `rm --recursive --force /`, `chmod 777 -R /` and `dd of=… if=…` all passed, contradicting the `execute` docstring's explicit claim to catch them. Obfuscated bypasses remain out of scope by design and are documented as such.
+
+**The stdio healthcheck reported healthy without a usable config.** It only parsed a config when `SSH_MCP_CONFIG` was set and pointed at an existing file, so a container with no configuration passed its Docker liveness gate. It now resolves the config the same way the server does.
+
+**Command results no longer discard output.** `format_exec_result` dropped stdout, stderr and the exit code whenever an error was set — a state the `ExecResult` contract documents as reachable and meaning "ran but had issues", i.e. exactly when the output matters for diagnosis.
+
+**SFTP no longer raises a bare `KeyError`** for an unknown server, which fell outside its documented `ValueError`/`RuntimeError` contract. A non-ASCII bearer token now returns 401 rather than 500 (it always failed closed). `$XDG_CONFIG_HOME` is honoured for the config search path, matching the new `$XDG_DATA_HOME` handling.
+
 
 - **CI `Lint` job was non-deterministic and had begun failing on unmodified code.** It invoked `uvx ruff` and `uvx bandit`; `uvx` resolves the newest release at run time. ruff **0.16.0** (2026-07-23) expanded its default rule set from **59 to 413 rules**, so the same command that printed `All checks passed!` on 2026-07-16 reported 50 errors days later with zero code changes. Lint tooling is now pinned (`ruff==0.16.0`, `bandit==1.9.4`) in the `dev` extra and invoked via `uv run`, so the gate is a function of the commit rather than of the outside world.
 - **The repo now declares its own lint standard.** There was no `[tool.ruff]` config at all, so the standard was whatever default the installed ruff happened to ship. `[tool.ruff.lint] select = ["E4", "E7", "E9", "F"]` codifies the pre-0.16 default the codebase has always been held to and is 100% clean against — no rule is dropped. Adopting ruff 0.16's wider default is tracked as a separate deliberate change.
@@ -29,11 +73,17 @@ Cleared every advisory reported by `pip-audit`. **None of the four is exploitabl
 
 - **`pip-audit` moved out of the `lint` job into a dedicated `audit` job**, and `docker` now declares `needs: [test, lint, audit]`. The audit's input is the live advisory database, not the commit, so a newly published CVE against any transitive dependency fails every open PR at once; a dedicated job makes that failure attributable instead of masquerading as a lint error. The gate is **not** weakened. Two parts, with different guarantees: the GHCR publish is gated **unconditionally and in-workflow** — the previously *implicit* dependency of `docker` on the audit is now an explicit `needs:` entry. PR blocking, however, is enforced by branch protection, so it holds **only once `Dependency audit` is added to the required-checks list** (see *Operator action required* below). Until then the audit runs on every PR but does not block merges.
 - **New `.github/workflows/audit.yml`** runs `pip-audit` daily at 06:00 UTC plus on demand via `workflow_dispatch`, so new advisories are discovered on a schedule and remediated in their own PR rather than first appearing as noise on an unrelated one. Note: `main` will now show a red scheduled run whenever a new advisory lands and remains unremediated.
+- Replaced the private Starlette `router.lifespan_context` dependency with the SDK's public `FastMCP.session_manager`.
 - Added `pyyaml>=6.0` to the `dev` extra (used by the new CI-invariant tests; previously present only transitively via bandit).
 - `.gitignore` now covers `.coverage` / `.coverage.*`.
 - **`.trivyignore`: two new `perl-base` entries** — `CVE-2026-13221` (regex trie >65535 branches → silently incorrect matches) and `CVE-2026-57433` (Storable `SX_HOOK` signed-integer overflow → deserialization panic). Both surfaced as CRITICAL on the **first Trivy run the `docker` job ever completed**: while `Lint` was red, `docker` was skipped and the image scan never executed, so these were latent rather than new. Verified against the Debian security tracker — trixie is `vulnerable` at perl 5.40.1-6 with **no fixed version published for trixie** — so they meet the existing ignore policy (unfixable OS CVEs only, with a stated reason and review date). perl is not used at runtime by this pure-Python app. The `severity: CRITICAL` threshold was **not** changed and no fixable CVE is ignored. Note for the next base-image bump: `CVE-2026-57433` *is* fixed in Debian sid (5.42.2-3) and forky (5.40.1-8), so it becomes fixable and must be deleted from the ignore list once the image moves off trixie.
 
 ### Added
+
+- **`transfer_root`** setting and `SSH_MCP_TRANSFER_ROOT` environment override (see Changed).
+- **`max_command_bytes`** setting (default 64 KiB), enforced at the MCP tool boundary.
+- `src/ssh_mcp/paths.py` — symlink-safe path confinement primitive. Documents its own residual risk: a same-filesystem rename of an intermediate directory between two `openat` calls is closed only by Linux `openat2(RESOLVE_BENEATH)`, which CPython does not expose and macOS has no equivalent for. Mitigated by requiring the root to be owner-only.
+- `.gitleaksignore` recording the synthetic credential fixtures in the redaction test corpus, so a genuinely new finding is not lost in known noise.
 
 - `tests/test_dependency_floors.py` — asserts every security-motivated version floor both holds in the resolved environment and is declared in `pyproject.toml` at the layer matching the dependency's kind. Runs offline with no advisory-DB access, so it catches a lockfile regression that `pip-audit` structurally cannot detect without network.
 - `tests/test_ci_lint_determinism.py` — asserts no linter is invoked through `uvx`, lint tools are exactly pinned, the ruff rule set is declared, `pip-audit` has its own job, the scheduled audit workflow exists, and **the `docker` publish job depends on `audit`**. That last assertion guards a regression caught during cross-model review: relocating `pip-audit` to a separate workflow would have silently removed it from the image-publish path, because GitHub Actions `needs:` cannot span workflows.
@@ -76,6 +126,11 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 
 ### Added
 
+- **`transfer_root`** setting and `SSH_MCP_TRANSFER_ROOT` environment override (see Changed).
+- **`max_command_bytes`** setting (default 64 KiB), enforced at the MCP tool boundary.
+- `src/ssh_mcp/paths.py` — symlink-safe path confinement primitive. Documents its own residual risk: a same-filesystem rename of an intermediate directory between two `openat` calls is closed only by Linux `openat2(RESOLVE_BENEATH)`, which CPython does not expose and macOS has no equivalent for. Mitigated by requiring the root to be owner-only.
+- `.gitleaksignore` recording the synthetic credential fixtures in the redaction test corpus, so a genuinely new finding is not lost in known noise.
+
 - **`ssh-mcp healthcheck` CLI subcommand** — built-in liveness probe that auto-detects transport (stdio vs streamable-http), respects auth env vars (`SSH_MCP_HTTP_TOKEN`, `SSH_MCP_HTTP_TOKEN_FILE`, `SSH_MCP_HTTP_AUTH=none`), and performs a real MCP `initialize` handshake in HTTP mode. Uses Python stdlib only, 3-second timeout, exits 0 healthy / 1 unhealthy.
 - New module `src/ssh_mcp/healthcheck.py` with unit tests in `tests/test_healthcheck.py`.
 
@@ -84,7 +139,35 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 - **Dockerfile `HEALTHCHECK`** now uses the built-in `ssh-mcp healthcheck` subcommand instead of the old `python -c "import ssh_mcp"` liveness-only check. The new check performs a real MCP protocol handshake in HTTP mode, so a container marked "healthy" actually means the MCP tools respond correctly — not just that the Python package is importable.
 - **`compose.yaml`** — removed the ~40-line inline Python healthcheck block from the commented `ssh-mcp-http` service template. Operators no longer need to embed credential-handling Python in their compose files. The Dockerfile's baked-in HEALTHCHECK handles both stdio and HTTP modes automatically.
 
+### Changed — BREAKING
+
+**Local path confinement.** `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Local paths are now **relative to a `transfer_root`** (new `[settings]` key; defaults under `$XDG_DATA_HOME` or `~/.local/share`; override with `SSH_MCP_TRANSFER_ROOT`). The directory is created `0700`, must be owned by the running user, and must not itself be a symlink.
+
+- Absolute local paths and `..` are rejected. Sub-directories are allowed but must already exist.
+- **Downloads no longer overwrite** — an existing destination fails rather than being silently replaced.
+- Remote non-regular files (symlinks, devices, FIFOs) are refused on a best-effort basis. SFTP v3 has no atomic no-follow open, so a remote server can still win the check-to-open race; the local destination stays confined regardless.
+- **Migrating:** replace absolute local paths with names relative to `transfer_root`, or point `transfer_root` at the directory you were already using. There is no flag to restore the previous behaviour.
+
+**`max_output_bytes` now bounds memory, not just the response.** Output is consumed incrementally and the remote process is terminated once the budget is spent, where previously the entire output was buffered before truncation — so a large `cat` could exhaust memory regardless of the setting. The limit is now counted in real bytes; it was previously character-based, which overran the stated limit roughly 4x on multibyte output. Note the budget is per-stream, so the combined ceiling is 2x the setting.
+
+**`max_parallel_hosts` now bounds the process, not one call.** The concurrency semaphore was created per `execute_on_group` invocation, so N concurrent calls allowed N x the limit — up to 2560 in HTTP mode against a container with a 1024 file-descriptor limit, which is the exhaustion this setting exists to prevent. It is now shared. Independent group calls therefore queue behind one another, which is the documented intent but a behaviour change.
+
 ### Fixed
+
+**`execute_on_group(fail_fast=true)` reported hosts that had run the command as "Cancelled".** After the first failure, results from hosts that had already completed successfully were discarded and those hosts were labelled cancelled — in 60 of 60 trials with uniform timing. For a destructive fleet command this told the operator a host was skipped when it had executed. Completed results are now reported, and the wording for the remainder admits the command may already have been dispatched: cancelling a local task does not stop a command already on the wire.
+
+**`~` was not expanded unless `[settings]` was present.** A minimal `servers.toml` left the default `ssh_config_path` as the literal `~/.ssh/config`, so every connection failed with `FileNotFoundError`. `identity_file` was never expanded at all, so a `~`-prefixed key silently failed to authenticate. Expansion now happens at the model boundary, for every path field.
+
+**Connection-pool defects.** A lock was created for a server name *before* the name was validated, so unknown names — reachable straight from tool arguments — accumulated locks permanently. The idle-eviction loop also removed a lock while holding it, orphaning any waiter and letting two callers enter the same critical section, which could leak an unclosed connection.
+
+**The dangerous-command tripwire missed plain variants.** `rm -r -f /`, `rm --recursive --force /`, `chmod 777 -R /` and `dd of=… if=…` all passed, contradicting the `execute` docstring's explicit claim to catch them. Obfuscated bypasses remain out of scope by design and are documented as such.
+
+**The stdio healthcheck reported healthy without a usable config.** It only parsed a config when `SSH_MCP_CONFIG` was set and pointed at an existing file, so a container with no configuration passed its Docker liveness gate. It now resolves the config the same way the server does.
+
+**Command results no longer discard output.** `format_exec_result` dropped stdout, stderr and the exit code whenever an error was set — a state the `ExecResult` contract documents as reachable and meaning "ran but had issues", i.e. exactly when the output matters for diagnosis.
+
+**SFTP no longer raises a bare `KeyError`** for an unknown server, which fell outside its documented `ValueError`/`RuntimeError` contract. A non-ASCII bearer token now returns 401 rather than 500 (it always failed closed). `$XDG_CONFIG_HOME` is honoured for the config search path, matching the new `$XDG_DATA_HOME` handling.
+
 
 - Eliminates the pain point where upgrading the healthcheck required editing every operator's compose.yaml.
 
@@ -97,6 +180,11 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 - Dangerous-command tripwire expanded: `base64 -d | bash`, `eval`, `python -c`, `perl -e`, `bash -c` (P10).
 
 ### Added
+
+- **`transfer_root`** setting and `SSH_MCP_TRANSFER_ROOT` environment override (see Changed).
+- **`max_command_bytes`** setting (default 64 KiB), enforced at the MCP tool boundary.
+- `src/ssh_mcp/paths.py` — symlink-safe path confinement primitive. Documents its own residual risk: a same-filesystem rename of an intermediate directory between two `openat` calls is closed only by Linux `openat2(RESOLVE_BENEATH)`, which CPython does not expose and macOS has no equivalent for. Mitigated by requiring the root to be owner-only.
+- `.gitleaksignore` recording the synthetic credential fixtures in the redaction test corpus, so a genuinely new finding is not lost in known noise.
 
 - `SSH_MCP_HTTP_TOKEN_FILE` env var for file-based token delivery, Docker secrets compatible (P5).
 - SFTP transfer size limit: 100 MiB default via `_MAX_SFTP_BYTES` constant (P8).
@@ -121,6 +209,11 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 
 ### Added
 
+- **`transfer_root`** setting and `SSH_MCP_TRANSFER_ROOT` environment override (see Changed).
+- **`max_command_bytes`** setting (default 64 KiB), enforced at the MCP tool boundary.
+- `src/ssh_mcp/paths.py` — symlink-safe path confinement primitive. Documents its own residual risk: a same-filesystem rename of an intermediate directory between two `openat` calls is closed only by Linux `openat2(RESOLVE_BENEATH)`, which CPython does not expose and macOS has no equivalent for. Mitigated by requiring the root to be owner-only.
+- `.gitleaksignore` recording the synthetic credential fixtures in the redaction test corpus, so a genuinely new finding is not lost in known noise.
+
 - Connection pool size periodic log in eviction loop (`Connection pool: N active, N locks` every 60s).
 - 6 new mutation-gap regression tests: audit-log redaction on success/timeout, eviction loop crash→restart, lifespan assertion, max_output_bytes bounds.
 
@@ -137,6 +230,11 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 
 ### Added
 
+- **`transfer_root`** setting and `SSH_MCP_TRANSFER_ROOT` environment override (see Changed).
+- **`max_command_bytes`** setting (default 64 KiB), enforced at the MCP tool boundary.
+- `src/ssh_mcp/paths.py` — symlink-safe path confinement primitive. Documents its own residual risk: a same-filesystem rename of an intermediate directory between two `openat` calls is closed only by Linux `openat2(RESOLVE_BENEATH)`, which CPython does not expose and macOS has no equivalent for. Mitigated by requiring the root to be owner-only.
+- `.gitleaksignore` recording the synthetic credential fixtures in the redaction test corpus, so a genuinely new finding is not lost in known noise.
+
 - 17 new tests: 4 exception-taxonomy tests (asyncssh.DisconnectError, PermissionDenied, OSError, TimeoutError), 6 tool-signature-stability tests, 3 fail_fast-cancelled-results tests, reworked bearer middleware tests for pure ASGI.
 
 ## [0.5.0] - 2026-04-12
@@ -146,7 +244,35 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 - **dry_run preview now redacts credentials.** R5 finding #4: `execute(..., dry_run=True, command="mysql -pSecret ...")` previously returned the raw command in the preview stdout. Now applies `_redact_secrets()` to the preview string.
 - **All f-string log calls converted to %-style with `_safe_log_value`.** R5 finding #5: 7 `logger.error(f"...")` calls in `_create_connection`, eviction loop, and group execution bypassed `_safe_log_value` — attacker-controlled SSH banners could inject forged log lines. All 7 now use `%s` + `_safe_log_value(str(e))`.
 
+### Changed — BREAKING
+
+**Local path confinement.** `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Local paths are now **relative to a `transfer_root`** (new `[settings]` key; defaults under `$XDG_DATA_HOME` or `~/.local/share`; override with `SSH_MCP_TRANSFER_ROOT`). The directory is created `0700`, must be owned by the running user, and must not itself be a symlink.
+
+- Absolute local paths and `..` are rejected. Sub-directories are allowed but must already exist.
+- **Downloads no longer overwrite** — an existing destination fails rather than being silently replaced.
+- Remote non-regular files (symlinks, devices, FIFOs) are refused on a best-effort basis. SFTP v3 has no atomic no-follow open, so a remote server can still win the check-to-open race; the local destination stays confined regardless.
+- **Migrating:** replace absolute local paths with names relative to `transfer_root`, or point `transfer_root` at the directory you were already using. There is no flag to restore the previous behaviour.
+
+**`max_output_bytes` now bounds memory, not just the response.** Output is consumed incrementally and the remote process is terminated once the budget is spent, where previously the entire output was buffered before truncation — so a large `cat` could exhaust memory regardless of the setting. The limit is now counted in real bytes; it was previously character-based, which overran the stated limit roughly 4x on multibyte output. Note the budget is per-stream, so the combined ceiling is 2x the setting.
+
+**`max_parallel_hosts` now bounds the process, not one call.** The concurrency semaphore was created per `execute_on_group` invocation, so N concurrent calls allowed N x the limit — up to 2560 in HTTP mode against a container with a 1024 file-descriptor limit, which is the exhaustion this setting exists to prevent. It is now shared. Independent group calls therefore queue behind one another, which is the documented intent but a behaviour change.
+
 ### Fixed
+
+**`execute_on_group(fail_fast=true)` reported hosts that had run the command as "Cancelled".** After the first failure, results from hosts that had already completed successfully were discarded and those hosts were labelled cancelled — in 60 of 60 trials with uniform timing. For a destructive fleet command this told the operator a host was skipped when it had executed. Completed results are now reported, and the wording for the remainder admits the command may already have been dispatched: cancelling a local task does not stop a command already on the wire.
+
+**`~` was not expanded unless `[settings]` was present.** A minimal `servers.toml` left the default `ssh_config_path` as the literal `~/.ssh/config`, so every connection failed with `FileNotFoundError`. `identity_file` was never expanded at all, so a `~`-prefixed key silently failed to authenticate. Expansion now happens at the model boundary, for every path field.
+
+**Connection-pool defects.** A lock was created for a server name *before* the name was validated, so unknown names — reachable straight from tool arguments — accumulated locks permanently. The idle-eviction loop also removed a lock while holding it, orphaning any waiter and letting two callers enter the same critical section, which could leak an unclosed connection.
+
+**The dangerous-command tripwire missed plain variants.** `rm -r -f /`, `rm --recursive --force /`, `chmod 777 -R /` and `dd of=… if=…` all passed, contradicting the `execute` docstring's explicit claim to catch them. Obfuscated bypasses remain out of scope by design and are documented as such.
+
+**The stdio healthcheck reported healthy without a usable config.** It only parsed a config when `SSH_MCP_CONFIG` was set and pointed at an existing file, so a container with no configuration passed its Docker liveness gate. It now resolves the config the same way the server does.
+
+**Command results no longer discard output.** `format_exec_result` dropped stdout, stderr and the exit code whenever an error was set — a state the `ExecResult` contract documents as reachable and meaning "ran but had issues", i.e. exactly when the output matters for diagnosis.
+
+**SFTP no longer raises a bare `KeyError`** for an unknown server, which fell outside its documented `ValueError`/`RuntimeError` contract. A non-ASCII bearer token now returns 401 rather than 500 (it always failed closed). `$XDG_CONFIG_HOME` is honoured for the config search path, matching the new `$XDG_DATA_HOME` handling.
+
 
 - **Eviction loop auto-restarts after crash.** R5 finding #6: if the eviction loop raised an unexpected exception, `_running` stayed `True` and the loop was permanently dead — connections accumulated without eviction until fd exhaustion. Now resets `_running = False` in the except block so the next `_get_connection()` call restarts the loop.
 - **`close_all()` prunes `_locks` dict.** R5 finding #11: `self._locks` was never cleared by `close_all()` or eviction, causing monotonic memory growth. Now both paths call `.pop()` / `.clear()` on `_locks`.
@@ -185,7 +311,35 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 - Applied to the audit log on success, the audit log on timeout, and both the dangerous-command block and timeout `logger.error` lines. Redaction is idempotent (the placeholder doesn't match any rule) so repeated passes produce identical output.
 - 28 regression tests including 2 Hypothesis property tests to fuzz the redaction pipeline on arbitrary input.
 
+### Changed — BREAKING
+
+**Local path confinement.** `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Local paths are now **relative to a `transfer_root`** (new `[settings]` key; defaults under `$XDG_DATA_HOME` or `~/.local/share`; override with `SSH_MCP_TRANSFER_ROOT`). The directory is created `0700`, must be owned by the running user, and must not itself be a symlink.
+
+- Absolute local paths and `..` are rejected. Sub-directories are allowed but must already exist.
+- **Downloads no longer overwrite** — an existing destination fails rather than being silently replaced.
+- Remote non-regular files (symlinks, devices, FIFOs) are refused on a best-effort basis. SFTP v3 has no atomic no-follow open, so a remote server can still win the check-to-open race; the local destination stays confined regardless.
+- **Migrating:** replace absolute local paths with names relative to `transfer_root`, or point `transfer_root` at the directory you were already using. There is no flag to restore the previous behaviour.
+
+**`max_output_bytes` now bounds memory, not just the response.** Output is consumed incrementally and the remote process is terminated once the budget is spent, where previously the entire output was buffered before truncation — so a large `cat` could exhaust memory regardless of the setting. The limit is now counted in real bytes; it was previously character-based, which overran the stated limit roughly 4x on multibyte output. Note the budget is per-stream, so the combined ceiling is 2x the setting.
+
+**`max_parallel_hosts` now bounds the process, not one call.** The concurrency semaphore was created per `execute_on_group` invocation, so N concurrent calls allowed N x the limit — up to 2560 in HTTP mode against a container with a 1024 file-descriptor limit, which is the exhaustion this setting exists to prevent. It is now shared. Independent group calls therefore queue behind one another, which is the documented intent but a behaviour change.
+
 ### Fixed
+
+**`execute_on_group(fail_fast=true)` reported hosts that had run the command as "Cancelled".** After the first failure, results from hosts that had already completed successfully were discarded and those hosts were labelled cancelled — in 60 of 60 trials with uniform timing. For a destructive fleet command this told the operator a host was skipped when it had executed. Completed results are now reported, and the wording for the remainder admits the command may already have been dispatched: cancelling a local task does not stop a command already on the wire.
+
+**`~` was not expanded unless `[settings]` was present.** A minimal `servers.toml` left the default `ssh_config_path` as the literal `~/.ssh/config`, so every connection failed with `FileNotFoundError`. `identity_file` was never expanded at all, so a `~`-prefixed key silently failed to authenticate. Expansion now happens at the model boundary, for every path field.
+
+**Connection-pool defects.** A lock was created for a server name *before* the name was validated, so unknown names — reachable straight from tool arguments — accumulated locks permanently. The idle-eviction loop also removed a lock while holding it, orphaning any waiter and letting two callers enter the same critical section, which could leak an unclosed connection.
+
+**The dangerous-command tripwire missed plain variants.** `rm -r -f /`, `rm --recursive --force /`, `chmod 777 -R /` and `dd of=… if=…` all passed, contradicting the `execute` docstring's explicit claim to catch them. Obfuscated bypasses remain out of scope by design and are documented as such.
+
+**The stdio healthcheck reported healthy without a usable config.** It only parsed a config when `SSH_MCP_CONFIG` was set and pointed at an existing file, so a container with no configuration passed its Docker liveness gate. It now resolves the config the same way the server does.
+
+**Command results no longer discard output.** `format_exec_result` dropped stdout, stderr and the exit code whenever an error was set — a state the `ExecResult` contract documents as reachable and meaning "ran but had issues", i.e. exactly when the output matters for diagnosis.
+
+**SFTP no longer raises a bare `KeyError`** for an unknown server, which fell outside its documented `ValueError`/`RuntimeError` contract. A non-ASCII bearer token now returns 401 rather than 500 (it always failed closed). `$XDG_CONFIG_HOME` is honoured for the config search path, matching the new `$XDG_DATA_HOME` handling.
+
 
 - **CRITICAL: Prevent file descriptor exhaustion under bursty HTTP traffic.** Production incident 2026-04-11: the container crashed with `OSError(24, 'Too many open files')` on `socket.accept()` because uvicorn's default `timeout_keep_alive=5s` combined with bursty n8n HTTP/1.1 traffic accumulated ~110 ESTABLISHED connections, eventually exceeding the Docker default 1024 fd limit. New tuning knobs with safer defaults:
   - `SSH_MCP_HTTP_KEEPALIVE_TIMEOUT` — default **2s** (down from uvicorn's 5s). Closes idle HTTP/1.1 connections fast enough that ephemeral n8n-style clients don't pile up sockets.
@@ -203,6 +357,11 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 
 ### Added
 
+- **`transfer_root`** setting and `SSH_MCP_TRANSFER_ROOT` environment override (see Changed).
+- **`max_command_bytes`** setting (default 64 KiB), enforced at the MCP tool boundary.
+- `src/ssh_mcp/paths.py` — symlink-safe path confinement primitive. Documents its own residual risk: a same-filesystem rename of an intermediate directory between two `openat` calls is closed only by Linux `openat2(RESOLVE_BENEATH)`, which CPython does not expose and macOS has no equivalent for. Mitigated by requiring the root to be owner-only.
+- `.gitleaksignore` recording the synthetic credential fixtures in the redaction test corpus, so a genuinely new finding is not lost in known noise.
+
 - **Optional HTTP authentication mode (`SSH_MCP_HTTP_AUTH`)** — set to `none` to disable the built-in bearer middleware entirely. Intended for deployments where a trusted reverse proxy (Caddy, nginx, Traefik, Envoy, Cloudflare Access, etc.) handles authentication at the edge.
 - **`SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK` escape hatch** — required when combining `SSH_MCP_HTTP_AUTH=none` with a non-localhost bind. Deliberately verbose magic-string value so no operator sets it by accident. Without the exact match, `_run_http` raises with a detailed explanation of the risk.
 - Startup now logs a loud warning banner whenever ssh-mcp is running without authentication on a non-localhost bind.
@@ -219,7 +378,35 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 
 ## [0.3.1] - 2026-04-09
 
+### Changed — BREAKING
+
+**Local path confinement.** `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Local paths are now **relative to a `transfer_root`** (new `[settings]` key; defaults under `$XDG_DATA_HOME` or `~/.local/share`; override with `SSH_MCP_TRANSFER_ROOT`). The directory is created `0700`, must be owned by the running user, and must not itself be a symlink.
+
+- Absolute local paths and `..` are rejected. Sub-directories are allowed but must already exist.
+- **Downloads no longer overwrite** — an existing destination fails rather than being silently replaced.
+- Remote non-regular files (symlinks, devices, FIFOs) are refused on a best-effort basis. SFTP v3 has no atomic no-follow open, so a remote server can still win the check-to-open race; the local destination stays confined regardless.
+- **Migrating:** replace absolute local paths with names relative to `transfer_root`, or point `transfer_root` at the directory you were already using. There is no flag to restore the previous behaviour.
+
+**`max_output_bytes` now bounds memory, not just the response.** Output is consumed incrementally and the remote process is terminated once the budget is spent, where previously the entire output was buffered before truncation — so a large `cat` could exhaust memory regardless of the setting. The limit is now counted in real bytes; it was previously character-based, which overran the stated limit roughly 4x on multibyte output. Note the budget is per-stream, so the combined ceiling is 2x the setting.
+
+**`max_parallel_hosts` now bounds the process, not one call.** The concurrency semaphore was created per `execute_on_group` invocation, so N concurrent calls allowed N x the limit — up to 2560 in HTTP mode against a container with a 1024 file-descriptor limit, which is the exhaustion this setting exists to prevent. It is now shared. Independent group calls therefore queue behind one another, which is the documented intent but a behaviour change.
+
 ### Fixed
+
+**`execute_on_group(fail_fast=true)` reported hosts that had run the command as "Cancelled".** After the first failure, results from hosts that had already completed successfully were discarded and those hosts were labelled cancelled — in 60 of 60 trials with uniform timing. For a destructive fleet command this told the operator a host was skipped when it had executed. Completed results are now reported, and the wording for the remainder admits the command may already have been dispatched: cancelling a local task does not stop a command already on the wire.
+
+**`~` was not expanded unless `[settings]` was present.** A minimal `servers.toml` left the default `ssh_config_path` as the literal `~/.ssh/config`, so every connection failed with `FileNotFoundError`. `identity_file` was never expanded at all, so a `~`-prefixed key silently failed to authenticate. Expansion now happens at the model boundary, for every path field.
+
+**Connection-pool defects.** A lock was created for a server name *before* the name was validated, so unknown names — reachable straight from tool arguments — accumulated locks permanently. The idle-eviction loop also removed a lock while holding it, orphaning any waiter and letting two callers enter the same critical section, which could leak an unclosed connection.
+
+**The dangerous-command tripwire missed plain variants.** `rm -r -f /`, `rm --recursive --force /`, `chmod 777 -R /` and `dd of=… if=…` all passed, contradicting the `execute` docstring's explicit claim to catch them. Obfuscated bypasses remain out of scope by design and are documented as such.
+
+**The stdio healthcheck reported healthy without a usable config.** It only parsed a config when `SSH_MCP_CONFIG` was set and pointed at an existing file, so a container with no configuration passed its Docker liveness gate. It now resolves the config the same way the server does.
+
+**Command results no longer discard output.** `format_exec_result` dropped stdout, stderr and the exit code whenever an error was set — a state the `ExecResult` contract documents as reachable and meaning "ran but had issues", i.e. exactly when the output matters for diagnosis.
+
+**SFTP no longer raises a bare `KeyError`** for an unknown server, which fell outside its documented `ValueError`/`RuntimeError` contract. A non-ASCII bearer token now returns 401 rather than 500 (it always failed closed). `$XDG_CONFIG_HOME` is honoured for the config search path, matching the new `$XDG_DATA_HOME` handling.
+
 
 - **CRITICAL: HTTP transport returned 500 on every authenticated request** — the graceful-shutdown lifespan wrapper introduced in v0.3.0 mounted the FastMCP streamable HTTP app as a sub-app and added its own Starlette lifespan. Starlette only runs top-level lifespans, so the FastMCP session manager's task group was never initialized and every request to `/mcp` failed with `RuntimeError('Task group is not initialized. Make sure to use run().')`. Fixed by collapsing the bearer middleware + shutdown-lifespan + FastMCP mount into a **single outer Starlette app** whose lifespan explicitly chains the FastMCP session-manager lifespan via `inner_app.router.lifespan_context(inner_app)`.
 - Regression test `test_authenticated_request_reaches_initialized_session_manager` drives an authenticated request through the real FastMCP app and asserts the task-group error does not appear in the response body.
@@ -228,6 +415,11 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 ## [0.3.0] - 2026-04-09
 
 ### Added
+
+- **`transfer_root`** setting and `SSH_MCP_TRANSFER_ROOT` environment override (see Changed).
+- **`max_command_bytes`** setting (default 64 KiB), enforced at the MCP tool boundary.
+- `src/ssh_mcp/paths.py` — symlink-safe path confinement primitive. Documents its own residual risk: a same-filesystem rename of an intermediate directory between two `openat` calls is closed only by Linux `openat2(RESOLVE_BENEATH)`, which CPython does not expose and macOS has no equivalent for. Mitigated by requiring the root to be owner-only.
+- `.gitleaksignore` recording the synthetic credential fixtures in the redaction test corpus, so a genuinely new finding is not lost in known noise.
 
 - **MCP streamable HTTP transport** — set `SSH_MCP_TRANSPORT=http` (or `streamable-http`) to run ssh-mcp as a network service over the official MCP streamable HTTP transport instead of the default stdio subprocess transport. Includes bearer-token authentication, DNS-rebinding protection via the SDK's `TransportSecuritySettings`, and a Starlette lifespan handler that drains pooled SSH connections on graceful shutdown (SIGTERM).
 - **Bearer-token authentication middleware** — `SSH_MCP_HTTP_TOKEN` configures a shared secret. Uses `hmac.compare_digest` for constant-time comparison. Scheme is case-insensitive per RFC 7235. Minimum token length 16 chars enforced at startup. Trailing whitespace stripped so `.env` files with newlines work as expected.
@@ -253,7 +445,35 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 - **Dangerous-command detection documented as a TRIPWIRE, not a security boundary** — README security section explicitly lists known bypass classes (base64, hex escapes, Unicode homoglyphs, subshell indirection) and recommends sandboxing at a lower layer for real isolation.
 - `mcp[cli]` lower bound bumped from `>=1.2.0` to `>=1.27.0` — aligns with the April 2026 MCP Dev Summit release.
 
+### Changed — BREAKING
+
+**Local path confinement.** `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Local paths are now **relative to a `transfer_root`** (new `[settings]` key; defaults under `$XDG_DATA_HOME` or `~/.local/share`; override with `SSH_MCP_TRANSFER_ROOT`). The directory is created `0700`, must be owned by the running user, and must not itself be a symlink.
+
+- Absolute local paths and `..` are rejected. Sub-directories are allowed but must already exist.
+- **Downloads no longer overwrite** — an existing destination fails rather than being silently replaced.
+- Remote non-regular files (symlinks, devices, FIFOs) are refused on a best-effort basis. SFTP v3 has no atomic no-follow open, so a remote server can still win the check-to-open race; the local destination stays confined regardless.
+- **Migrating:** replace absolute local paths with names relative to `transfer_root`, or point `transfer_root` at the directory you were already using. There is no flag to restore the previous behaviour.
+
+**`max_output_bytes` now bounds memory, not just the response.** Output is consumed incrementally and the remote process is terminated once the budget is spent, where previously the entire output was buffered before truncation — so a large `cat` could exhaust memory regardless of the setting. The limit is now counted in real bytes; it was previously character-based, which overran the stated limit roughly 4x on multibyte output. Note the budget is per-stream, so the combined ceiling is 2x the setting.
+
+**`max_parallel_hosts` now bounds the process, not one call.** The concurrency semaphore was created per `execute_on_group` invocation, so N concurrent calls allowed N x the limit — up to 2560 in HTTP mode against a container with a 1024 file-descriptor limit, which is the exhaustion this setting exists to prevent. It is now shared. Independent group calls therefore queue behind one another, which is the documented intent but a behaviour change.
+
 ### Fixed
+
+**`execute_on_group(fail_fast=true)` reported hosts that had run the command as "Cancelled".** After the first failure, results from hosts that had already completed successfully were discarded and those hosts were labelled cancelled — in 60 of 60 trials with uniform timing. For a destructive fleet command this told the operator a host was skipped when it had executed. Completed results are now reported, and the wording for the remainder admits the command may already have been dispatched: cancelling a local task does not stop a command already on the wire.
+
+**`~` was not expanded unless `[settings]` was present.** A minimal `servers.toml` left the default `ssh_config_path` as the literal `~/.ssh/config`, so every connection failed with `FileNotFoundError`. `identity_file` was never expanded at all, so a `~`-prefixed key silently failed to authenticate. Expansion now happens at the model boundary, for every path field.
+
+**Connection-pool defects.** A lock was created for a server name *before* the name was validated, so unknown names — reachable straight from tool arguments — accumulated locks permanently. The idle-eviction loop also removed a lock while holding it, orphaning any waiter and letting two callers enter the same critical section, which could leak an unclosed connection.
+
+**The dangerous-command tripwire missed plain variants.** `rm -r -f /`, `rm --recursive --force /`, `chmod 777 -R /` and `dd of=… if=…` all passed, contradicting the `execute` docstring's explicit claim to catch them. Obfuscated bypasses remain out of scope by design and are documented as such.
+
+**The stdio healthcheck reported healthy without a usable config.** It only parsed a config when `SSH_MCP_CONFIG` was set and pointed at an existing file, so a container with no configuration passed its Docker liveness gate. It now resolves the config the same way the server does.
+
+**Command results no longer discard output.** `format_exec_result` dropped stdout, stderr and the exit code whenever an error was set — a state the `ExecResult` contract documents as reachable and meaning "ran but had issues", i.e. exactly when the output matters for diagnosis.
+
+**SFTP no longer raises a bare `KeyError`** for an unknown server, which fell outside its documented `ValueError`/`RuntimeError` contract. A non-ASCII bearer token now returns 401 rather than 500 (it always failed closed). `$XDG_CONFIG_HOME` is honoured for the config search path, matching the new `$XDG_DATA_HOME` handling.
+
 
 - **SFTP path validation bypass via `/etc//shadow` and `/etc/./shadow`** — `posixpath.normpath` is now applied before substring matching.
 - **Safety gate edge cases** — `::ffff:127.0.0.1`, `0:0:0:0:0:0:0:1`, `127.0.0.2` now correctly classified as loopback via `ipaddress.is_loopback`.
@@ -269,6 +489,11 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 ## [0.2.0] - 2026-04-08
 
 ### Added
+
+- **`transfer_root`** setting and `SSH_MCP_TRANSFER_ROOT` environment override (see Changed).
+- **`max_command_bytes`** setting (default 64 KiB), enforced at the MCP tool boundary.
+- `src/ssh_mcp/paths.py` — symlink-safe path confinement primitive. Documents its own residual risk: a same-filesystem rename of an intermediate directory between two `openat` calls is closed only by Linux `openat2(RESOLVE_BENEATH)`, which CPython does not expose and macOS has no equivalent for. Mitigated by requiring the root to be owner-only.
+- `.gitleaksignore` recording the synthetic credential fixtures in the redaction test corpus, so a genuinely new finding is not lost in known noise.
 
 - **Pydantic v2 config validation.** `Settings`, `GroupConfig`, and `ServerConfig` are now `pydantic.dataclasses` with `extra='forbid'`. Unknown TOML keys, out-of-range numeric values, and missing required fields all raise a `ConfigError` (ValueError subclass) naming the offending field, its section/host context, and the list of valid keys.
 - **SFTP audit lifecycle logs.** `upload_file` and `download_file` now emit three structured events per transfer: `sftp.{upload,download}.start` → `sftp.{upload,download}.complete` (or `.failed`), each tagged with a stable `connection_id` contextvar so a single transfer is grep-correlatable. Failure events include the exception type and elapsed `duration_ms`.
@@ -289,6 +514,11 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 ## [0.1.1] - 2026-04-08
 
 ### Added
+
+- **`transfer_root`** setting and `SSH_MCP_TRANSFER_ROOT` environment override (see Changed).
+- **`max_command_bytes`** setting (default 64 KiB), enforced at the MCP tool boundary.
+- `src/ssh_mcp/paths.py` — symlink-safe path confinement primitive. Documents its own residual risk: a same-filesystem rename of an intermediate directory between two `openat` calls is closed only by Linux `openat2(RESOLVE_BENEATH)`, which CPython does not expose and macOS has no equivalent for. Mitigated by requiring the root to be owner-only.
+- `.gitleaksignore` recording the synthetic credential fixtures in the redaction test corpus, so a genuinely new finding is not lost in known noise.
 
 - `max_parallel_hosts` setting in `[settings]` — configurable concurrency cap for `execute_on_group` (default 10, range 1–100). Previously hardcoded to 10.
 - `SSH_MCP_LOG_FORMAT` environment variable — set to `json` for single-line JSON logs (timestamp, level, event, contextvars) suitable for log aggregators. Defaults to colorized human-readable console output.
@@ -317,7 +547,35 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 - `asyncssh` upper bound added to dependencies: `>=2.14.0,<3.0.0`
 - CI pipeline updated to 2026 best practices: `actions/checkout@v6`, `astral-sh/setup-uv@v8.0.0`, `docker/build-push-action@v7`, Trivy pinned by commit SHA
 
+### Changed — BREAKING
+
+**Local path confinement.** `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Local paths are now **relative to a `transfer_root`** (new `[settings]` key; defaults under `$XDG_DATA_HOME` or `~/.local/share`; override with `SSH_MCP_TRANSFER_ROOT`). The directory is created `0700`, must be owned by the running user, and must not itself be a symlink.
+
+- Absolute local paths and `..` are rejected. Sub-directories are allowed but must already exist.
+- **Downloads no longer overwrite** — an existing destination fails rather than being silently replaced.
+- Remote non-regular files (symlinks, devices, FIFOs) are refused on a best-effort basis. SFTP v3 has no atomic no-follow open, so a remote server can still win the check-to-open race; the local destination stays confined regardless.
+- **Migrating:** replace absolute local paths with names relative to `transfer_root`, or point `transfer_root` at the directory you were already using. There is no flag to restore the previous behaviour.
+
+**`max_output_bytes` now bounds memory, not just the response.** Output is consumed incrementally and the remote process is terminated once the budget is spent, where previously the entire output was buffered before truncation — so a large `cat` could exhaust memory regardless of the setting. The limit is now counted in real bytes; it was previously character-based, which overran the stated limit roughly 4x on multibyte output. Note the budget is per-stream, so the combined ceiling is 2x the setting.
+
+**`max_parallel_hosts` now bounds the process, not one call.** The concurrency semaphore was created per `execute_on_group` invocation, so N concurrent calls allowed N x the limit — up to 2560 in HTTP mode against a container with a 1024 file-descriptor limit, which is the exhaustion this setting exists to prevent. It is now shared. Independent group calls therefore queue behind one another, which is the documented intent but a behaviour change.
+
 ### Fixed
+
+**`execute_on_group(fail_fast=true)` reported hosts that had run the command as "Cancelled".** After the first failure, results from hosts that had already completed successfully were discarded and those hosts were labelled cancelled — in 60 of 60 trials with uniform timing. For a destructive fleet command this told the operator a host was skipped when it had executed. Completed results are now reported, and the wording for the remainder admits the command may already have been dispatched: cancelling a local task does not stop a command already on the wire.
+
+**`~` was not expanded unless `[settings]` was present.** A minimal `servers.toml` left the default `ssh_config_path` as the literal `~/.ssh/config`, so every connection failed with `FileNotFoundError`. `identity_file` was never expanded at all, so a `~`-prefixed key silently failed to authenticate. Expansion now happens at the model boundary, for every path field.
+
+**Connection-pool defects.** A lock was created for a server name *before* the name was validated, so unknown names — reachable straight from tool arguments — accumulated locks permanently. The idle-eviction loop also removed a lock while holding it, orphaning any waiter and letting two callers enter the same critical section, which could leak an unclosed connection.
+
+**The dangerous-command tripwire missed plain variants.** `rm -r -f /`, `rm --recursive --force /`, `chmod 777 -R /` and `dd of=… if=…` all passed, contradicting the `execute` docstring's explicit claim to catch them. Obfuscated bypasses remain out of scope by design and are documented as such.
+
+**The stdio healthcheck reported healthy without a usable config.** It only parsed a config when `SSH_MCP_CONFIG` was set and pointed at an existing file, so a container with no configuration passed its Docker liveness gate. It now resolves the config the same way the server does.
+
+**Command results no longer discard output.** `format_exec_result` dropped stdout, stderr and the exit code whenever an error was set — a state the `ExecResult` contract documents as reachable and meaning "ran but had issues", i.e. exactly when the output matters for diagnosis.
+
+**SFTP no longer raises a bare `KeyError`** for an unknown server, which fell outside its documented `ValueError`/`RuntimeError` contract. A non-ASCII bearer token now returns 401 rather than 500 (it always failed closed). `$XDG_CONFIG_HOME` is honoured for the config search path, matching the new `$XDG_DATA_HOME` handling.
+
 
 - Unknown TOML keys in `[settings]`, `[groups.*]`, or `[servers.*]` now surface the offending key name AND the list of valid keys, instead of crashing with an opaque `TypeError: unexpected keyword argument`.
 - TOML parse errors now include the configuration file path in the error message for faster diagnosis.
@@ -338,6 +596,11 @@ Cleared every CVE reported by `pip-audit` against the dependency tree. All are t
 ## [0.1.0] - 2026-03-01
 
 ### Added
+
+- **`transfer_root`** setting and `SSH_MCP_TRANSFER_ROOT` environment override (see Changed).
+- **`max_command_bytes`** setting (default 64 KiB), enforced at the MCP tool boundary.
+- `src/ssh_mcp/paths.py` — symlink-safe path confinement primitive. Documents its own residual risk: a same-filesystem rename of an intermediate directory between two `openat` calls is closed only by Linux `openat2(RESOLVE_BENEATH)`, which CPython does not expose and macOS has no equivalent for. Mitigated by requiring the root to be owner-only.
+- `.gitleaksignore` recording the synthetic credential fixtures in the redaction test corpus, so a genuinely new finding is not lost in known noise.
 
 - SSH command execution via `execute` tool — run shell commands on a single configured server
 - Parallel execution via `execute_on_group` tool — run a command across all servers in a named group
