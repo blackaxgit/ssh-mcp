@@ -32,13 +32,15 @@ Connection details are read from your existing `~/.ssh/config`. No credentials a
 
 ```bash
 # Run directly with uvx (no install required)
-uvx ssh-mcp
+uvx blc-ssh-mcp
 
 # Or install with pip
-pip install ssh-mcp
+pip install blc-ssh-mcp
 ```
 
 Requires Python 3.11+. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) to use `uvx`.
+
+> **The PyPI package is `blc-ssh-mcp`, not `ssh-mcp`.** The name `ssh-mcp` on PyPI belongs to an unrelated project by a different author. Installing it will not give you this server. Releases before 0.6.1 documented the wrong name — if you followed those instructions, uninstall `ssh-mcp` and install `blc-ssh-mcp`.
 
 #### Docker
 
@@ -83,7 +85,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
   "mcpServers": {
     "ssh-mcp": {
       "command": "uvx",
-      "args": ["ssh-mcp"]
+      "args": ["blc-ssh-mcp"]
     }
   }
 }
@@ -96,7 +98,7 @@ To use a non-default config path, pass the environment variable:
   "mcpServers": {
     "ssh-mcp": {
       "command": "uvx",
-      "args": ["ssh-mcp"],
+      "args": ["blc-ssh-mcp"],
       "env": {
         "SSH_MCP_CONFIG": "/path/to/servers.toml"
       }
@@ -113,7 +115,7 @@ If you use [Claude Code](https://docs.anthropic.com/en/docs/claude-code) instead
 
 ```bash
 # 1. Add the MCP server
-claude mcp add ssh-mcp -- uvx ssh-mcp
+claude mcp add ssh-mcp -- uvx blc-ssh-mcp
 
 # 2. Create the config directory and copy the example
 mkdir -p ~/.config/ssh-mcp
@@ -130,7 +132,7 @@ chmod 600 ~/.config/ssh-mcp/servers.toml
 To use a custom config path:
 
 ```bash
-claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx ssh-mcp
+claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx blc-ssh-mcp
 ```
 
 ## Configuration
@@ -141,7 +143,7 @@ claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx ssh-mcp
 |---|---|---|
 | `SSH_MCP_CONFIG` | — | Absolute path to a TOML config file. Overrides the default search path. |
 | `SSH_MCP_LOG_FORMAT` | `console` | Log output format. Set to `json` to emit single-line JSON events (timestamp, level, event, contextvars) suitable for log aggregators like Loki, Datadog, or Splunk. Any other value falls back to the colorized console renderer. |
-| `SSH_MCP_TRANSPORT` | `stdio` | MCP transport. `stdio` = classic subprocess transport (default, used by Claude Desktop / Claude Code via `uvx ssh-mcp`). `http` or `streamable-http` = run as a network service over MCP streamable HTTP. |
+| `SSH_MCP_TRANSPORT` | `stdio` | MCP transport. `stdio` = classic subprocess transport (default, used by Claude Desktop / Claude Code via `uvx blc-ssh-mcp`). `http` or `streamable-http` = run as a network service over MCP streamable HTTP. |
 | `SSH_MCP_HTTP_HOST` | `127.0.0.1` | Bind address for HTTP transport. **Binding to any non-localhost value (e.g. `0.0.0.0`) REQUIRES `SSH_MCP_HTTP_TOKEN` — startup aborts otherwise.** |
 | `SSH_MCP_HTTP_PORT` | `8000` | TCP port for HTTP transport. |
 | `SSH_MCP_HTTP_TOKEN` | — | Shared bearer secret. When set, every request must carry `Authorization: Bearer <token>` (scheme case-insensitive per RFC 7235) or receive HTTP 401. Mandatory for non-localhost binds (unless `SSH_MCP_HTTP_AUTH=none`). Minimum length 16 characters — shorter tokens are rejected at startup. Leading/trailing whitespace is stripped so `.env` files with trailing newlines work as expected. |

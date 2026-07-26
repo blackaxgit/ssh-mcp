@@ -1,5 +1,13 @@
 [project]
-name = "ssh-mcp"
+# PyPI distribution name. NOT "ssh-mcp": that name on PyPI belongs to an
+# unrelated project (author czyhandsome, MIT, last released 0.1.4 in June 2025)
+# and this project has never owned it. Until 0.6.1 the docs told users to run
+# `uvx ssh-mcp` / `pip install ssh-mcp`, which installed that stranger's
+# package — also an SSH tool, so the substitution was not obvious. Do not
+# "restore" this to "ssh-mcp"; the upload would be rejected and the docs would
+# again point at someone else's code. The import package stays `ssh_mcp` and the
+# container image stays ghcr.io/blackaxgit/ssh-mcp.
+name = "blc-ssh-mcp"
 dynamic = ["version"]
 description = "SSH MCP server for managing infrastructure via Claude Code"
 requires-python = ">=3.11"
@@ -34,6 +42,11 @@ dependencies = [
 ]
 
 [project.scripts]
+# `blc-ssh-mcp` must exist and match the distribution name, or `uvx blc-ssh-mcp`
+# finds no console script of that name and fails. `ssh-mcp` is kept as an alias:
+# the Dockerfile HEALTHCHECK and release.yml's smoke test both invoke it, and
+# existing installs have it on PATH.
+blc-ssh-mcp = "ssh_mcp.server:main"
 ssh-mcp = "ssh_mcp.server:main"
 
 [project.urls]
@@ -79,6 +92,17 @@ build-backend = "hatchling.build"
 
 [tool.hatch.version]
 path = "src/ssh_mcp/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+# REQUIRED, and easy to miss: hatchling's default file selection derives the
+# package directory from the *distribution* name. That worked implicitly while
+# the distribution was called "ssh-mcp" (-> src/ssh_mcp), but the distribution
+# is now "blc-ssh-mcp", so hatchling looks for src/blc_ssh_mcp, finds nothing,
+# and the WHEEL build fails outright with "Unable to determine which files to
+# ship inside the wheel" — while the sdist still builds fine, so a partial
+# `uv build` looks deceptively healthy. The import package deliberately stays
+# `ssh_mcp`; point at it explicitly.
+packages = ["src/ssh_mcp"]
 
 [tool.uv]
 # Security floors for TRANSITIVE dependencies. These are deliberately NOT in

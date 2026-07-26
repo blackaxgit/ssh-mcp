@@ -80,6 +80,57 @@ wheels = [
 ]
 
 [[package]]
+name = "blc-ssh-mcp"
+source = { editable = "." }
+dependencies = [
+    { name = "asyncssh" },
+    { name = "mcp", extra = ["cli"] },
+    { name = "orjson" },
+    { name = "pydantic" },
+    { name = "structlog" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "bandit" },
+    { name = "hypothesis" },
+    { name = "mypy" },
+    { name = "opentelemetry-sdk" },
+    { name = "pip" },
+    { name = "pip-audit" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "pyyaml" },
+    { name = "ruff" },
+]
+otel = [
+    { name = "opentelemetry-api" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "asyncssh", specifier = ">=2.23.0,<3.0.0" },
+    { name = "bandit", marker = "extra == 'dev'", specifier = "==1.9.4" },
+    { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.151.0,<7.0.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.28.1,<2.0.0" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.15" },
+    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.30.0,<2.0.0" },
+    { name = "opentelemetry-sdk", marker = "extra == 'dev'", specifier = ">=1.30.0,<2.0.0" },
+    { name = "orjson", specifier = ">=3.10.0,<4.0.0" },
+    { name = "pip", marker = "extra == 'dev'", specifier = ">=26.1.2" },
+    { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.9" },
+    { name = "pydantic", specifier = ">=2.10.0,<3.0.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
+    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.0" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.16.0" },
+    { name = "structlog", specifier = ">=25.5.0,<26.0.0" },
+]
+provides-extras = ["dev", "otel"]
+
+[[package]]
 name = "boolean-py"
 version = "5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1590,57 +1641,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/8b/8d/00d280c03ffd39aae
 wheels = [
     { url = "https://files.pythonhosted.org/packages/96/7f/832f015020844a8b8f7a9cbc103dd76ba8e3875004c41e08440ea3a2b41a/sse_starlette-3.2.0-py3-none-any.whl", hash = "sha256:5876954bd51920fc2cd51baee47a080eb88a37b5b784e615abb0b283f801cdbf", size = 12763, upload-time = "2026-01-17T13:11:03.775Z" },
 ]
-
-[[package]]
-name = "ssh-mcp"
-source = { editable = "." }
-dependencies = [
-    { name = "asyncssh" },
-    { name = "mcp", extra = ["cli"] },
-    { name = "orjson" },
-    { name = "pydantic" },
-    { name = "structlog" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "bandit" },
-    { name = "hypothesis" },
-    { name = "mypy" },
-    { name = "opentelemetry-sdk" },
-    { name = "pip" },
-    { name = "pip-audit" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pyyaml" },
-    { name = "ruff" },
-]
-otel = [
-    { name = "opentelemetry-api" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "asyncssh", specifier = ">=2.23.0,<3.0.0" },
-    { name = "bandit", marker = "extra == 'dev'", specifier = "==1.9.4" },
-    { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.151.0,<7.0.0" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.28.1,<2.0.0" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.15" },
-    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.30.0,<2.0.0" },
-    { name = "opentelemetry-sdk", marker = "extra == 'dev'", specifier = ">=1.30.0,<2.0.0" },
-    { name = "orjson", specifier = ">=3.10.0,<4.0.0" },
-    { name = "pip", marker = "extra == 'dev'", specifier = ">=26.1.2" },
-    { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.9" },
-    { name = "pydantic", specifier = ">=2.10.0,<3.0.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.0" },
-    { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.16.0" },
-    { name = "structlog", specifier = ">=25.5.0,<26.0.0" },
-]
-provides-extras = ["dev", "otel"]
 
 [[package]]
 name = "starlette"

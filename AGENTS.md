@@ -9,7 +9,7 @@ Command sources: `.github/workflows/ci.yml` (the gates), `.github/workflows/rele
 
 - **Purpose:** SSH MCP server that lets AI assistants execute commands on remote servers.
 - **Owner:** TODO: team/maintainer
-- **Type:** app — published as a PyPI wheel (`uvx ssh-mcp`) *and* a container image (`ghcr.io/blackaxgit/ssh-mcp`)
+- **Type:** app — published as a PyPI wheel (`uvx blc-ssh-mcp`) *and* a container image (`ghcr.io/blackaxgit/ssh-mcp`). **The PyPI distribution is `blc-ssh-mcp`, not `ssh-mcp`** — that name belongs to an unrelated project this repo has never owned; see the comment above `name` in `pyproject.toml`. The import package is still `ssh_mcp` and the image is still `.../ssh-mcp`.
 - **Stacks:** Python 3.11-3.14, `uv` + hatchling, asyncssh, MCP SDK, Starlette/uvicorn (HTTP transport only)
 - **Deploy targets:** N/A — this is a tool operators run themselves, not a hosted service
 - **Version:** `src/ssh_mcp/__init__.py` is the single source (hatchling reads it). Currently `0.5.6`; `CHANGELOG.md` `[Unreleased]` targets **0.6.0**.
@@ -150,7 +150,7 @@ Most of these will break a build, a release, or production if ignored. The last 
 
 - **The dangerous-command list is a tripwire, not a security boundary.** `README.md` and `SECURITY.md` say so explicitly, and base64 / hex-escape / homoglyph / `$(...)` bypasses are acknowledged. Do not describe it as a security control, and do not widen it into a claim it cannot keep.
 
-- **`ssh-mcp --version` and `--help` do not exist.** `main()` in `server.py` inspects only `sys.argv[1] == "healthcheck"`; anything else falls through and starts the MCP server on stdin. `CONTRIBUTING.md` tells bug reporters to run `uvx ssh-mcp --version`, and `release.yml` smoke-tests artifacts with `ssh-mcp --help` — that test exits 0 only because CI closes stdin, so it verifies the entry point imports and nothing more. Fix the flags or fix both callers; do not assume the smoke test is meaningful.
+- **`ssh-mcp --version` and `--help` do not exist.** `main()` in `server.py` inspects only `sys.argv[1] == "healthcheck"`; anything else falls through and starts the MCP server on stdin. `CONTRIBUTING.md` no longer tells bug reporters to run it (it now points at `import ssh_mcp; ssh_mcp.__version__` or `pip show blc-ssh-mcp`), but `release.yml` still smoke-tests artifacts with `ssh-mcp --help` — that test exits 0 only because CI closes stdin, so it verifies the entry point imports and nothing more. Fix the flags or fix both callers; do not assume the smoke test is meaningful.
 
 - **`uv sync` must use `--locked` in CI, and lint tools must run via `uv run`, never `uvx`.** `uvx` resolves the newest release at run time: ruff 0.16.0 widened its default rule set from 59 to 413 rules and turned CI red on commits that had passed days earlier. `[tool.ruff.lint] select` therefore pins the rule set explicitly — widening it is a deliberate decision, not a cleanup. `tests/test_ci_lint_determinism.py` enforces all of this.
 

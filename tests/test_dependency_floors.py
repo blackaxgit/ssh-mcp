@@ -19,7 +19,7 @@ The layer distinction is load-bearing:
 
 * **Direct** dependencies belong in ``[project.dependencies]`` — the only
   place that reaches the published wheel's ``METADATA`` and therefore the only
-  thing protecting ``pip install ssh-mcp`` consumers.
+  thing protecting ``pip install blc-ssh-mcp`` consumers.
 * **Transitive** dependencies belong in ``[tool.uv] constraint-dependencies``.
   Putting them in ``[project.dependencies]`` would assert a dependency edge
   that does not exist; a uv constraint binds resolution without lying about
@@ -154,7 +154,7 @@ def test_direct_dependency_floor_reaches_wheel_metadata(package: str) -> None:
 
     ``[tool.uv]`` settings are uv-only and absent from the built wheel's
     ``METADATA``. For a project published to PyPI, a floor declared only there
-    leaves ``pip install ssh-mcp`` free to resolve a vulnerable version. This
+    leaves ``pip install blc-ssh-mcp`` free to resolve a vulnerable version. This
     is the assertion that protects downstream consumers rather than just CI.
     """
     expected = Version(SECURITY_FLOORS[package][0])
@@ -167,7 +167,7 @@ def test_direct_dependency_floor_reaches_wheel_metadata(package: str) -> None:
     assert declared >= expected, (
         f"[project.dependencies] pins {package}>={declared}, below the security "
         f"floor {expected}. The wheel's METADATA would permit a vulnerable "
-        f"resolution for anyone running `pip install ssh-mcp`."
+        f"resolution for anyone running `pip install blc-ssh-mcp`."
     )
 
 
