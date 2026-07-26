@@ -523,6 +523,83 @@ class TestBearerAuthR3Hardening:
         with pytest.raises(RuntimeError, match="wildcard"):
             _run_http()
 
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "*",
+            "*:*",
+            "*.*",
+            "*.*:*",
+            "*.*.*",
+            "*.:*",
+            "a*b.example.com",
+        ],
+    )
+    def test_wildcard_family_rejected(
+        self, entry: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for the H4 ordering trap on ci/fix-digest-verification.
+
+        The previous implementation checked ``entry.startswith("*.")`` as an
+        "always a permitted suffix wildcard" escape hatch BEFORE the
+        ``entry in {"*", "*:*", "*.*"}`` refusal ran. "*.*" satisfies
+        ``startswith("*.")`` too, so that escape hatch fired first and let
+        "*.*" — which matches essentially any dotted hostname, functionally
+        equivalent to the bare "*" this gate exists to block — through as
+        PERMITTED, even though it was explicitly listed in the refusal set.
+
+        Every entry here must still resolve to "no concrete hostname"
+        after stripping the two deliberately-permitted wildcard forms (a
+        trailing ``:*`` port wildcard, a leading ``*.`` subdomain
+        wildcard), so all of them must be refused.
+        """
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_ALLOWED_HOSTS", entry)
+        with pytest.raises(RuntimeError, match="wildcard"):
+            _run_http()
+
+    def test_whitespace_only_allowed_hosts_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An ALLOWED_HOSTS value that is explicitly set but blank (e.g. an
+        empty templated env var like ``${EXTRA_HOSTS:- }``) must fail loud
+        rather than silently falling back to the localhost-only default —
+        that fallback would mask a broken deployment config from the
+        operator.
+        """
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_ALLOWED_HOSTS", "   ")
+        with pytest.raises(RuntimeError, match="whitespace"):
+            _run_http()
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "*.internal.example.com",
+            "*.internal.example.com:*",
+            "ok.example.com:*",
+            "ok.example.com",
+        ],
+    )
+    def test_deliberate_wildcard_forms_still_permitted(
+        self, entry: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Suffix wildcards and port wildcards remain deliberately permitted.
+
+        Documented in AGENTS.md: a leading subdomain wildcard such as
+        ``*.internal.example.com`` and a trailing port wildcard such as
+        ``ok.example.com:*`` (and combinations of the two) must keep
+        working — only entries with no concrete hostname remainder are
+        refused. Patches ``uvicorn.run`` and ``_build_http_app`` so no
+        socket is actually bound.
+        """
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.setenv("SSH_MCP_HTTP_ALLOWED_HOSTS", entry)
+        with patch("uvicorn.run"), patch.object(server_module, "_build_http_app"):
+            _run_http()
+        allowed = server_module.mcp.settings.transport_security.allowed_hosts
+        assert entry in allowed, f"{entry!r} should be permitted, got {allowed!r}"
+
     def test_token_whitespace_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """M4: SSH_MCP_HTTP_TOKEN with trailing whitespace (common from .env
         files that append ``\\n``) must be stripped before being handed to

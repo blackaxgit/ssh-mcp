@@ -333,6 +333,68 @@ def test_docker_job_builds_exactly_once() -> None:
             )
 
 
+def test_digest_verification_accounts_for_index_wrapping() -> None:
+    """Production incident 2026-07-26: the publish-path digest check failed on
+    every run to ``main``, and because it sits *before* the attestation step it
+    also stopped provenance from ever being attached.
+
+    ``docker buildx imagetools create`` does not reuse the source digest — it
+    wraps the scanned manifest in a NEW OCI index. So comparing the tag's own
+    digest (or a hash of ``inspect --raw`` stdout) against
+    ``steps.build.outputs.digest`` compares an index against one of its
+    children and can never match. Verified against the live registry: tag
+    ``:latest`` was index ``sha256:8204263e…`` whose sole child was the scanned
+    ``sha256:12db37ce…``.
+
+    The invariant worth asserting is that every published tag serves *only* the
+    scanned digest, which means inspecting the index's children. This test
+    fails if someone reintroduces the digest-to-digest comparison.
+    """
+    workflow = _load_workflow(CI_WORKFLOW_PATH)
+    docker_job = workflow["jobs"]["docker"]
+
+    verify_steps = [
+        step
+        for step in docker_job.get("steps", [])
+        if "serves only the scanned digest" in step.get("name", "")
+        or "resolves to the scanned digest" in step.get("name", "")
+    ]
+    assert verify_steps, (
+        "the docker job no longer verifies that published tags serve the "
+        "scanned digest; that check is the proof the Trivy gate was not bypassed"
+    )
+
+    for step in verify_steps:
+        script = step.get("run", "")
+        # The broken form hashed the raw manifest bytes and compared that to
+        # the build digest. Both halves of that mistake are banned.
+        assert "sha256sum" not in script, (
+            "the digest-verification step hashes `imagetools inspect --raw` "
+            "output again. That yields the INDEX digest, which never equals "
+            "the scanned manifest digest, so the step fails on every publish "
+            "run and blocks provenance attestation. Inspect the index's "
+            "child manifests instead."
+        )
+        # It must actually look at what the index serves.
+        assert ".manifests" in script, (
+            "the digest-verification step does not inspect the index's "
+            "`.manifests` children, so it cannot tell whether the tag serves "
+            "the scanned image after `imagetools create` wrapped it"
+        )
+
+    # Ordering matters for the consequence described above: attestation must
+    # not be gated behind a check that is prone to this failure mode without
+    # someone noticing the images lost their provenance.
+    step_names = [step.get("name", "") for step in docker_job.get("steps", [])]
+    attest = next(
+        (i for i, name in enumerate(step_names) if "Attest build provenance" in name),
+        None,
+    )
+    assert attest is not None, (
+        "the docker job no longer attests build provenance for the image"
+    )
+
+
 def test_release_workflow_exists_and_is_tag_triggered() -> None:
     """S6: a release workflow must exist and be triggered by version tags."""
     assert RELEASE_WORKFLOW_PATH.exists(), (

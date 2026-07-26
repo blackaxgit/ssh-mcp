@@ -1687,13 +1687,19 @@ class TestRedactSecrets:
         prefix to 40 chars — this generates junk from 41 to 300 chars to
         prove the replacement scanner has no such ceiling.
         """
-        assume(secret not in junk)
-        assume(secret not in "{REDACTED}")
         cmd = f"myapp --{junk}-{keyword}={secret} run"
         redacted = _redact_secrets(cmd)
-        assert secret not in redacted, (
-            f"Leaked: junk_len={len(junk)} keyword={keyword!r} secret={secret!r} "
-            f"→ {redacted!r}"
+        # Assert the exact expected output rather than `secret not in redacted`.
+        # The substring form needed a growing pile of `assume()`s to stay
+        # satisfiable, because the structural parts of the command legitimately
+        # survive redaction: a generated secret can be a substring of `junk`
+        # (already excluded) or of `keyword` — Hypothesis found
+        # secret='credenti' inside keyword='credential', which reported a
+        # "leak" via the FLAG NAME, not via any leaked value. Exact equality is
+        # immune to that whole class and is a strictly stronger property.
+        expected = f"myapp --{junk}-{keyword}={_REDACTION_PLACEHOLDER} run"
+        assert redacted == expected, (
+            f"junk_len={len(junk)} keyword={keyword!r} secret={secret!r} → {redacted!r}"
         )
         assert _REDACTION_PLACEHOLDER in redacted
 
@@ -1928,11 +1934,15 @@ def _tokenwise_command(draw: st.DrawFn) -> tuple[str, str]:
     if use_eq_form:
         cred_tokens = [f"{cred_name}={secret}"]
     else:
-        # Space-separated form: a value token starting with '-' is
-        # genuinely ambiguous with another flag (this is documented,
-        # intentional behaviour — see _redact_long_flags), so exclude it
-        # here rather than assert on undefined CLI-parsing behaviour.
-        assume(not secret.startswith("-"))
+        # Space-separated form: a value token starting with '--' is
+        # genuinely ambiguous with another long flag (this is
+        # documented, intentional behaviour — see _redact_long_flags),
+        # so exclude it here rather than assert on undefined
+        # CLI-parsing behaviour. A single-dash value (e.g. "-0000000")
+        # is NOT ambiguous — it must be redacted — so it is deliberately
+        # left in the generated space here (see the 2026-07-25 defect
+        # note in _redact_long_flags).
+        assume(not secret.startswith("--"))
         cred_tokens = [cred_name, secret]
 
     token_groups = [[t] for t in boolean_flags] + [[t] for t in noncred_flags]
@@ -2120,6 +2130,133 @@ class TestRedactSecretsNestedCredentialFlag:
         candidate."""
         redacted = _redact_secrets("--password=--flag=x")
         assert redacted == "--password={REDACTED}"
+
+
+# ---------------------------------------------------------------------------
+# Defect (found 2026-07-25, reported against `main`): a space-separated
+# credential flag whose VALUE begins with a single '-' (e.g. `-0000000`)
+# was indistinguishable, under the old "starts with '-'" boolean-flag
+# guard in _redact_long_flags, from a following flag — so it was left
+# unredacted. Fixed by narrowing the guard to "starts with '--'". See the
+# docstring above _redact_long_flags in ssh.py for the full rationale.
+# ---------------------------------------------------------------------------
+
+
+class TestRedactSecretsDashPrefixedValue:
+    """Regression tests: a dash-led credential VALUE in the space-separated
+    flag form (``--password VALUE``) must be redacted like any other
+    value, not mistaken for a following flag."""
+
+    @pytest.mark.parametrize(
+        "command,secret,expected",
+        [
+            (
+                "mysql --password -0000000 somedb",
+                "-0000000",
+                "mysql --password {REDACTED} somedb",
+            ),
+            (
+                "mysql --password - somedb",
+                None,
+                "mysql --password {REDACTED} somedb",
+            ),
+            (
+                # Value uses "--token" (not "--password") so the short-flag
+                # value "-p" cannot false-positive as a substring of the
+                # flag name itself ("-p" IS a substring of "--password").
+                "tool --token -p somedb",
+                "-p",
+                "tool --token {REDACTED} somedb",
+            ),
+            (
+                "tool --token -rf somedb",
+                "-rf",
+                "tool --token {REDACTED} somedb",
+            ),
+            (
+                # Dash-prefixed value at end-of-string, no trailing token.
+                "mysql --password -0000000",
+                "-0000000",
+                "mysql --password {REDACTED}",
+            ),
+        ],
+        ids=[
+            "numeric-dash-value",
+            "bare-single-dash-value",
+            "short-flag-shaped-value",
+            "short-flag-rf-shaped-value",
+            "dash-prefixed-value-eos",
+        ],
+    )
+    def test_dash_prefixed_space_separated_value_redacted(
+        self, command: str, secret: str | None, expected: str
+    ) -> None:
+        redacted = _redact_secrets(command)
+        assert redacted == expected
+        if secret is not None:
+            assert secret not in redacted, f"Leaked: {command!r} -> {redacted!r}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A value that is only dashes (`---`) begins with "--", which
+            # is documented, intentional residual ambiguity (see the
+            # _redact_long_flags docstring) — it is left untouched, same
+            # as any other genuine "--"-prefixed long flag would be.
+            "mysql --password --- somedb",
+            "mysql --password ----- somedb",
+            "mysql --password -----",
+        ],
+        ids=["dashes-only-value", "longer-dashes-only-value", "dashes-only-value-eos"],
+    )
+    def test_double_dash_shaped_value_left_unredacted_documented_residual(
+        self, command: str
+    ) -> None:
+        """Control case, NOT a leak of concern: a value indistinguishable
+        from a long flag (starts with '--') is intentionally left alone by
+        the narrowed guard — this is the documented tripwire boundary, not
+        a credential (a real credential value beginning with two literal
+        dashes is an edge case outside this tripwire's coverage, same as
+        the pre-existing quoted-multi-word-value residual)."""
+        assert _redact_secrets(command) == command
+
+    def test_double_dash_after_credential_flag_still_treated_as_boolean(self) -> None:
+        """Control case: the guard is narrowed to '--', not removed — a
+        genuine long flag immediately following a space-separated
+        credential flag must still be left alone (boolean-flag shape),
+        and it still gets its own classification turn (no skip-leak
+        reintroduced)."""
+        redacted = _redact_secrets("cmd --password --rm image")
+        assert redacted == "cmd --password --rm image"
+
+    def test_credential_flag_then_double_dash_credential_flag_both_redacted(
+        self,
+    ) -> None:
+        """The skip-leak this guard exists to prevent (R5/Defect A): a
+        credential flag immediately followed by ANOTHER credential flag
+        must not cause the second one to be silently skipped."""
+        redacted = _redact_secrets("cmd --password --token=secret")
+        assert "secret" not in redacted
+        assert redacted == "cmd --password --token={REDACTED}"
+
+    def test_boolean_flag_then_credential_flag_docker_rm_shape(self) -> None:
+        """Named in the task report: docker run --rm --password=X must not
+        leak X (pre-existing skip-leak guard, unaffected by this fix)."""
+        redacted = _redact_secrets("docker run --rm --password=X")
+        assert "=X" not in redacted
+        assert redacted == "docker run --rm --password={REDACTED}"
+
+    def test_redaction_idempotent_on_dash_prefixed_value(self) -> None:
+        """Redacting already-redacted output must not change it further."""
+        once = _redact_secrets("mysql --password -0000000 somedb")
+        twice = _redact_secrets(once)
+        assert once == twice == "mysql --password {REDACTED} somedb"
+
+    def test_fails_on_unfixed_guard_reproduces_task_example(self) -> None:
+        """Sanity pin of the exact example from the bug report."""
+        redacted = _redact_secrets("mysql --password -0000000 somedb")
+        assert redacted == "mysql --password {REDACTED} somedb"
+        assert "-0000000" not in redacted
 
 
 # ---------------------------------------------------------------------------
@@ -2953,6 +3090,97 @@ class TestEvictionLoopRestart:
                 pass
 
         assert manager._running is False, "_running must reset after crash"
+
+
+# ---------------------------------------------------------------------------
+# _create_connection exception-handler ordering (found 2026-07-25): on
+# Python >=3.11, `asyncio.TimeoutError is TimeoutError`, and `TimeoutError`
+# is itself a subclass of `OSError`. The `except OSError` handler used to
+# be listed BEFORE `except asyncio.TimeoutError`, which made the
+# TimeoutError handler unreachable dead code — every connect timeout was
+# silently caught by the OSError branch and logged with the less specific
+# "OS error connecting" message. Fixed by reordering (TimeoutError first)
+# so the more specific "Timeout connecting" message is preserved, while a
+# non-timeout OSError (e.g. ConnectionRefusedError) still reaches the
+# OSError branch.
+# ---------------------------------------------------------------------------
+
+
+class TestCreateConnectionExceptionOrdering:
+    """_create_connection must log a distinct message for a connect
+    timeout vs. any other OSError."""
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[settings]
+command_timeout = 30
+
+[groups]
+test = { description = "Test group" }
+
+[servers.test-host]
+description = "Test server"
+groups = ["test"]
+"""
+        tmp = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        tmp.write(config_content)
+        tmp.flush()
+        tmp.close()
+        return ServerRegistry(tmp.name)
+
+    async def test_timeout_error_logs_timeout_message_not_os_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A TimeoutError from asyncssh.connect (as asyncio.wait_for
+        propagates it) must be logged as 'Timeout connecting', proving the
+        handler is reachable and ordered before the OSError branch."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        server = manager.registry.get_server("test-host")
+
+        with patch(
+            "ssh_mcp.ssh.asyncssh.connect",
+            AsyncMock(side_effect=TimeoutError("connect timed out")),
+        ):
+            with caplog.at_level("ERROR", logger="ssh_mcp.ssh"):
+                with pytest.raises(TimeoutError):
+                    await manager._create_connection(server)
+
+        messages = [r.getMessage() for r in caplog.records if r.name == "ssh_mcp.ssh"]
+        assert any("Timeout connecting" in m for m in messages), (
+            f"Expected 'Timeout connecting' log, got: {messages!r}"
+        )
+        assert not any("OS error connecting" in m for m in messages), (
+            f"TimeoutError must not fall through to the OSError branch: {messages!r}"
+        )
+
+    async def test_non_timeout_os_error_logs_os_error_message(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A genuine (non-timeout) OSError, e.g. connection refused, must
+        still be logged as 'OS error connecting' — the reorder must not
+        swallow this branch."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        server = manager.registry.get_server("test-host")
+
+        with patch(
+            "ssh_mcp.ssh.asyncssh.connect",
+            AsyncMock(side_effect=ConnectionRefusedError("refused")),
+        ):
+            with caplog.at_level("ERROR", logger="ssh_mcp.ssh"):
+                with pytest.raises(ConnectionRefusedError):
+                    await manager._create_connection(server)
+
+        messages = [r.getMessage() for r in caplog.records if r.name == "ssh_mcp.ssh"]
+        assert any("OS error connecting" in m for m in messages), (
+            f"Expected 'OS error connecting' log, got: {messages!r}"
+        )
+        assert not any("Timeout connecting" in m for m in messages)
 
 
 # ---------------------------------------------------------------------------
