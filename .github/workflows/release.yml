@@ -1,8 +1,8 @@
 name: Release
 
 # The tag is the release input. `v*` only — the guard step in `build` asserts the
-# tag matches the version hatchling reads out of src/ssh_mcp/__init__.py, so a
-# mistyped tag fails before anything is published.
+# tag matches the version declared in src/ssh_mcp/__init__.py, so a mistyped tag
+# fails before anything is published.
 on:
   push:
     tags:
@@ -17,10 +17,13 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Gates. These duplicate ci.yml deliberately: ci.yml runs on branches, not on
-  # tags, so without these a tag could be cut from a commit that never passed CI
-  # (or that passed CI days ago, before a new advisory landed). `audit` in
-  # particular MUST run at tag time — its input is the live advisory DB.
+  # Gates. Near-copies of ci.yml's `test`/`lint`/`audit` — the test step here
+  # drops ci.yml's coverage flags. They exist because `needs:` cannot reference
+  # a job in another workflow: ci.yml does also run on `v*` tags, but `build`
+  # and `publish-pypi` can only be gated by jobs defined HERE. The price is
+  # that a tag push runs all three twice, once per workflow. `audit` earns its
+  # place regardless — its input is the live advisory DB, not the commit, so it
+  # must run at tag time instead of relying on a days-old branch result.
   # ---------------------------------------------------------------------------
   test:
     name: Test (Python ${{ matrix.python-version }})
@@ -107,10 +110,13 @@ jobs:
 
       - run: uv python install 3.13
 
-      # hatchling reads the version from src/ssh_mcp/__init__.py. If the tag and
-      # that string disagree, the artifact filename will not match the tag and
-      # the release is a lie. Fail here, not after upload — PyPI uploads are
-      # irreversible and, since 2026-07-08, un-amendable after 14 days.
+      # The published version comes from src/ssh_mcp/__init__.py (hatchling
+      # reads it via [tool.hatch.version]). If the tag and that string disagree,
+      # the artifact filename will not match the tag and the release is a lie.
+      # The check below imports the module rather than invoking hatchling, and
+      # it is the first `uv run` in this job — so it implicitly syncs WITHOUT
+      # `--locked`, unlike every gate job above. Fail here, not after upload: a
+      # version/filename that reached PyPI can never be re-uploaded.
       - name: Assert tag matches package version
         env:
           GIT_TAG: ${{ github.ref_name }}
@@ -126,13 +132,23 @@ jobs:
         run: uv build
 
       # Smoke-test the built artifacts, not the source tree. Catches a wheel
-      # that is missing a module or an entry point.
+      # whose console script does not resolve, or that is missing a module the
+      # import chain needs. `--help` is NOT a supported flag: main() recognizes
+      # only `healthcheck` (see server.py), so any other argv falls through to
+      # the stdio transport, which exits 0 here because the runner hands the
+      # step an empty stdin. Read this as an import/entry-point check only — it
+      # asserts nothing about a CLI contract.
       - name: Smoke test (wheel)
         run: uv run --isolated --no-project --with dist/*.whl -- ssh-mcp --help
       - name: Smoke test (sdist)
         run: uv run --isolated --no-project --with dist/*.tar.gz -- ssh-mcp --help
 
-      # CycloneDX SBOM of the LOCKED RUNTIME dependency set (no dev extras).
+      # CycloneDX SBOM of the LOCKED dependency set. Two things it does NOT
+      # contain: ssh-mcp itself (`--no-emit-project`), so the document has no
+      # subject component; and anything from an extra — `dev` and `otel` are
+      # [project.optional-dependencies], which `uv export` drops by default, so
+      # the `otel` extra's opentelemetry-api is absent. `--no-dev` targets
+      # dependency-GROUPS, of which this project has none, and is a no-op here.
       - name: Generate CycloneDX SBOM
         run: |
           set -euo pipefail
@@ -157,9 +173,11 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Publish. The ONLY job with id-token: write. Runs in the `pypi` environment,
-  # which is where the human approval gate lives and which PyPI's trusted
-  # publisher config pins to. Nothing is built here.
+  # Publish. The ONLY job with id-token: write. Nothing is built here. The
+  # `environment:` key below only NAMES the `pypi` environment; the human
+  # approval gate on it and PyPI's trusted-publisher binding to it are
+  # out-of-band settings (repository environment config / PyPI project config),
+  # not something this file can enforce.
   # ---------------------------------------------------------------------------
   publish-pypi:
     name: Publish to PyPI
@@ -186,7 +204,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # GitHub Release: attach the SBOM + the exact artifacts that went to PyPI, and
-  # a GitHub-native build provenance attestation over them.
+  # a GitHub-native build provenance attestation over the distributions only
+  # (`subject-path: dist/*` below — the SBOM is attached but NOT attested).
   # ---------------------------------------------------------------------------
   github-release:
     name: GitHub Release

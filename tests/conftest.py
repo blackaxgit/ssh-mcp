@@ -1,7 +1,11 @@
 """Shared pytest fixtures for SSH MCP server tests.
 
 This module provides reusable test fixtures for models, configurations, and
-test data structures used across multiple test modules.
+test data structures used by the other test modules.
+
+Importing it also has a session-wide side effect: it registers and loads the
+global Hypothesis profiles below, so every property test in the suite inherits
+whichever profile ``HYPOTHESIS_PROFILE`` selects.
 """
 
 from __future__ import annotations
@@ -14,8 +18,14 @@ from hypothesis import HealthCheck, settings
 
 from ssh_mcp.models import ExecResult, GroupConfig, ServerConfig, Settings
 
-# Hypothesis profiles: tuned for fast local dev, thorough CI.
-# Select via HYPOTHESIS_PROFILE=ci env var — CI workflow sets this.
+# Hypothesis profiles: ``dev`` is tuned for a fast inner loop, ``ci`` for a
+# thorough fuzz run. Select via the HYPOTHESIS_PROFILE env var. No workflow in
+# .github/ sets it, so CI currently runs ``dev`` (50 examples) too — export
+# HYPOTHESIS_PROFILE=ci by hand, or in the workflow, to get the 200-example run.
+#
+# ``suppress_health_check`` is defensive only: every ``@given`` test in the
+# suite takes Hypothesis-drawn arguments exclusively, so no function-scoped
+# pytest fixture is currently reused across examples.
 settings.register_profile(
     "dev",
     max_examples=50,
@@ -35,6 +45,11 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 def sample_settings() -> Settings:
     """Return a Settings instance with default values.
 
+    Not fully hermetic: ``transfer_root`` comes from a ``default_factory``
+    (``paths.default_transfer_root``) that reads ``XDG_DATA_HOME``, so it is
+    ``~/.local/share/ssh-mcp/transfers`` only when that variable is unset. This
+    fixture monkeypatches nothing — assert on it accordingly.
+
     Returns:
         Settings instance with default configuration
     """
@@ -44,6 +59,12 @@ def sample_settings() -> Settings:
 @pytest.fixture
 def sample_settings_custom() -> Settings:
     """Return a Settings instance with custom values.
+
+    Currently unreferenced by any test module. Two caveats if it is picked up
+    again: ``known_hosts=True`` matches the model default, so this does not
+    exercise the ``known_hosts=False`` MITM-warning branch in ``config.py``;
+    and the fields added since it was written (``max_command_bytes``,
+    ``transfer_root``, ``max_parallel_hosts``) are left at their defaults.
 
     Returns:
         Settings instance with custom configuration
@@ -60,6 +81,12 @@ def sample_settings_custom() -> Settings:
 @pytest.fixture
 def sample_servers() -> list[ServerConfig]:
     """Return a list of sample ServerConfig objects.
+
+    Deliberately not a self-consistent registry: ``bastion`` references
+    ``jump_host="work"`` and ``groups=("infra",)``, neither of which exists here
+    or in ``sample_groups``. Loading these two fixtures together through
+    ``ConfigManager`` would log ``references undefined jump_host`` and
+    ``references undefined group`` warnings (advisory only, not fatal).
 
     Returns:
         List of 4 test server configurations
@@ -98,6 +125,9 @@ def sample_servers() -> list[ServerConfig]:
 @pytest.fixture
 def sample_groups() -> list[GroupConfig]:
     """Return a list of sample GroupConfig objects.
+
+    Defines ``prod``, ``web`` and ``database`` only — the ``infra`` group that
+    ``sample_servers`` references is intentionally absent (see that fixture).
 
     Returns:
         List of 3 test group configurations
@@ -147,6 +177,12 @@ def sample_exec_error() -> ExecResult:
 @pytest.fixture
 def tmp_config_file(tmp_path: Path) -> Path:
     """Create a minimal valid TOML config file for testing.
+
+    The file content is fixed, but the ``Settings`` a ``ConfigManager`` derives
+    from it are not: this fixture isolates no environment variables, and
+    ``config.py`` applies ``SSH_MCP_TRANSFER_ROOT`` as an env > TOML > default
+    override at load time (with ``XDG_DATA_HOME`` feeding the default). Clear or
+    monkeypatch both when asserting on ``settings.transfer_root``.
 
     Args:
         tmp_path: pytest temporary directory fixture

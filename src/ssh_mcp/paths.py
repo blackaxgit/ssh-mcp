@@ -25,20 +25,33 @@ directly rather than ``get``/``put``, asyncssh never resolves a local path at
 all, so (2) and (3) become unreachable code rather than defended-against
 behaviour.
 
+The denylist itself was not deleted: ``_SENSITIVE_PATHS`` in ``ssh.py``
+survives as a *remote*-path tripwire, which is all it was ever fit to be.
+Local paths no longer consult it at all.
+
 Portability and residual risk
 -----------------------------
-This requires POSIX ``openat``-style semantics (``dir_fd=`` plus
-``O_NOFOLLOW``) and is not supported on Windows; ``ensure_root`` fails fast
-there rather than silently degrading.
+This requires POSIX ``openat``-style semantics (``dir_fd=`` plus both
+``O_NOFOLLOW`` and ``O_DIRECTORY``) and is not supported on Windows;
+``ensure_root`` fails fast there rather than silently degrading.
 
-One race is **not** closed: a same-filesystem ``rename()`` of an intermediate
-directory between two ``os.open`` calls. Only Linux ``openat2`` with
-``RESOLVE_BENEATH`` closes it, and as of 2026 CPython has declined to expose
-it (python/cpython#141878, closed "not planned") with no macOS equivalent
-existing at all. The exposure is mitigated by requiring the root to be
-owner-only (0700) and owned by the running user, so an attacker who could win
-that race already has write access to the root. This is stated rather than
-hidden.
+Three races are **not** closed. They are stated rather than hidden:
+
+1. A same-filesystem ``rename()`` of an intermediate directory between two
+   ``os.open`` calls. Only Linux ``openat2`` with ``RESOLVE_BENEATH`` closes
+   it, and as of 2026 CPython has declined to expose it
+   (python/cpython#141878, closed "not planned") with no macOS equivalent
+   existing at all. The exposure is mitigated by requiring the root to be
+   owner-only (0700) and owned by the running user, so an attacker who could
+   win that race already has write access to the root.
+2. The *remote* check-to-open gap that ``ssh.py`` points here for:
+   ``download_file`` refuses non-regular remote files via
+   ``sftp.stat(follow_symlinks=False)`` before opening anything, but SFTP v3
+   has no atomic no-follow open, so a hostile remote server can still swap
+   the path in between. The local destination stays confined regardless.
+3. ``_unlink_beneath``'s ``stat``-then-``unlink`` identity gap in ``ssh.py``:
+   POSIX has no "unlink iff inode matches" primitive, so a rename landing in
+   that exact gap could still slip through. See that function's docstring.
 """
 
 from __future__ import annotations
@@ -106,9 +119,12 @@ def default_transfer_root() -> str:
     Computed in code rather than written as a string default: the shell form
     ``${XDG_DATA_HOME:-~/.local/share}`` is not something Python expands.
     ``os.path.expanduser`` handles only a leading ``~`` and
-    ``os.path.expandvars`` does not implement the ``:-`` fallback, so a
-    string default would be taken literally and create a directory with that
-    name on first run.
+    ``os.path.expandvars`` does not implement the ``:-`` fallback, so that
+    form would be taken literally and create a directory with that name on
+    first run. (A plain ``~/.local/share/...`` string default *would* be
+    expanded — the ``transfer_root`` validator in ``models.py`` runs
+    ``expanduser`` + ``abspath``, and ``validate_default=True`` applies it to
+    the default too — but it could not honour ``XDG_DATA_HOME``.)
     """
     base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     return os.path.join(base, "ssh-mcp", "transfers")
@@ -117,15 +133,19 @@ def default_transfer_root() -> str:
 def validate_relative(relpath: str) -> tuple[str, ...]:
     """Split ``relpath`` into components, rejecting anything not confinable.
 
-    Rejects absolute paths, ``..``, ``.``, empty components and embedded NUL
-    bytes. Sub-directories *are* permitted — confinement comes from the
-    component-wise walk in :func:`open_beneath`, not from forbidding depth.
+    Rejects absolute paths, ``..``, a path that is only ``.``, and embedded
+    NUL bytes. Empty and ``.`` components *inside* a path are collapsed
+    rather than rejected: ``PurePosixPath`` already drops them, so ``"a//b"``
+    and ``"a/./b"`` both yield ``("a", "b")``. Sub-directories *are*
+    permitted — confinement comes from the component-wise walk in
+    :func:`open_beneath`, not from forbidding depth.
 
     Returns:
         The path components, e.g. ``("sub", "file.txt")``.
 
     Raises:
-        PathConfinementError: with an actionable message naming the setting.
+        PathConfinementError: with an actionable message; the two that mean
+            "this escapes the root" name the ``transfer_root`` setting.
     """
     if not isinstance(relpath, str) or not relpath.strip():
         raise PathConfinementError("path must be a non-empty string")
@@ -145,6 +165,10 @@ def validate_relative(relpath: str) -> tuple[str, ...]:
         raise PathConfinementError(f"path resolves to no components: {relpath!r}")
 
     for part in parts:
+        # Defensive, not load-bearing: ``.parts`` never yields "" or "."
+        # (PurePosixPath collapses both) and yields os.sep only for absolute
+        # paths, already rejected above. Kept so the invariant is enforced
+        # rather than assumed, should that normalisation ever change.
         if part in ("", ".", os.sep):
             raise PathConfinementError(f"path contains an empty component: {relpath!r}")
         if part == "..":
@@ -158,13 +182,20 @@ def validate_relative(relpath: str) -> tuple[str, ...]:
 def ensure_root(path: str) -> int:
     """Create/validate the transfer root and return a pinned directory fd.
 
-    The descriptor is opened once and held for the process lifetime, so later
+    The descriptor is opened once and then held by ``SSHManager`` — pinned
+    lazily on the first SFTP transfer rather than at startup, refcounted
+    across concurrent transfers, and closed by ``close_all()`` — so later
     transfers resolve against the directory that was validated here rather
     than re-resolving a path that may since have been replaced.
 
-    Fails closed: a root that cannot be created, is not a directory, is not
-    owned by this user, or is group/other-accessible raises rather than
-    silently proceeding with a weaker boundary.
+    Fails closed, in this order: a platform without POSIX ``dir_fd`` or
+    without ``O_NOFOLLOW``/``O_DIRECTORY``; then a root that cannot be
+    created, is itself a symbolic link (the check the comment below calls the
+    whole point), is not a directory, is not owned by this user, or is
+    group/other-accessible. Each raises rather than silently proceeding with
+    a weaker boundary. Note ``makedirs`` runs *before* the symlink, ownership
+    and mode checks, so the directory is created as a side effect even on the
+    paths that then refuse to use it.
 
     Raises:
         PathConfinementError: if the root cannot be established safely.
@@ -244,9 +275,18 @@ def open_beneath(root_fd: int, relpath: str, flags: int, mode: int = 0o600) -> i
     as an escape route, and leaves an ``upload_file`` *read* free to follow a
     link planted inside the root.
 
+    The same walk is duplicated in ``ssh.py``'s ``_unlink_beneath``, which
+    needs the *parent* descriptor this function does not hand back. Keep the
+    two in step — but note their error contracts deliberately differ: that
+    copy does **not** translate ``ELOOP``/``ENOTDIR`` into
+    ``PathConfinementError``, because its only caller treats every
+    ``OSError`` as best-effort-cleanup-failed anyway.
+
     Args:
         root_fd: Directory descriptor from :func:`ensure_root`.
-        relpath: Root-relative path; sub-directories permitted.
+        relpath: Root-relative path; sub-directories are permitted but must
+            already exist — the walk never passes ``O_CREAT``, so a missing
+            intermediate directory surfaces as a bare ``OSError`` (ENOENT).
         flags: ``os.open`` flags for the final component. ``O_NOFOLLOW`` and
             ``O_CLOEXEC`` are always added.
         mode: Creation mode when ``flags`` includes ``O_CREAT``.

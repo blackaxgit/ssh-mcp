@@ -1,5 +1,10 @@
 name: CI
 
+# Branches AND `v*` tags. The tag path is not a dry run: `PUBLISH` (docker job)
+# is true for it, so a tag push runs the full matrix and publishes a GHCR image
+# — concurrently with release.yml, which re-runs its own copies of test/lint/
+# audit on the same tag. release.yml's header comment and
+# tests/test_ci_lint_determinism.py both still describe ci.yml as branches-only.
 on:
   push:
     branches: [main]
@@ -9,6 +14,9 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
+  # Unlike release.yml (`cancel-in-progress: false`, "never cancel a
+  # half-finished publish"), this cancels in flight — on the tag and main paths
+  # too, where the docker job is publishing.
   cancel-in-progress: true
 
 permissions: {}
@@ -72,6 +80,11 @@ jobs:
       # ruff 0.16.0's default-rule expansion (59 -> 413 on 2026-07-23) turned
       # this job red on commits it had passed days earlier. See pyproject.toml
       # [tool.ruff.lint] for the explicitly declared rule set.
+      #
+      # mypy also gates this job (below) but is NOT exactly pinned
+      # (`mypy>=1.15` in pyproject.toml); its determinism rests on uv.lock
+      # alone, not on the pin rationale above. Same blind spot in
+      # PINNED_LINT_TOOLS in tests/test_ci_lint_determinism.py.
       - name: Check formatting with ruff
         run: uv run ruff format --check src/ tests/
 
@@ -135,11 +148,13 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write        # sign the provenance/SBOM attestations
-      attestations: write    # record them
+      id-token: write        # sign the provenance attestation
+      attestations: write    # record it
     env:
-      # Single source of truth. Used by build, scan, promote and attest so the
-      # four steps cannot drift apart.
+      # Single source of truth for the PUBLISH path: build, scan, promote and
+      # attest all derive their reference from it, so those four steps cannot
+      # drift apart. The PR path deliberately stays out of the registry and
+      # hardcodes `ssh-mcp:ci` in its build and scan steps instead.
       IMAGE: ghcr.io/${{ github.repository }}
       # Publishing is the exception, not the default. PRs build + scan only.
       PUBLISH: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
@@ -159,6 +174,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Only this step's `tags` output is consumed (by promote + verify). Its
+      # `labels`/`annotations` outputs are computed and then used by nothing —
+      # the publish build passes no `labels:`, so published images carry none.
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
@@ -171,14 +189,22 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       # -----------------------------------------------------------------------
-      # ONE build. On the publish path it goes straight to GHCR *by digest* —
-      # no tag is attached, so nothing in the registry is reachable by name
-      # until Trivy has passed. On PRs the same build is loaded locally.
+      # ONE build per path. On the publish path it goes straight to GHCR *by
+      # digest* — no tag is attached, so nothing in the registry is reachable by
+      # name until Trivy's CRITICAL gate has passed. PRs take the second step
+      # below, which loads the image locally instead. The two are independent
+      # BuildKit invocations with different exporters, NOT the same build — see
+      # test_docker_job_builds_exactly_once in
+      # tests/test_ci_lint_determinism.py for why that distinction matters.
       #
-      # provenance/sbom are disabled on purpose: BuildKit's inline attestations
-      # wrap the image in an index, which complicates digest promotion, and
-      # GHCR's Referrers API support for them is incomplete. GitHub Artifact
-      # Attestations (below) cover the same ground with a working verifier.
+      # On the publish step provenance/sbom are disabled on purpose: BuildKit's
+      # inline attestations wrap the image in an index, which complicates
+      # digest promotion, and GHCR's Referrers API support for them is
+      # incomplete. GitHub Artifact Attestations (below) are meant to cover the
+      # same ground with a working verifier — but see the verify step: that
+      # attest step does not currently run. The PR step sets neither input; it
+      # never leaves the runner. (The CycloneDX SBOM is a release.yml artifact,
+      # not something this job produces or attests.)
       # -----------------------------------------------------------------------
       - name: Build image (publish path — push by digest, no tags)
         id: build
@@ -208,6 +234,10 @@ jobs:
       # Scan the EXACT digest that was pushed. `${IMAGE}@sha256:…` is content-
       # addressed: there is no tag in the reference, so nothing can have been
       # substituted between the build step and this one.
+      #
+      # Scope of the gate, deliberately narrow: `severity: CRITICAL` only, so
+      # HIGH image findings never fail the build, and `ignore-unfixed` is unset.
+      # Open posture decision, tracked in docs/fixes/05-followups.md §3.
       # -----------------------------------------------------------------------
       - name: Scan published digest with Trivy
         if: env.PUBLISH == 'true'
@@ -230,6 +260,8 @@ jobs:
       # -----------------------------------------------------------------------
       # Only now does a human-readable tag come into existence, and it is
       # created FROM the scanned digest. No rebuild, no second BuildKit run.
+      # Mind the ordering: this step publishes the tags, and the verify step
+      # below only reports on them afterwards — a failing verify untags nothing.
       # -----------------------------------------------------------------------
       - name: Promote scanned digest to tags
         if: env.PUBLISH == 'true'
@@ -244,8 +276,17 @@ jobs:
           done <<< "$TAGS"
           docker buildx imagetools create "${TAG_ARGS[@]}" "${IMAGE}@${DIGEST}"
 
-      # Proof, in the job log, that every published tag resolves to the bytes
-      # Trivy cleared. If this ever fails, the scan gate has been bypassed.
+      # Intended as proof, in the job log, that every published tag resolves to
+      # the bytes Trivy cleared. As written the check cannot pass: `imagetools
+      # create` above wraps the single-platform manifest in a NEW OCI index, so
+      # the tag's digest legitimately differs from the scanned one (and hashing
+      # `inspect --raw` stdout folds in a trailing newline the registry's
+      # manifest bytes do not have). Since 2026-07-26 it fails on every publish
+      # run — after the tags are already live — which also stops the attest step
+      # below from running. A failure here means the comparison is broken, NOT
+      # that the scan gate was bypassed. FIXME: compare the manifest digest the
+      # registry reports (`imagetools inspect --format '{{.Manifest.Digest}}'`),
+      # accounting for the index wrapping.
       - name: Verify every tag resolves to the scanned digest
         if: env.PUBLISH == 'true'
         env:
@@ -263,6 +304,9 @@ jobs:
             fi
           done <<< "$TAGS"
 
+      # Unreachable on the publish path today: the verify step above fails
+      # first, so images pushed to GHCR since 2026-07-26 carry no provenance
+      # attestation. Fixing verify restores this.
       - name: Attest build provenance for the image
         if: env.PUBLISH == 'true'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1

@@ -3,6 +3,14 @@
 This module provides the SSHManager class that handles async SSH connections
 to multiple servers with connection pooling, idle eviction, and parallel
 group execution capabilities.
+
+It also holds the three security-relevant surfaces that account for most of
+this file: the credential-redaction pipeline applied to every command before
+it reaches a logger (``_redact_secrets``), the destructive-command tripwire
+(``_is_dangerous_command``), and the SFTP upload/download implementations,
+whose local paths are resolved beneath a pinned ``transfer_root`` file
+descriptor (B1) via ``ssh_mcp.paths.open_beneath`` rather than handed to
+asyncssh as path strings.
 """
 
 from __future__ import annotations
@@ -49,7 +57,8 @@ except ImportError:  # pragma: no cover - exercised by env without extras
 # These are deliberately NOT promoted to Settings fields: they are
 # implementation details that operators should not need to tune. Lifting
 # them to module-level makes them greppable and testable without widening
-# the public config surface.
+# the public config surface. (``_MAX_SFTP_BYTES`` is the one candidate for
+# promotion — see its own comment below.)
 # ---------------------------------------------------------------------------
 
 # Eviction loop wakes this often to scan for idle connections. Smaller =
@@ -452,11 +461,11 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
     separator can't be swallowed by a later rule. Env-var patterns run
     before short-flag patterns because ``PGPASSWORD=xxx`` is more
     specific than any flag-based match, and the two hand-written scanners
-    (Defect 1) that replaced the old rules 0/8/9 keep their original
-    relative position — URL first, long-flags last.
+    (Defect A) that replaced the old regex rules 1 and 8/9 keep their
+    original relative position — URL first, long-flags last.
 
     Rules 4/5/6 use lookbehind, which is why this pipeline stays on
-    Python's ``re`` engine for everything except the three rules that
+    Python's ``re`` engine for everything except the two rules that
     needed hand-written scanners (RE2 was considered and rejected for
     that reason).
     """
@@ -572,10 +581,11 @@ def _redact_secrets(value: Any) -> Any:
 # patterns below catch the highest-frequency mistakes — they are NOT
 # expected to resist a motivated adversary. Operators who need real
 # isolation must sandbox at a lower layer (containers, SELinux, etc.).
-# Red Team R4 hardening: every pattern is compiled with ``re.IGNORECASE``
-# so ``rm -RF /`` / ``RM -rf /`` don't bypass. The rm-flag patterns use
-# lookaheads instead of ordered character classes so `-rfv`, `-vfr`,
-# `-rfvi` (any order with extra flags) all match.
+# Red Team R4 hardening: every letter-bearing pattern is compiled with
+# ``re.IGNORECASE`` so ``rm -RF /`` / ``RM -rf /`` don't bypass (the
+# fork-bomb pattern below matches no letters, so it needs no flag). The
+# rm-flag patterns use lookaheads instead of ordered character classes so
+# `-rfv`, `-vfr`, `-rfvi` (any order with extra flags) all match.
 _DANGEROUS_PATTERNS = [
     # Filesystem root wipe via rm -rf — catches `/`, `~`, `$HOME`, `$USER`
     # forms. Flag cluster must contain BOTH `r` and `f` anywhere, plus
@@ -588,7 +598,7 @@ _DANGEROUS_PATTERNS = [
     # S11 (RC7): the combined-cluster pattern above only matches a SINGLE
     # token like -rf/-fr. It misses recursive and force given as separate
     # tokens (`rm -r -f /`) or as GNU long options (`rm --recursive
-    # --force /`), which the execute() docstring claims are caught. Both
+    # --force /`), which operators reasonably expect to be caught. Both
     # flag orders are covered; short/long forms are independent per slot,
     # so this also matches `rm -r --force /` and `rm --recursive -f /`.
     re.compile(
@@ -660,8 +670,10 @@ _DANGEROUS_PATTERNS = [
 # leading ``/`` match anywhere in the normalized path (e.g. ``.aws/credentials``
 # catches both ``/home/alice/.aws/credentials`` and ``/root/.aws/credentials``).
 #
-# SSH public keys (``*.pub``) are explicitly exempted in ``_is_sensitive_path``
-# because publishing public keys via SFTP is a legitimate operation.
+# There is NO ``*.pub`` exemption: B1/RC1 dropped it, so ``.ssh/id_rsa.pub``
+# still matches the ``.ssh/id_rsa`` entry below and is blocked — see
+# ``_is_sensitive_path`` for why the exemption was removed rather than
+# hardened. Do not reintroduce it.
 _SENSITIVE_PATHS = [
     # Unix system secrets
     "/etc/shadow",
@@ -719,8 +731,11 @@ def _normalize_path(path: str) -> str:
     case-insensitive (defends against ``/ETC/SHADOW`` on case-insensitive
     filesystems and caseless-hostname shells).
 
-    Does NOT resolve ``..`` components (path traversal is caught earlier
-    by a separate check) and does NOT follow symlinks (those require
+    ``normpath`` also collapses ``..`` components LEXICALLY, which is not
+    a traversal defence on its own (a lexical collapse can rewrite a path
+    across a symlinked component). Traversal is rejected earlier, by
+    ``_validate_remote_path``, before this function is ever reached — that
+    ordering is load-bearing. Does NOT follow symlinks (that would require
     filesystem access).
 
     Args:
@@ -770,8 +785,12 @@ def _is_sensitive_path(path: str) -> bool:
 def _is_dangerous_command(command: str) -> bool:
     """Check if command matches any dangerous patterns.
 
-    Strips null bytes and ASCII control characters before matching so that
-    homoglyph / null-byte injection cannot bypass the regex patterns.
+    Replaces null bytes and ASCII control characters with a space before
+    matching so that null-byte / control-character injection cannot bypass
+    the regex patterns (see the inline comment below for why replacement
+    rather than deletion). Unicode homoglyphs are NOT normalized — they
+    remain a known bypass, per the tripwire caveat above
+    ``_DANGEROUS_PATTERNS``.
 
     Args:
         command: Command string to check
@@ -826,10 +845,12 @@ def _validate_remote_path(path: str) -> None:
 # unreachable rather than defended against.
 
 
-# Bounded read chunk for the S10 output-draining loop below. Independent
-# of asyncssh's own SFTP block sizing (``SFTPClient.limits``); this only
-# caps how much a single ``SSHReader.read()`` call may request, so a
-# single call can never over-allocate far past the configured budget.
+# Bounded read chunk for the S10 output-draining loop below. This governs
+# process stdout/stderr draining via ``SSHReader.read()`` only — it is
+# unrelated to the SFTP block sizes, which the transfer paths take from
+# ``sftp.limits`` separately. It only caps how much a single ``read()``
+# call may request, so a single call can never over-allocate far past the
+# configured budget.
 _STREAM_READ_CHUNK_BYTES: int = 65536
 
 
@@ -856,8 +877,10 @@ async def _drain_stream_bounded(
 
     Returns:
         ``(data, truncated)``. ``data`` is at most ``budget`` bytes.
-        ``truncated`` is ``True`` iff more data remained unread when this
-        function stopped.
+        ``truncated`` is ``True`` iff the stream produced more than
+        ``budget`` bytes — the overflow bytes were read and then dropped by
+        the slice below; whether anything further remains unread on the
+        stream is not implied.
     """
     chunks: list[bytes] = []
     total = 0
@@ -1274,15 +1297,24 @@ class SSHManager:
         Args:
             server_name: Server name from registry
             command: Command to execute
-            timeout: Command timeout in seconds
+            timeout: Command timeout in seconds. A per-server
+                ``server.timeout`` in the registry takes precedence and
+                silently overrides this argument whenever it is set.
             working_dir: Working directory for command execution
             force: Bypass dangerous command detection (use with caution)
             dry_run: If True, skip connection and execution — return a
                 preview describing what WOULD run. Dangerous-command detection
-                still applies so rejection can be previewed.
+                still applies so rejection can be previewed. The preview text
+                is returned in ``stdout`` with ``exit_code=0`` and
+                ``duration_ms=0``, so a caller must NOT read ``exit_code == 0``
+                as "the command ran".
 
         Returns:
-            ExecResult with command output and metadata
+            ExecResult with command output and metadata. This method never
+            raises: every failure path (unknown server, SSH error, timeout,
+            unexpected exception) is reported as an ExecResult with
+            ``exit_code=None`` and ``error`` set. ``execute_on_group``
+            depends on that contract.
         """
         if _ssh_tracer is None:
             return await self._execute_impl(
@@ -1644,18 +1676,27 @@ class SSHManager:
     ) -> list[ExecResult]:
         """Execute command on all servers in a group in parallel.
 
+        Parallelism is bounded by a PROCESS-WIDE semaphore sized from
+        ``settings.max_parallel_hosts``, not a per-call one, so independent
+        ``execute_on_group`` calls serialise against each other for their
+        share of the pool — an intentional behaviour change (S1).
+
         Args:
             group_name: Group name from registry
             command: Command to execute
             timeout: Command timeout in seconds
             working_dir: Working directory for command execution
-            fail_fast: Cancel remaining tasks on first failure
+            fail_fast: Cancel the remaining tasks as soon as one result
+                comes back with ``error`` set OR with a non-zero
+                ``exit_code`` (not only on an exception).
             force: Bypass dangerous command detection (use with caution)
             dry_run: If True, preview what WOULD run on each server without
                 connecting. Dangerous-command detection still applies.
 
         Returns:
-            List of ExecResult, one per server in the group
+            List of ExecResult, one per server in the group. An unknown
+            group name returns a single-element list whose ``server`` field
+            holds the GROUP name rather than a server name.
         """
         try:
             servers = self.registry.servers_in_group(group_name)
@@ -1848,10 +1889,16 @@ class SSHManager:
     async def upload(self, server_name: str, local_path: str, remote_path: str) -> str:
         """Upload file to remote server via SFTP.
 
-        Emits three-stage audit logs (start → complete | failed) with the
-        ``connection_id`` and a monotonic ``duration_ms`` bound into the
-        structlog context so every log line from a single transfer is
-        grep-correlatable. Also opens an OpenTelemetry ``ssh.upload`` span
+        Emits audit logs (``start`` → ``complete`` | ``failed``) with
+        ``server``, ``operation``, both paths and the ``connection_id`` bound
+        into the structlog context so every log line from a single transfer
+        is grep-correlatable; a monotonic ``duration_ms`` is not bound to the
+        context but reported on each of those lines. A ``failed`` record is
+        emitted only from the ``FileNotFoundError`` and SFTP/OS-error
+        handlers — a ``ValueError`` from one of the validation guards
+        (non-regular local file, oversize file, non-regular remote target,
+        ``PathConfinementError``) leaves ``start`` with no terminal record.
+        Also opens an OpenTelemetry ``ssh.upload`` span
         (Green Team H2 fix) with ``ssh.host`` and path-length attributes —
         lengths not contents so nothing sensitive leaks into trace backends.
 
@@ -2059,11 +2106,16 @@ class SSHManager:
     ) -> str:
         """Download file from remote server via SFTP.
 
-        Emits three-stage audit logs (start → complete | failed) with the
-        ``connection_id`` and a monotonic ``duration_ms`` bound into the
-        structlog context so every log line from a single transfer is
-        grep-correlatable. Also opens an OpenTelemetry ``ssh.download``
-        span (Green Team H2 fix).
+        Emits audit logs (``start`` → ``complete`` | ``failed``) with
+        ``server``, ``operation``, both paths and the ``connection_id`` bound
+        into the structlog context so every log line from a single transfer
+        is grep-correlatable; a monotonic ``duration_ms`` is not bound to the
+        context but reported on each of those lines. A ``failed`` record is
+        emitted only from the SFTP/OS-error handler — a ``ValueError`` from
+        one of the validation guards (non-regular remote file, local
+        destination already exists, ``PathConfinementError``) leaves
+        ``start`` with no terminal record. Also opens an OpenTelemetry
+        ``ssh.download`` span (Green Team H2 fix).
 
         Args:
             server_name: Server name from registry
@@ -2305,7 +2357,14 @@ class SSHManager:
             structlog.contextvars.reset_contextvars(**ctx_tokens)
 
     async def close_all(self) -> None:
-        """Close all active SSH connections and stop eviction task."""
+        """Close all active SSH connections and stop eviction task.
+
+        Latches the transfer-root shutdown flag FIRST, so any SFTP transfer
+        starting after this point is refused with ``RuntimeError``, then
+        blocks on the transfer-root condition until every in-flight transfer
+        has drained before closing the pinned transfer-root fd. Also clears
+        the connection, last-used, connection-id, and per-server lock maps.
+        """
         # Defect C (panel iteration 3, verified by executing code): this
         # latch must be set before ANY other await in this method.
         # Previously it was only set at the very end, after cancelling
@@ -2449,6 +2508,10 @@ class SSHManager:
         self, server: ServerConfig, _depth: int = 0
     ) -> asyncssh.SSHClientConnection:
         """Create new SSH connection with jump host support.
+
+        Connection establishment is bounded by ``settings.command_timeout``
+        — a command-scoped setting reused as the connect timeout, so there
+        is no separate connect-timeout knob.
 
         Args:
             server: Server configuration

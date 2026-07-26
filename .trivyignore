@@ -1,19 +1,30 @@
-# Trivy ignore file — image (OS-level) CVEs with NO upstream fix available.
+# Trivy ignore file — image CVEs with NO upstream fix available. CI hands it to
+# the whole-image scan (`trivyignores: .trivyignore`), so an ID added here
+# silences Python site-packages findings under /app/.venv as well as OS ones.
 #
 # Policy: we only ignore CVEs that are unfixable at the base-image layer
 # (Debian status "fix_deferred" / "affected", no fixed version published).
-# Fixable CVEs must be patched, not ignored. Re-review each entry when the
-# base image (python:3.13-slim-trixie) is next bumped.
+# Fixable CVEs must be patched, not ignored — but note the scan runs at
+# `severity: CRITICAL` (ci.yml), so fixable HIGH/MEDIUM OS CVEs are never
+# surfaced by that gate at all. Re-review each entry when the pinned base-image
+# digest in the Dockerfile changes: the base is pinned by digest, so the tag
+# string (python:3.13-slim-trixie) does NOT move when the scanned bytes — and
+# the perl version in them — do. Nothing in CI or tests enforces this review.
 #
-# Last reviewed: 2026-07-25
+# Last reviewed: CVE-2026-42496 / CVE-2026-8376 — 2026-07-02 (perl version not
+# recorded); CVE-2026-13221 / CVE-2026-57433 — 2026-07-25.
 
-# perl-base (from python:3.13-slim-trixie). Not used at runtime by ssh-mcp,
-# which is a pure-Python app. Debian has not published a fix for any of these.
+# perl-base (from python:3.13-slim-trixie). perl is never invoked at runtime:
+# ssh-mcp never shells out locally (no subprocess/os.system in src/ssh_mcp/) and
+# jump hosts go through asyncssh's in-process tunnel, not an `ssh` ProxyCommand.
+# Debian has not published a fix for any of these.
 CVE-2026-42496  # perl-archive-tar path traversal — Debian status: fix_deferred
 CVE-2026-8376   # perl regex-compile heap buffer overflow — Debian status: affected
 
 # Added 2026-07-25. Both surfaced as CRITICAL on the first Trivy run after the
-# `Lint` job was un-blocked (previously `docker` never reached the scan step).
+# `Lint` job was un-blocked (previously `docker` never reached the scan step —
+# which any job in `needs: [test, lint, audit]`, `audit` included, can still
+# cause; the scan itself is now two steps, published digest vs PR-local image).
 # Verified against the Debian security tracker: trixie is "vulnerable" at
 # perl 5.40.1-6 with NO fixed version published for trixie.
 CVE-2026-13221  # perl regex trie >65535 branches -> silently wrong matches; trixie: vulnerable, no fix

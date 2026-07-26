@@ -1,15 +1,35 @@
 # Synthetic credential fixtures in the redaction test corpus.
 #
-# Every fingerprint below is an INPUT to a test in
-# tests/test_ssh.py::TestRedactSecrets, which asserts that _redact_secrets()
-# replaces it. They exist precisely so the redaction control has something to
-# redact -- none is a real credential and none requires rotation. tests/ ships
-# in neither distributed artifact: hatchling packages src/ only, and
-# .dockerignore excludes tests/.
+# Every fingerprint below points into the redaction test corpus in
+# tests/test_ssh.py -- the TestRedactSecrets* classes (TestRedactSecrets,
+# TestRedactSecretsPerformance, TestRedactSecretsTokenwise,
+# TestRedactSecretsNestedCredentialFlag). All but one are an INPUT to a test
+# which asserts that _redact_secrets() replaces it; the curl-auth-user entry
+# lands on a source comment naming the flags such a fixture exercises. They
+# exist precisely so the redaction control has something to redact -- none is a
+# real credential and none requires rotation. The published WHEEL excludes
+# tests/ (hatchling packages src/ only) and .dockerignore excludes tests/, but
+# the SDIST currently DOES ship tests/: pyproject.toml declares no
+# [tool.hatch.build] target config, so hatchling's default sdist includes every
+# non-gitignored path. Scanning the sdist surfaces these same fixtures.
 #
 # Recorded so a genuinely new finding is never lost in known noise. Generated
-# from an actual `gitleaks git` run rather than by hand. Re-generate if
-# TestRedactSecrets is restructured.
+# from an actual `gitleaks git` run rather than by hand -- and the raw findings
+# only reappear in such a run when this file is UNTRACKED (gitleaks reads the
+# committed copy, so deleting it on disk alone still yields 0 findings).
+# Re-generation is therefore APPEND-only: never replace the commit-pinned
+# entries below with the output of a run made while they were in effect.
+# Re-generate if the TestRedactSecrets* corpus is restructured.
+#
+# Scope limit: these fingerprints are commit-pinned (<sha>:<path>:<rule>:<line>)
+# and so suppress nothing in a working-tree scan. `gitleaks dir` / `--no-git`
+# reports the 7 below unsuppressed, plus untracked build/cache noise
+# (tests/__pycache__/*.pyc, .pytest_cache/, gitignored docs/) -- all of it the
+# same synthetic corpus, and all of it needing hand triage. Use `gitleaks git`
+# for the pre-push gate.
+#
+# Per-entry line numbers are the coordinates AT THE PINNED COMMIT, not at HEAD;
+# 6 of the 7 have since moved.
 
 # tests/test_ssh.py:1322 (generic-api-key)
 5093aca667d6aa461ea34e58a21b5d643b77e86a:tests/test_ssh.py:generic-api-key:1322
