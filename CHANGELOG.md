@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-07-26
+
+### Fixed
+
+**The PyPI project page had no description at all.** `pyproject.toml` declared no `readme`, so the built wheel carried a zero-length long description and https://pypi.org/project/blc-ssh-mcp/ rendered an empty body — just the name and a one-line summary. `readme = "README.md"` fixes it. Package metadata cannot be edited on PyPI and published files are immutable, so correcting this requires a release; that is the only reason 0.6.2 exists.
+
+**Seven README links would have 404'd once rendered on PyPI.** PyPI resolves relative Markdown links against `pypi.org`, not the repository, so `[LICENSE](LICENSE)`, `[CHANGELOG.md](CHANGELOG.md)`, `[SECURITY.md](SECURITY.md)`, `[CONTRIBUTING.md](CONTRIBUTING.md)`, `[compose.yaml](compose.yaml)` and `config/servers.example.toml` are now absolute. Keep any new README link absolute for the same reason.
+
+### Changed
+
+- **Summary rewritten** from "SSH MCP server for managing infrastructure via Claude Code" to "MCP server giving AI assistants SSH access to run commands, transfer files, and manage server fleets" — the old one named a single MCP client and omitted what the server actually does.
+- **`license` migrated to the PEP 639 SPDX form** (`license = "MPL-2.0"` plus `license-files`) from the deprecated `{text = "..."}` table, and the correspondingly deprecated `License :: OSI Approved ::` classifier was dropped. The published `License-File: LICENSE` metadata is unchanged.
+- **More project links on PyPI**: Changelog, Documentation, Security Policy and Container Image, alongside the existing Homepage/Repository/Issues.
+- Added the `System Administrators` audience classifier and the `sftp`, `devops`, `automation` keywords.
+
 ## [0.6.1] - 2026-07-26
 
 ### Changed — BREAKING (install command)
