@@ -1,3 +1,3 @@
 """SSH MCP Server - Manage infrastructure via MCP clients like Claude Code."""
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"

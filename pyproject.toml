@@ -9,17 +9,28 @@
 # container image stays ghcr.io/blackaxgit/ssh-mcp.
 name = "blc-ssh-mcp"
 dynamic = ["version"]
-description = "SSH MCP server for managing infrastructure via Claude Code"
+description = "MCP server giving AI assistants SSH access to run commands, transfer files, and manage server fleets"
+# Without `readme` there is NO long description in the wheel METADATA, and the
+# PyPI project page renders an empty body — which is exactly what 0.6.1 shipped.
+# The README is written to survive being rendered off-GitHub: every link in it
+# is absolute, because PyPI resolves relative links against pypi.org and they
+# would 404. Keep it that way when editing README.md.
+readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MPL-2.0"}
+# PEP 639 SPDX expression, not the legacy `{text = "..."}` table (deprecated,
+# and setuptools/hatchling both warn on it). `license-files` replaces the
+# `License :: OSI Approved ::` classifier, which PEP 639 also deprecates — do
+# not add that classifier back alongside this.
+license = "MPL-2.0"
+license-files = ["LICENSE"]
 authors = [
     {name = "SSH MCP Contributors"},
 ]
-keywords = ["mcp", "ssh", "claude", "infrastructure"]
+keywords = ["mcp", "ssh", "claude", "infrastructure", "sftp", "devops", "automation"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+    "Intended Audience :: System Administrators",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -53,6 +64,10 @@ ssh-mcp = "ssh_mcp.server:main"
 Homepage = "https://github.com/blackaxgit/ssh-mcp"
 Repository = "https://github.com/blackaxgit/ssh-mcp"
 Issues = "https://github.com/blackaxgit/ssh-mcp/issues"
+Changelog = "https://github.com/blackaxgit/ssh-mcp/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/blackaxgit/ssh-mcp#readme"
+"Security Policy" = "https://github.com/blackaxgit/ssh-mcp/blob/main/SECURITY.md"
+"Container Image" = "https://github.com/blackaxgit/ssh-mcp/pkgs/container/ssh-mcp"
 
 [project.optional-dependencies]
 dev = [

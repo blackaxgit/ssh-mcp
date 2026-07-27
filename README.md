@@ -2,7 +2,7 @@
 
 SSH MCP server that lets AI assistants execute commands on remote servers.
 
-[![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-brightgreen.svg)](LICENSE)
+[![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-brightgreen.svg)](https://github.com/blackaxgit/ssh-mcp/blob/main/LICENSE)
 [![Claude Code Ready](https://img.shields.io/badge/Claude_Code-Auto_Install_Ready-blueviolet?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iMCAwIDE2IDE2Ij48dGV4dCB4PSIwIiB5PSIxMyIgZm9udC1zaXplPSIxNCI+8J+UpTwvdGV4dD48L3N2Zz4=)](#add-to-claude-code)
 
 ## What is this
@@ -65,7 +65,7 @@ services:
       - ~/.ssh:/home/sshmcp/.ssh:ro
 ```
 
-The image uses a non-root `sshmcp` user (uid 1000). Mount your SSH keys and config file read-only. [compose.yaml](compose.yaml) in the repo carries a fuller example — it builds from the local Dockerfile rather than pulling the published image, and includes the HTTP-transport service, `ulimits` and healthcheck guidance omitted above.
+The image uses a non-root `sshmcp` user (uid 1000). Mount your SSH keys and config file read-only. [compose.yaml](https://github.com/blackaxgit/ssh-mcp/blob/main/compose.yaml) in the repo carries a fuller example — it builds from the local Dockerfile rather than pulling the published image, and includes the HTTP-transport service, `ulimits` and healthcheck guidance omitted above.
 
 ### Create a config file
 
@@ -349,7 +349,7 @@ Note two things about the timeouts, because the names invite confusion:
 
 `max_parallel_hosts` bounds the whole process, not a single call: the semaphore is built once at startup, so concurrent `execute_on_group` calls share the same budget rather than each getting their own.
 
-Per-server overrides (`hostname`, `port`, `user`, `identity_file`, `jump_host`, `default_dir`, `timeout`) take precedence over `~/.ssh/config`. See [config/servers.example.toml](config/servers.example.toml) for the annotated reference.
+Per-server overrides (`hostname`, `port`, `user`, `identity_file`, `jump_host`, `default_dir`, `timeout`) take precedence over `~/.ssh/config`. See [config/servers.example.toml](https://github.com/blackaxgit/ssh-mcp/blob/main/config/servers.example.toml) for the annotated reference.
 
 Restrict config file permissions to your user:
 
@@ -404,7 +404,7 @@ ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normal
 
 > **Known limitation: command OUTPUT is NOT redacted.** If you run `cat /etc/mysql/my.cnf`, `env | grep PASSWORD`, or `kubectl get secret X -o yaml`, the stdout/stderr returned to the MCP client will contain plaintext secrets. The redaction pipeline only filters the COMMAND string (what you asked to run), not the OUTPUT (what it printed). Avoid running commands that print secrets via ssh-mcp — pass credentials through env vars, Docker/K8s secrets, or dedicated config files instead.
 
-**Local path confinement (new in 0.6.0; versions ≤ 0.5.6 are affected by the flaw it fixes — see [CHANGELOG.md](CHANGELOG.md)).** SFTP `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Every local path is **relative to a configured transfer root** and is resolved one component at a time beneath it, refusing a symbolic link at *any* component:
+**Local path confinement (new in 0.6.0; versions ≤ 0.5.6 are affected by the flaw it fixes — see [CHANGELOG.md](https://github.com/blackaxgit/ssh-mcp/blob/main/CHANGELOG.md)).** SFTP `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Every local path is **relative to a configured transfer root** and is resolved one component at a time beneath it, refusing a symbolic link at *any* component:
 
 ```toml
 [settings]
@@ -436,7 +436,7 @@ For production log aggregation, set `SSH_MCP_LOG_FORMAT=json` to emit single-lin
 
 When running in Docker, capture stderr with `docker logs` for the audit trail.
 
-For vulnerability reports, see [SECURITY.md](SECURITY.md). Do not open public GitHub issues for security concerns.
+For vulnerability reports, see [SECURITY.md](https://github.com/blackaxgit/ssh-mcp/blob/main/SECURITY.md). Do not open public GitHub issues for security concerns.
 
 ## Development
 
@@ -448,12 +448,12 @@ uv run pytest
 uv run ruff check src/ tests/
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on making changes and submitting pull requests.
+See [CONTRIBUTING.md](https://github.com/blackaxgit/ssh-mcp/blob/main/CONTRIBUTING.md) for guidelines on making changes and submitting pull requests.
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md).
+See [CHANGELOG.md](https://github.com/blackaxgit/ssh-mcp/blob/main/CHANGELOG.md).
 
 ## License
 
-Mozilla Public License 2.0. See [LICENSE](LICENSE).
+Mozilla Public License 2.0. See [LICENSE](https://github.com/blackaxgit/ssh-mcp/blob/main/LICENSE).
