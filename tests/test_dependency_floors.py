@@ -53,7 +53,8 @@ SECURITY_FLOORS: dict[str, tuple[str, str]] = {
         "8.3.3",
         "PYSEC-2026-2132 / CVE-2026-7246 — command injection in click.edit() "
         "via an unescaped filename interpolated into a shell string. "
-        "Transitive only (mcp[cli] -> typer -> click, uvicorn -> click); "
+        "Transitive only (uvicorn -> click; the mcp[cli] -> typer -> click "
+        "path is gone now that the [cli] extra is not requested); "
         "ssh-mcp never imports click, so it is not exploitable here.",
     ),
     "asyncssh": (
