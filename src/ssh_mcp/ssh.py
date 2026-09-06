@@ -1656,10 +1656,21 @@ class SSHManager:
             asyncssh.PermissionDenied,
             OSError,
         ) as e:
+            # M5 / rev-2 finding: str(e) reaches ExecResult.error, which
+            # formatting.py renders verbatim to the LLM (`ERROR: {error}`).
+            # _safe_log_value only escapes control characters for safe log
+            # interpolation — it does not redact credentials. Compute the
+            # redacted string once and use it on both the log line and the
+            # result so the two never diverge. The group-level per-task path
+            # at execute_on_group already did this (`_redact_secrets` around
+            # `task_exc`); these single-host arms and the group's own
+            # top-level `except Exception` below were the three inconsistent
+            # ones.
+            redacted = _redact_secrets(str(e))
             logger.error(
                 "SSH error on %s: %s",
                 _safe_log_value(server_name),
-                _safe_log_value(str(e)),
+                _safe_log_value(redacted),
             )
             return ExecResult(
                 server=server_name,
@@ -1667,14 +1678,15 @@ class SSHManager:
                 stdout="",
                 stderr="",
                 exit_code=None,
-                error=f"SSH error: {e}",
+                error=f"SSH error: {redacted}",
             )
 
         except Exception as e:
+            redacted = _redact_secrets(str(e))
             logger.error(
                 "Unexpected error on %s: %s",
                 _safe_log_value(server_name),
-                _safe_log_value(str(e)),
+                _safe_log_value(redacted),
             )
             return ExecResult(
                 server=server_name,
@@ -1682,7 +1694,7 @@ class SSHManager:
                 stdout="",
                 stderr="",
                 exit_code=None,
-                error=f"Unexpected error: {e}",
+                error=f"Unexpected error: {redacted}",
             )
 
     async def execute_on_group(
@@ -1893,8 +1905,9 @@ class SSHManager:
             ]
 
         except Exception as e:
+            redacted = _redact_secrets(str(e))
             logger.error(
-                "Unexpected error in group execution: %s", _safe_log_value(str(e))
+                "Unexpected error in group execution: %s", _safe_log_value(redacted)
             )
             return [
                 ExecResult(
@@ -1903,7 +1916,7 @@ class SSHManager:
                     stdout="",
                     stderr="",
                     exit_code=None,
-                    error=f"Unexpected error: {e}",
+                    error=f"Unexpected error: {redacted}",
                 )
             ]
 

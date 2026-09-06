@@ -2590,6 +2590,90 @@ groups = ["t"]
         )
 
 
+class TestExecResultErrorRedaction:
+    """M5 / rev-2 finding (§1.4): three ``_execute_impl`` /
+    ``execute_on_group`` exception handlers used to pass raw ``str(e)``
+    through ``_safe_log_value`` (control-character escaping only, not
+    credential redaction) into both the log line and ``ExecResult.error``.
+    ``formatting.py`` renders ``ExecResult.error`` verbatim to the LLM, so
+    an unredacted connection error leaked credentials straight to the
+    client. The per-task group path already redacted
+    (``ssh.py`` ``execute_on_group`` task-exception harvest); these three
+    sites were the inconsistent ones.
+    """
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[groups]
+t = { description = "t" }
+[servers.web1]
+description = "Test server"
+groups = ["t"]
+"""
+        f = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        f.write(config_content)
+        f.close()
+        return ServerRegistry(f.name)
+
+    async def test_ssh_error_result_redacts_credentials(self) -> None:
+        """``except (DisconnectError, PermissionDenied, OSError)`` arm of
+        ``_execute_impl`` (site 1). Driven via ``_get_connection`` raising,
+        per the existing injection shape (see ``TestDryRun``)."""
+        import asyncssh
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        exc = asyncssh.DisconnectError(
+            2, "auth failed for https://deploy:hunter2@bastion.example.com"
+        )
+
+        with patch.object(manager, "_get_connection", AsyncMock(side_effect=exc)):
+            result = await manager.execute("web1", "true")
+
+        assert result.error is not None
+        assert "hunter2" not in result.error, f"Leaked: {result.error!r}"
+        assert _REDACTION_PLACEHOLDER in result.error
+
+    async def test_unexpected_error_result_redacts_credentials(self) -> None:
+        """``except Exception`` arm of ``_execute_impl`` (site 2) — same
+        shape as site 1 but for the catch-all handler, driven by a plain
+        ``RuntimeError`` rather than an asyncssh-specific exception."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        exc = RuntimeError("auth failed for https://deploy:hunter2@bastion.example.com")
+
+        with patch.object(manager, "_get_connection", AsyncMock(side_effect=exc)):
+            result = await manager.execute("web1", "true")
+
+        assert result.error is not None
+        assert "hunter2" not in result.error, f"Leaked: {result.error!r}"
+        assert _REDACTION_PLACEHOLDER in result.error
+
+    async def test_group_unexpected_error_result_redacts_credentials(self) -> None:
+        """Group-level top-level ``except Exception`` in ``execute_on_group``
+        (site 3). The per-task ``side_effect`` shape used above can't reach
+        this arm — it only catches failures in the group-setup machinery
+        itself, before any task is created. Drive it behaviorally instead:
+        make ``registry.servers_in_group`` raise something other than
+        ``KeyError`` (which has its own, separate handler) so it propagates
+        straight to this handler with no async task plumbing involved."""
+        from unittest.mock import patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        exc = RuntimeError("auth failed for https://deploy:hunter2@bastion.example.com")
+
+        with patch.object(manager.registry, "servers_in_group", side_effect=exc):
+            results = await manager.execute_on_group("t", "true")
+
+        assert len(results) == 1
+        assert results[0].error is not None
+        assert "hunter2" not in results[0].error, f"Leaked: {results[0].error!r}"
+        assert _REDACTION_PLACEHOLDER in results[0].error
+
+
 # ---------------------------------------------------------------------------
 # S10: max_output_bytes bounds ALLOCATION, not just the response
 # ---------------------------------------------------------------------------
