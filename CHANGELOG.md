@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-06
+
+### Security
+
+Cleared all four Dependabot alerts open against `uv.lock`, moving to the *latest stable* of each affected package rather than the minimum patched version Dependabot proposed, so one lock refresh supersedes three separate open PRs (#53, #54, #55) instead of leaving them to land piecemeal. **None of the four is exploitable in ssh-mcp today** — the floors exist to protect `pip install blc-ssh-mcp` consumers through the wheel's published METADATA, since `uv.lock` itself carries no guarantee for anyone installing from PyPI.
+
+- **CVE-2026-54591** (`GHSA-2wxc-x7rj-hg8f`, asyncssh, SCP-client path traversal to arbitrary file write via a server-supplied filename) — **not reachable**: ssh-mcp uses SFTP exclusively and never calls `asyncssh.scp`, and it is an SSH client, never a server.
+- **CVE-2026-54590** (`GHSA-qr67-gv47-xwwh`, asyncssh, `AuthorizedKeysFile %u` escape) — **not reachable**: this is server-side behavior and ssh-mcp is a client only.
+- **CVE-2026-69247** (`GHSA-g6cj-pr64-35w5`, cryptography, Bleichenbacher oracle in PKCS#7 `EnvelopedData` decryption) — **not reachable**: ssh-mcp never calls `pkcs7_decrypt_*`.
+- **CVE-2026-13346** (`GHSA-qwm4-qh6w-59xr`, pip, doubly-encoded index URLs enabling an arbitrary write under `pip download --only-binary`) — dev/CI extra only, not a runtime dependency.
+- `asyncssh` bumped to **2.24.0**, `cryptography` constrained to **>=50.0.1**, `pip` (dev extra) to **>=26.2.1**.
+
+**Credential redaction was missing at a fourth `str(e)` site, and inconsistent at three others.** `ssh.py`'s SSH-error and unexpected-error handlers (single-host and group paths) passed the raw exception text through `_safe_log_value` — control-character escaping only, not `_redact_secrets` — into both the log line and `ExecResult.error`, which `formatting.py` renders verbatim to the LLM. The group-level task-failure path already redacted; the other three did not. All three now redact before logging or returning. A fourth, separate site had the same gap on the *raising* tools: `server.py::_mcp_tool` logged and re-raised `str(e)` un-redacted in `ToolError`, so an unredacted string reached both the ssh-mcp log and the MCP client's error content. It is now redacted before either happens.
+
+**Suppressed a new INFO-level tool-failure log added by the MCP SDK v2.** `mcp/server/mcpserver/server.py` logs `Tool %r failed: %r` at INFO on its own logger before converting a `ToolError` into `CallToolResult(is_error=True)`. `upload_file` and `download_file` are the tools that raise, and their messages carry local and remote paths. This is the same class of leak as "Production incident 2026-04-11 (round 2)" (asyncssh's own INFO logging of raw commands), on a logger the existing mitigation did not cover. `_configure_logging` now raises `mcp.server.mcpserver.server` to WARNING alongside the `asyncssh` loggers it already silences.
+
+### Changed
+
+**MCP Python SDK 1.x → 2.x** (`mcp>=2.1.1,<3.0.0`). v1.x entered maintenance mode (security fixes only) at the v2.0.0 release. Operator-visible consequences:
+
+- **Streamable HTTP requests are now capped at 4 MiB** (SDK default) — an oversized request gets HTTP 413 before its JSON is parsed or a session is created. Comfortably above `max_command_bytes`' 1 MiB ceiling; no operator action needed.
+- **`serverInfo` in the MCP `initialize` response now reports ssh-mcp's own version.** v1 reported the SDK's version instead.
+- **The SDK's own OpenTelemetry tracing is on by default.** It records `mcp.method.name`, `mcp.protocol.version`, `jsonrpc.request.id`, `gen_ai.operation.name` and `gen_ai.tool.name` — no tool arguments and no command text. Left enabled: audited against the wheel source, the error path is attribute-only for a converted `ToolError` (`error.type="tool_error"`, a bare error status with no description), so it does not reopen the leak the SDK's INFO log above does.
+- **The `[cli]` extra is no longer requested** (`mcp[cli]` → `mcp`). ssh-mcp parses `sys.argv` directly and never imports `typer`, `click`, `python-dotenv` or `mcp.cli`; dropping the extra removes those three packages from the published wheel's dependency closure. `click` still arrives transitively via `uvicorn`, so the existing `click>=8.3.3` security floor stays load-bearing.
+- **The `otel` extra is removed.** `opentelemetry-api` is now a hard dependency of `mcp>=2`, so the extra had become dead weight — installing a nonexistent extra warns rather than errors, which would have been silently misleading. The tracing API is always importable now; spans are always created and are no-ops until an operator installs an OpenTelemetry SDK and exporter, same operator experience the extra used to describe.
+- **`pydantic>=2.12.0` is now a declared floor**, matching what `mcp>=2` already requires, so the wheel metadata carries the constraint instead of relying on a transitive dependency to enforce it.
+
+All dev tooling and every GitHub Action bumped to latest stable (`pytest` 9.1.1, `pytest-asyncio` 1.4.0, `pytest-cov` 7.1.0, `mypy` 2.3.1, `ruff` 0.16.6, `hypothesis` 6.167.1, `opentelemetry-sdk` 1.44.0, plus action SHA/version bumps across `ci.yml` and `release.yml`). Container base image moved to `python:3.14-slim-trixie`; `uv` pinned to **0.12.10** everywhere it appears (CI, `release.yml`, `Dockerfile`), closing the previous split-brain between a 0.11.3 image and a 0.11.32 CI pin.
+
+### Added
+
+- **`.github/dependabot.yml`**, grouping security and version updates into one PR per ecosystem instead of ungrouped single-package PRs — the reason #54 and #55 were both red: each cleared one advisory while `pip-audit` still saw the rest.
+- **`HYPOTHESIS_PROFILE: ci` in both `ci.yml` and `release.yml`**, raising the security-relevant Hypothesis fuzzers (credential redaction, dangerous-command detection) from 50 examples to 200 in CI. This had never actually run: no workflow set the variable before this PR.
+- **`packaging` declared as a `dev` dependency.** `tests/test_dependency_floors.py` has always imported `packaging.version`; it worked only because a transitive dependency happened to supply it.
+
+### Fixed
+
+- **The `pip` and `asyncssh` security floors are now actually enforced**, not merely documented. `tests/test_dependency_floors.py` asserts both hold in the resolved environment and are declared in `pyproject.toml` at the layer matching each dependency's kind.
+- **`release.yml`'s release-environment URL pointed at the wrong PyPI project** (`https://pypi.org/p/ssh-mcp`, a name this repo has never owned — see 0.6.1) instead of `https://pypi.org/p/blc-ssh-mcp`. Missed when the distribution was renamed in #51.
+
 ## [0.6.2] - 2026-07-26
 
 ### Fixed
