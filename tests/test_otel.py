@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from hypothesis import given
@@ -332,3 +332,132 @@ class TestNoOpWhenTracerUnavailable:
         # No spans should be recorded because the wrapper skipped the
         # tracer path entirely.
         assert not _exporter.get_finished_spans()
+
+
+# Credential-shaped command used as a canary: `--password=` is matched by
+# `_long_flag_is_credential` in `ssh_mcp/ssh.py`, so if a future coupling
+# ever let a raw command reach the SDK's own span through some path other
+# than the one audited below, this string would surface the leak.
+SECRET_CMD = "mysql --password=hunter2 -e 'select 1'"
+
+
+class TestSDKMiddlewareSpanPrivacy:
+    """D6/T6: the SDK's own OpenTelemetry middleware must never leak a command.
+
+    D6 (`docs/plans/2026-09-05-modernize-mcp-v2.md`) leaves `mcp` v2's
+    on-by-default `OpenTelemetryMiddleware` (`mcp/server/_otel.py`) enabled
+    because its audited attribute set is `mcp.method.name`,
+    `mcp.protocol.version`, `jsonrpc.request.id`, `gen_ai.operation.name`,
+    and `gen_ai.tool.name` -- never tool arguments. But the error path is
+    NOT attribute-only: an exception escaping the handler reaches
+    `span.record_exception(e)` (an event) and `span.set_status(ERROR,
+    str(e))` (the status description), so a scan limited to
+    `span.attributes` is blind to exactly the path that could leak. These
+    tests are the regression guard that makes that a safe decision instead
+    of an assumption, and assertion 1 below is deliberately load-bearing:
+    without it, a run producing zero SDK ``SERVER`` spans would pass
+    vacuously.
+    """
+
+    async def test_sdk_middleware_span_carries_no_command(
+        self, tmp_config_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A successful `execute` call's SDK span carries no command text."""
+        from mcp.client import Client
+        from opentelemetry.trace import SpanKind
+
+        import ssh_mcp.server as server_module
+        from ssh_mcp.config import ServerRegistry
+        from ssh_mcp.models import ExecResult
+
+        monkeypatch.setenv("SSH_MCP_CONFIG", str(tmp_config_file))
+        fake_ssh = MagicMock(spec=SSHManager)
+        fake_ssh.execute = AsyncMock(
+            return_value=ExecResult(
+                server="web1",
+                command=SECRET_CMD,
+                stdout="ok",
+                stderr="",
+                exit_code=0,
+                duration_ms=1,
+            )
+        )
+        monkeypatch.setattr(server_module, "_ssh", fake_ssh)
+        monkeypatch.setattr(
+            server_module, "_registry", ServerRegistry(str(tmp_config_file))
+        )
+
+        async with Client(server_module.mcp) as client:
+            await client.call_tool("execute", {"server": "web1", "command": SECRET_CMD})
+
+        spans = _exporter.get_finished_spans()
+        server_spans = [s for s in spans if s.kind is SpanKind.SERVER]
+        # Assertion 1 -- anti-vacuity guard. Confirmed by tracing the source
+        # (`mcp/server/runner.py`: `serve_one` -> `ServerRunner._on_request`
+        # -> `_compose_server_middleware`) that the default in-process
+        # `mode="auto"` path for an `MCPServer` DOES run
+        # `Server.middleware`, so this passes without `mode="legacy"`. If a
+        # future SDK release changes that routing and this lookup starts
+        # raising `StopIteration`, retry with
+        # `Client(server_module.mcp, mode="legacy")` -- do not delete this
+        # assertion to make the test pass.
+        call = next(s for s in server_spans if s.name == "tools/call execute")
+        assert call.attributes is not None
+        assert call.attributes["gen_ai.tool.name"] == "execute"
+
+        # Assertion 2 -- attributes AND events AND status description, not
+        # attributes alone: the error path (exercised in the sibling test
+        # below) writes to events and the status description, not
+        # attributes, so a scan of attributes only would never see it.
+        haystack = [str(v) for v in call.attributes.values()]
+        haystack += [str(event.attributes) for event in call.events]
+        haystack.append(str(call.status.description or ""))
+        assert not any(SECRET_CMD in h for h in haystack)
+
+    async def test_sdk_middleware_span_no_exception_event_on_tool_error(
+        self,
+    ) -> None:
+        """A `ToolError` must not reach the span as an event or status text.
+
+        `mcp/server/mcpserver/server.py:426-441` converts a `ToolError` to
+        `CallToolResult(is_error=True)` INSIDE the tool-call handler, before
+        `OpenTelemetryMiddleware` ever sees an exception -- so the
+        middleware's `except Exception` branch (which would call
+        `record_exception`/`set_status(ERROR, str(e))`) never fires for it.
+        The middleware's own `tools/call` post-check instead sets only
+        `error.type="tool_error"` and a bare `set_status(ERROR)` with no
+        description. Registered on a throwaway `MCPServer`, never the
+        module-level `mcp` shared by every other test in this file.
+        """
+        from mcp.client import Client
+        from mcp.server.mcpserver import MCPServer
+        from mcp.server.mcpserver.exceptions import ToolError
+        from opentelemetry.trace import SpanKind
+
+        credential_url = "https://u:p@bastion.example.com/x"
+        throwaway: MCPServer = MCPServer("otel-privacy-probe")
+
+        @throwaway.tool()
+        async def fail(command: str) -> str:
+            raise ToolError(f"fail {credential_url}: {command}")
+
+        async with Client(throwaway) as client:
+            await client.call_tool("fail", {"command": SECRET_CMD})
+
+        spans = _exporter.get_finished_spans()
+        server_spans = [s for s in spans if s.kind is SpanKind.SERVER]
+        call = next(s for s in server_spans if s.name == "tools/call fail")
+        assert call.attributes is not None
+        assert call.attributes.get("error.type") == "tool_error"
+
+        assert call.events == ()
+        assert not call.status.description
+
+        # Belt-and-suspenders: even if a future SDK release stops leaving
+        # these empty, neither the credential nor the command may surface
+        # via any channel on this span.
+        haystack = [str(v) for v in call.attributes.values()]
+        haystack += [str(event.attributes) for event in call.events]
+        haystack.append(str(call.status.description or ""))
+        assert not any(credential_url in h for h in haystack)
+        assert not any(SECRET_CMD in h for h in haystack)
