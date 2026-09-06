@@ -46,7 +46,16 @@ dependencies = [
     # floor lands in the published wheel METADATA and is therefore the only
     # thing protecting `pip install ssh-mcp` consumers — uv.lock does not.
     "mcp[cli]>=1.28.1,<2.0.0",
-    "asyncssh>=2.23.0,<3.0.0",
+    # 2.24.0, not 2.23.1: 2.23.1 fixed CVE-2026-54591 (GHSA-2wxc-x7rj-hg8f,
+    # SCP client path traversal to arbitrary file write via server-supplied
+    # filenames) and CVE-2026-54590 (GHSA-qr67-gv47-xwwh, incomplete fix for
+    # CVE-2026-45309 — AuthorizedKeysFile %u still escaped via a leading ~).
+    # 2.24.0 (2026-06-27) postdates 2.23.1 (2026-06-07) and is a clean
+    # superset. Neither CVE is reachable here: ssh-mcp uses SFTP and never
+    # asyncssh.scp, and it is a client, not a server. The floor still matters
+    # because it lands in the published wheel METADATA and is the only thing
+    # protecting `pip install blc-ssh-mcp` consumers — uv.lock does not.
+    "asyncssh>=2.24.0,<3.0.0",
     "structlog>=25.5.0,<26.0.0",
     "orjson>=3.10.0,<4.0.0",
     "pydantic>=2.10.0,<3.0.0",
@@ -76,8 +85,11 @@ dev = [
     "pytest-cov>=6.0",
     "mypy>=1.15",
     "pip-audit>=2.9",
-    # Patched pip in the dev/CI venv (PYSEC-2026-196); not a runtime dependency.
-    "pip>=26.1.2",
+    # Patched pip in the dev/CI venv: PYSEC-2026-196 and CVE-2026-13346
+    # (GHSA-qwm4-qh6w-59xr — doubly-encoded package URLs from an index could
+    # install files to arbitrary paths; materially affects
+    # `pip download --only-binary`). Not a runtime dependency.
+    "pip>=26.2.1",
     "hypothesis>=6.151.0,<7.0.0",
     # OTel SDK is needed at test time for the in-memory exporter.
     "opentelemetry-sdk>=1.30.0,<2.0.0",
@@ -134,6 +146,13 @@ constraint-dependencies = [
     # directly), so this is not exploitable here. The floor exists so a
     # future `uv lock` regeneration cannot silently regress below the fix.
     "click>=8.3.3",
+    # CVE-2026-69247 (GHSA-g6cj-pr64-35w5) — PKCS#7 EnvelopedData decryption
+    # exposed a Bleichenbacher oracle through distinguishable errors and
+    # timing (introduced 44.0.0, fixed 50.0.0). Transitive: asyncssh requires
+    # cryptography>=48.0.1. ssh-mcp never calls pkcs7_decrypt_*, so this is
+    # not exploitable here; the floor keeps a future `uv lock` from
+    # regressing below the fix.
+    "cryptography>=50.0.1",
 ]
 
 [tool.ruff.lint]

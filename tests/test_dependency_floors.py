@@ -56,6 +56,29 @@ SECURITY_FLOORS: dict[str, tuple[str, str]] = {
         "Transitive only (mcp[cli] -> typer -> click, uvicorn -> click); "
         "ssh-mcp never imports click, so it is not exploitable here.",
     ),
+    "asyncssh": (
+        "2.23.1",
+        "CVE-2026-54591 (GHSA-2wxc-x7rj-hg8f, high 8.1) — SCP client path "
+        "traversal to arbitrary file write via server-supplied filenames; "
+        "CVE-2026-54590 (GHSA-qr67-gv47-xwwh) — incomplete fix for "
+        "CVE-2026-45309, AuthorizedKeysFile %u still escaped via a leading "
+        "~. Both first patched in 2.23.1. Neither is reachable here: "
+        "ssh-mcp uses SFTP and never asyncssh.scp, and it is a client, not "
+        "a server. The declared pin is 2.24.0, a clean superset.",
+    ),
+    "cryptography": (
+        "50.0.0",
+        "CVE-2026-69247 (GHSA-g6cj-pr64-35w5, high) — PKCS#7 EnvelopedData "
+        "decryption leaked a Bleichenbacher oracle through distinguishable "
+        "errors and timing (44.0.0 to <50.0.0). Transitive via asyncssh; "
+        "ssh-mcp never calls pkcs7_decrypt_*.",
+    ),
+    "pip": (
+        "26.2.0",
+        "CVE-2026-13346 (GHSA-qwm4-qh6w-59xr) — doubly-encoded package URLs "
+        "from an index could install files to arbitrary paths. Dev/CI extra "
+        "only; materially affects `pip download --only-binary`.",
+    ),
     "mcp": (
         "1.28.1",
         "PYSEC-2026-3481 / CVE-2026-52870 (experimental tasks handlers), "
@@ -68,7 +91,10 @@ SECURITY_FLOORS: dict[str, tuple[str, str]] = {
 
 # Packages that ssh-mcp imports directly and must therefore constrain in the
 # published wheel metadata, not merely in the lockfile.
-DIRECT_DEPENDENCIES: frozenset[str] = frozenset({"mcp"})
+# ``asyncssh`` belongs here as well as in SECURITY_FLOORS: its floor exists
+# specifically to reach `pip install blc-ssh-mcp` consumers through the wheel
+# metadata, and only this set proves that.
+DIRECT_DEPENDENCIES: frozenset[str] = frozenset({"mcp", "asyncssh"})
 
 
 def _pyproject() -> dict:
@@ -124,8 +150,13 @@ def test_security_floor_is_declared_in_pyproject(package: str) -> None:
     """A floor that lives only in uv.lock is one `uv lock` away from vanishing.
 
     Every entry in ``SECURITY_FLOORS`` must be declared in pyproject.toml —
-    either as a direct dependency or as a uv constraint — with a bound at
-    least as high as the table's.
+    as a direct dependency, as a uv constraint, or in the ``dev`` extra —
+    with a bound at least as high as the table's.
+
+    The ``dev`` extra is a declaration site in its own right: ``pip``'s floor
+    is a dev/CI-only concern and lives there, so reading only
+    ``[project.dependencies]`` and ``constraint-dependencies`` would leave it
+    unenforced while looking enforced.
     """
     expected = Version(SECURITY_FLOORS[package][0])
     cfg = _pyproject()
@@ -134,13 +165,17 @@ def test_security_floor_is_declared_in_pyproject(package: str) -> None:
     constraint_floor = _floor_from(
         cfg.get("tool", {}).get("uv", {}).get("constraint-dependencies", []), package
     )
-    declared = [f for f in (project_floor, constraint_floor) if f]
+    dev_floor = _floor_from(
+        cfg["project"].get("optional-dependencies", {}).get("dev", []), package
+    )
+    declared = [f for f in (project_floor, constraint_floor, dev_floor) if f]
 
     assert declared, (
         f"No floor for {package!r} is declared in pyproject.toml. It must appear "
-        f"in [project.dependencies] (direct deps) or [tool.uv] "
-        f"constraint-dependencies (transitive deps), otherwise the next "
-        f"`uv lock` regeneration can silently reintroduce a vulnerable version."
+        f"in [project.dependencies] (direct deps), [tool.uv] "
+        f"constraint-dependencies (transitive deps), or the [dev] extra "
+        f"(dev/CI-only deps), otherwise the next `uv lock` regeneration can "
+        f"silently reintroduce a vulnerable version."
     )
     assert max(declared) >= expected, (
         f"Declared floor for {package!r} is {max(declared)}, below the required "
