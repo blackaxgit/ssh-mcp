@@ -74,7 +74,7 @@ def _check_stdio() -> tuple[bool, str]:
     We call ``server._get_config_path`` directly instead of re-implementing
     its fallback chain — a hand-rolled second copy would drift from the
     real one the next time either changes, reintroducing this exact bug.
-    Measured cost of importing server.py (FastMCP + asyncssh + structlog)
+    Measured cost of importing server.py (MCPServer + asyncssh + structlog)
     is ~0.3s. Nothing bounds this branch from the inside:
     HEALTHCHECK_TIMEOUT is only handed to ``urlopen`` in ``_check_http``,
     so the only limit here is the ``--timeout=5s`` the Dockerfile
@@ -125,7 +125,7 @@ def _check_http() -> tuple[bool, str]:
 
     # Two values below are implicit couplings to SDK defaults, not knobs:
     # "2025-03-26" is the MCP protocol revision this probe claims, and
-    # ``/mcp`` is FastMCP's default streamable_http_path (server.py never
+    # ``/mcp`` is MCPServer's default streamable_http_path (server.py never
     # overrides it and mounts the app at "/"). If either default moves,
     # this probe must be updated in lockstep or it stops reaching the app.
     payload = json.dumps(

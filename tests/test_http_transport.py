@@ -45,30 +45,27 @@ def _make_dummy_asgi_app():
 
 @pytest.fixture(autouse=True)
 def _reset_server_globals() -> Iterator[None]:
-    """Restore module-level FastMCP settings and session manager between tests.
+    """Reset the cached session manager between tests.
 
-    ``_run_http`` mutates ``mcp.settings`` in place; without this fixture
-    a test setting ``host = "0.0.0.0"`` would poison the next one.
+    v1's ``mcp.settings.host/port/stateless_http/transport_security`` no
+    longer exist on the v2 ``Settings`` object (assigning a removed field
+    raises ``ValueError``), so there is nothing left to save/restore there.
 
-    Additionally, FastMCP caches a single ``StreamableHTTPSessionManager``
-    on ``mcp._session_manager`` and that manager's ``.run()`` context
-    manager raises on second entry. Multiple tests that drive the real
-    HTTP app through ``TestClient`` would collide on this singleton. We
-    reset it to ``None`` before each test so the next ``streamable_http_app``
-    call mints a fresh manager.
+    The session-manager reset is still required, but not for the reason
+    it used to be: v1's ``streamable_http_app()`` cached a single
+    ``StreamableHTTPSessionManager`` whose ``.run()`` context manager
+    raised on a second entry, so a second ``TestClient`` in the suite
+    would collide. v2 mints a fresh manager on every call
+    (``mcp/server/lowlevel/server.py:742-751``), so that collision can no
+    longer happen. What still depends on this reset is
+    ``TestLifespanAssertionFires`` below, which needs
+    ``_lowlevel_server._session_manager`` to be ``None`` so that the
+    ``session_manager`` property raises instead of returning a stale one.
     """
-    saved_host = server_module.mcp.settings.host
-    saved_port = server_module.mcp.settings.port
-    saved_stateless = server_module.mcp.settings.stateless_http
-    saved_security = server_module.mcp.settings.transport_security
     # Force a fresh session manager for this test
-    server_module.mcp._session_manager = None
+    server_module.mcp._lowlevel_server._session_manager = None
     yield
-    server_module.mcp.settings.host = saved_host
-    server_module.mcp.settings.port = saved_port
-    server_module.mcp.settings.stateless_http = saved_stateless
-    server_module.mcp.settings.transport_security = saved_security
-    server_module.mcp._session_manager = None
+    server_module.mcp._lowlevel_server._session_manager = None
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +211,7 @@ class TestOptionalAuthMode:
 
         captured: list[str | None] = []
 
-        def fake_build(token):  # type: ignore[no-untyped-def]
+        def fake_build(token, **_kwargs):  # type: ignore[no-untyped-def]
             captured.append(token)
             return _make_dummy_asgi_app()
 
@@ -274,7 +271,14 @@ class TestGracefulShutdown:
         original_ssh = server_module._ssh
         server_module._ssh = mock_ssh
         try:
-            app = server_module._build_http_app(token=None)
+            app = server_module._build_http_app(
+                token=None,
+                host="127.0.0.1",
+                stateless=False,
+                transport_security=server_module._build_transport_security(
+                    None, "127.0.0.1"
+                ),
+            )
             # Starlette's TestClient drives the lifespan via context manager
             with TestClient(app):
                 pass  # entering/exiting the context runs startup/shutdown
@@ -290,7 +294,14 @@ class TestGracefulShutdown:
         original_ssh = server_module._ssh
         server_module._ssh = None
         try:
-            app = server_module._build_http_app(token=None)
+            app = server_module._build_http_app(
+                token=None,
+                host="127.0.0.1",
+                stateless=False,
+                transport_security=server_module._build_transport_security(
+                    None, "127.0.0.1"
+                ),
+            )
             # Simply entering and exiting the lifespan should not raise
             with TestClient(app):
                 pass
@@ -301,12 +312,19 @@ class TestGracefulShutdown:
 class TestBuildHttpApp:
     """Verify _build_http_app wraps auth middleware exactly when expected."""
 
-    def test_no_token_returns_raw_fastmcp_app(self) -> None:
+    def test_no_token_returns_raw_mcpserver_app(self) -> None:
         """When token is None, no auth wrapper is added."""
         from starlette.applications import Starlette
 
-        app = _build_http_app(token=None)
-        # The raw FastMCP app is a Starlette instance; the wrapper one
+        app = _build_http_app(
+            token=None,
+            host="127.0.0.1",
+            stateless=False,
+            transport_security=server_module._build_transport_security(
+                None, "127.0.0.1"
+            ),
+        )
+        # The raw MCPServer app is a Starlette instance; the wrapper one
         # is also a Starlette, so identity check isn't enough — verify
         # there is no BearerAuth middleware in the stack.
         assert isinstance(app, Starlette)
@@ -319,23 +337,37 @@ class TestBuildHttpApp:
 
     def test_with_token_wraps_app(self) -> None:
         """When token is set, middleware is registered on the wrapper."""
-        app = _build_http_app(token="secret-xyz-abcdefghij")
+        app = _build_http_app(
+            token="secret-xyz-abcdefghij",
+            host="127.0.0.1",
+            stateless=False,
+            transport_security=server_module._build_transport_security(
+                None, "127.0.0.1"
+            ),
+        )
         # The wrapper must expose user_middleware with at least one entry
         assert hasattr(app, "user_middleware")
         assert len(app.user_middleware) > 0
 
-    def test_middleware_blocks_unauth_requests_on_real_fastmcp_app(self) -> None:
+    def test_middleware_blocks_unauth_requests_on_real_mcpserver_app(self) -> None:
         """Green Team H6: stronger mutation-resistance check.
 
         ``test_with_token_wraps_app`` only checks that SOME middleware is
         registered. A mutation that swapped the middleware for a no-op
         class or mounted it in the wrong order would pass that test.
-        This test drives an actual request through the real FastMCP
+        This test drives an actual request through the real MCPServer
         wrapper and verifies the 401 path is hit BEFORE reaching the
         MCP session manager (which would otherwise raise a different
         error due to its own lifespan requirement).
         """
-        app = _build_http_app(token="middleware-integration-test-token")
+        app = _build_http_app(
+            token="middleware-integration-test-token",
+            host="127.0.0.1",
+            stateless=False,
+            transport_security=server_module._build_transport_security(
+                None, "127.0.0.1"
+            ),
+        )
         client = TestClient(app)
         # No Authorization header → middleware must 401 before the MCP
         # session manager is reached. If the middleware was bypassed,
@@ -348,9 +380,9 @@ class TestBuildHttpApp:
         self,
     ) -> None:
         """Red Team R5 regression: production bug v0.3.0 where
-        ``_install_shutdown_lifespan`` mounted the FastMCP app as a sub-app
+        ``_install_shutdown_lifespan`` mounted the MCPServer app as a sub-app
         and added its OWN lifespan — Starlette only runs top-level
-        lifespans, so the FastMCP session manager's task group was never
+        lifespans, so the MCPServer session manager's task group was never
         initialized and every authenticated request returned HTTP 500 with
         ``RuntimeError('Task group is not initialized. Make sure to use
         run().')``.
@@ -360,7 +392,7 @@ class TestBuildHttpApp:
         MUST NOT return the "Task group is not initialized" error.
 
         This test ALSO covers the ``token=None`` path by parametrizing
-        over both branches — but because the FastMCP session manager is
+        over both branches — but because the MCPServer session manager is
         a module-level singleton that cannot be re-run once started, we
         reset its ``_has_started`` flag between the two subtests by
         recreating the server module attribute. If that reset breaks in
@@ -368,7 +400,14 @@ class TestBuildHttpApp:
         ``token`` branch alone is sufficient to catch the regression.
         """
         token = "auth-reaches-session-manager-ok"
-        app = _build_http_app(token=token)
+        app = _build_http_app(
+            token=token,
+            host="127.0.0.1",
+            stateless=False,
+            transport_security=server_module._build_transport_security(
+                None, "127.0.0.1"
+            ),
+        )
         with TestClient(app) as client:
             resp = client.get(
                 "/mcp",
@@ -376,7 +415,7 @@ class TestBuildHttpApp:
             )
         body = resp.text
         assert "Task group is not initialized" not in body, (
-            f"FastMCP session manager never started: "
+            f"MCPServer session manager never started: "
             f"status={resp.status_code} body={body!r}"
         )
 
@@ -581,24 +620,21 @@ class TestBearerAuthR3Hardening:
             "ok.example.com",
         ],
     )
-    def test_deliberate_wildcard_forms_still_permitted(
-        self, entry: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_deliberate_wildcard_forms_still_permitted(self, entry: str) -> None:
         """Suffix wildcards and port wildcards remain deliberately permitted.
 
         Documented in AGENTS.md: a leading subdomain wildcard such as
         ``*.internal.example.com`` and a trailing port wildcard such as
         ``ok.example.com:*`` (and combinations of the two) must keep
         working — only entries with no concrete hostname remainder are
-        refused. Patches ``uvicorn.run`` and ``_build_http_app`` so no
-        socket is actually bound.
+        refused. Exercises ``_build_transport_security`` directly rather
+        than through ``_run_http``, since it is the pure function that
+        owns this decision (no global mutation to observe or restore).
         """
-        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
-        monkeypatch.setenv("SSH_MCP_HTTP_ALLOWED_HOSTS", entry)
-        with patch("uvicorn.run"), patch.object(server_module, "_build_http_app"):
-            _run_http()
-        allowed = server_module.mcp.settings.transport_security.allowed_hosts
-        assert entry in allowed, f"{entry!r} should be permitted, got {allowed!r}"
+        ts = server_module._build_transport_security(entry, "127.0.0.1")
+        assert entry in ts.allowed_hosts, (
+            f"{entry!r} should be permitted, got {ts.allowed_hosts!r}"
+        )
 
     def test_token_whitespace_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """M4: SSH_MCP_HTTP_TOKEN with trailing whitespace (common from .env
@@ -615,7 +651,7 @@ class TestBearerAuthR3Hardening:
 
         captured: list[str | None] = []
 
-        def fake_build(token):  # type: ignore[no-untyped-def]
+        def fake_build(token, **_kwargs):  # type: ignore[no-untyped-def]
             captured.append(token)
             return _make_dummy_asgi_app()
 
@@ -816,18 +852,13 @@ class TestRunHttpSafetyGate:
         monkeypatch.setenv("SSH_MCP_HTTP_STATELESS", "true")
         with patch("uvicorn.run"):
             _run_http()
-        assert server_module.mcp.settings.stateless_http is True
+        assert server_module.mcp.session_manager.stateless is True
 
-    def test_allowed_hosts_extends_dns_rebinding_list(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
-        monkeypatch.setenv(
-            "SSH_MCP_HTTP_ALLOWED_HOSTS", "ssh-mcp.internal:*, api.example.com:8000"
+    def test_allowed_hosts_extends_dns_rebinding_list(self) -> None:
+        ts = server_module._build_transport_security(
+            "ssh-mcp.internal:*, api.example.com:8000", "127.0.0.1"
         )
-        with patch("uvicorn.run"):
-            _run_http()
-        allowed = server_module.mcp.settings.transport_security.allowed_hosts
+        allowed = ts.allowed_hosts
         # Localhost defaults must survive
         assert "127.0.0.1:*" in allowed
         # Extra hosts must be added
@@ -907,7 +938,12 @@ class TestLifespanAssertionFires:
 
         with patch.object(srv.mcp, "streamable_http_app", return_value=fake_inner):
             with pytest.raises(RuntimeError, match="lifespan_context"):
-                srv._build_http_app(token=None)
+                srv._build_http_app(
+                    token=None,
+                    host="127.0.0.1",
+                    stateless=False,
+                    transport_security=srv._build_transport_security(None, "127.0.0.1"),
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -919,47 +955,32 @@ class TestDnsRebindingAlwaysEnabled:
     """P3: TransportSecuritySettings must be configured even when
     SSH_MCP_HTTP_ALLOWED_HOSTS is not set."""
 
-    def test_dns_rebinding_enabled_by_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Without SSH_MCP_HTTP_ALLOWED_HOSTS, dns rebinding protection
-        must still be True (the MCP SDK default is False)."""
-        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
-        monkeypatch.delenv("SSH_MCP_HTTP_ALLOWED_HOSTS", raising=False)
-        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
-        with patch("uvicorn.run"):
-            _run_http()
-        ts = server_module.mcp.settings.transport_security
+    def test_dns_rebinding_enabled_by_default(self) -> None:
+        """Without an ``SSH_MCP_HTTP_ALLOWED_HOSTS`` override, dns rebinding
+        protection must still default to True. (v2's
+        ``TransportSecuritySettings.enable_dns_rebinding_protection`` field
+        itself now defaults to True — this asserts ssh-mcp still passes it
+        explicitly rather than relying on that SDK default, via the
+        required ``transport_security`` kwarg on ``_build_http_app``.)
+        """
+        ts = server_module._build_transport_security(None, "127.0.0.1")
         assert ts is not None, (
             "transport_security must be set even without ALLOWED_HOSTS"
         )
         assert ts.enable_dns_rebinding_protection is True
 
-    def test_dns_rebinding_includes_localhost_defaults(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_dns_rebinding_includes_localhost_defaults(self) -> None:
         """Default allowed_hosts must include localhost entries."""
-        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
-        monkeypatch.delenv("SSH_MCP_HTTP_ALLOWED_HOSTS", raising=False)
-        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
-        with patch("uvicorn.run"):
-            _run_http()
-        allowed = server_module.mcp.settings.transport_security.allowed_hosts
+        ts = server_module._build_transport_security(None, "127.0.0.1")
+        allowed = ts.allowed_hosts
         assert "127.0.0.1:*" in allowed
         assert "localhost:*" in allowed
         assert "[::1]:*" in allowed
 
-    def test_custom_bind_host_added_to_allowed_hosts(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_custom_bind_host_added_to_allowed_hosts(self) -> None:
         """A non-standard bind host should be included in allowed_hosts."""
-        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "10.0.0.5")
-        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN", "s3cret-long-token-val")
-        monkeypatch.delenv("SSH_MCP_HTTP_ALLOWED_HOSTS", raising=False)
-        with patch("uvicorn.run"):
-            _run_http()
-        allowed = server_module.mcp.settings.transport_security.allowed_hosts
-        assert "10.0.0.5:*" in allowed
+        ts = server_module._build_transport_security(None, "10.0.0.5")
+        assert "10.0.0.5:*" in ts.allowed_hosts
 
 
 # ---------------------------------------------------------------------------
@@ -984,7 +1005,7 @@ class TestTokenFile:
 
         captured: list[str | None] = []
 
-        def fake_build(token):  # type: ignore[no-untyped-def]
+        def fake_build(token, **_kwargs):  # type: ignore[no-untyped-def]
             captured.append(token)
             return _make_dummy_asgi_app()
 
@@ -1023,7 +1044,7 @@ class TestTokenFile:
 
         captured: list[str | None] = []
 
-        def fake_build(token):  # type: ignore[no-untyped-def]
+        def fake_build(token, **_kwargs):  # type: ignore[no-untyped-def]
             captured.append(token)
             return _make_dummy_asgi_app()
 

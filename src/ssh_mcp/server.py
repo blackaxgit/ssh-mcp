@@ -1,4 +1,4 @@
-"""FastMCP server for SSH operations.
+"""MCP server for SSH operations.
 
 This module defines the MCP server entry point with 6 tools for SSH operations:
 - list_servers: Show configured servers
@@ -28,8 +28,11 @@ from pathlib import Path
 from typing import Any, TypeVar, cast
 
 import structlog
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
+
+from ssh_mcp import __version__
 
 from ssh_mcp.config import ServerRegistry
 from ssh_mcp.formatting import (
@@ -38,7 +41,7 @@ from ssh_mcp.formatting import (
     format_group_table,
     format_server_table,
 )
-from ssh_mcp.ssh import SSHManager
+from ssh_mcp.ssh import SSHManager, _redact_secrets
 
 # ---------------------------------------------------------------------------
 # OpenTelemetry tracing — soft-imported so ssh_mcp[otel] is genuinely optional.
@@ -166,13 +169,31 @@ def _configure_logging() -> None:
     for noisy in ("asyncssh", "asyncssh.sftp", "asyncssh.connection"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    # v2 (mcp>=2) logs tool-failure messages at INFO in
+    # mcp/server/mcpserver/server.py::_handle_call_tool before converting a
+    # ToolError into CallToolResult(is_error=True). ssh-mcp's raising tools
+    # (upload_file/download_file) put local and remote paths in those
+    # messages, and a wrapped asyncssh error can put credential text there.
+    # Same class of leak as the asyncssh INFO logging above
+    # (Production incident 2026-04-11 round 2), same mitigation.
+    logging.getLogger("mcp.server.mcpserver.server").setLevel(logging.WARNING)
+
 
 _configure_logging()
 
 logger = logging.getLogger(__name__)
 
-# Create FastMCP server
-mcp = FastMCP("ssh-mcp")
+# Create the MCP server. _configure_logging() above still runs first, and
+# MCPServer.__init__'s own configure_logging -> logging.basicConfig remains
+# a no-op once the root logger already has handlers (same as v1) — this
+# ordering is intentional, do not "fix" it.
+#
+# v1 reported the SDK's own version in serverInfo; v2 reports "" unless
+# given one, so pass ssh-mcp's own version explicitly here for the first
+# time. version MUST be passed by keyword: the constructor's positional
+# order is (name, title, description, instructions, website_url, icons,
+# version).
+mcp = MCPServer("ssh-mcp", version=__version__)
 
 # Lazy-initialized globals
 _registry: ServerRegistry | None = None
@@ -319,7 +340,7 @@ def _mcp_tool(func: F) -> F:
     and ``StatusCode.ERROR`` via ``_span``'s error path. When OTel is not
     installed, the span is a no-op.
 
-    Apply BELOW ``@mcp.tool()`` so FastMCP registers the wrapped function.
+    Apply BELOW ``@mcp.tool()`` so MCPServer registers the wrapped function.
     """
 
     tool_name = func.__name__
@@ -335,8 +356,15 @@ def _mcp_tool(func: F) -> F:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error("%s failed: %s", tool_name, e, exc_info=True)
-            raise ToolError(str(e)) from e
+            # Same leak class as the SDK's own INFO tool-failure log
+            # (2b-bis): this string is what mcp/server/mcpserver/server.py
+            # logs at INFO and puts into CallToolResult.content, so
+            # redact it once here and reuse it for both the log line and
+            # the client-visible ToolError. exc_info=True still carries
+            # the full traceback for operators reading our own log.
+            redacted = _redact_secrets(str(e))
+            logger.error("%s failed: %s", tool_name, redacted, exc_info=True)
+            raise ToolError(redacted) from e
 
     return cast(F, wrapper)
 
@@ -623,14 +651,20 @@ async def download_file(
 _MIN_TOKEN_LENGTH: int = 16
 
 
-def _build_http_app(token: str | None) -> Any:
+def _build_http_app(
+    token: str | None,
+    *,
+    host: str,
+    stateless: bool,
+    transport_security: TransportSecuritySettings,
+) -> Any:
     """Return the Starlette ASGI app for streamable HTTP transport.
 
     Assembles a SINGLE outer Starlette app containing:
 
-    1. The FastMCP streamable HTTP app mounted under ``/``
-    2. A ``lifespan`` that starts FastMCP's session-manager task group
-       via the PUBLIC ``FastMCP.session_manager`` property — without
+    1. The MCPServer streamable HTTP app mounted under ``/``
+    2. A ``lifespan`` that starts MCPServer's session-manager task group
+       via the PUBLIC ``MCPServer.session_manager`` property — without
        this every request returns HTTP 500 with ``RuntimeError('Task
        group is not initialized')``.
     3. On shutdown, drains the pooled SSH manager BEFORE exiting the
@@ -638,12 +672,20 @@ def _build_http_app(token: str | None) -> Any:
        traffic on a live event loop.
     4. If ``token`` is provided, a bearer-auth middleware is attached
        to THIS outer app (not a separate wrapper) so the middleware
-       runs inside the same lifespan context as the FastMCP app.
+       runs inside the same lifespan context as the MCPServer app.
 
     Earlier versions (v0.3.0) built three nested Starlette apps:
-    bearer wrapper → shutdown-lifespan wrapper → FastMCP. Only the
-    outermost lifespan ran, so the FastMCP task group was never
+    bearer wrapper → shutdown-lifespan wrapper → MCPServer. Only the
+    outermost lifespan ran, so the MCPServer task group was never
     initialized. This single-app approach fixes that regression.
+
+    ``host``, ``stateless`` and ``transport_security`` have no defaults
+    on purpose: the SDK only auto-enables DNS-rebinding protection for a
+    loopback ``host`` when ``transport_security is None``
+    (mcp/server/lowlevel/server.py:735), and a bare ``None`` there
+    constructs a settings object with protection OFF
+    (mcp/server/transport_security.py:48). A default here would make
+    that fail-open path reachable by omission.
 
     Returns a ``Starlette`` instance ready to hand to ``uvicorn.run``.
     """
@@ -652,16 +694,20 @@ def _build_http_app(token: str | None) -> Any:
     from starlette.applications import Starlette
     from starlette.routing import Mount
 
-    inner_app = mcp.streamable_http_app()
+    inner_app = mcp.streamable_http_app(
+        host=host,
+        stateless_http=stateless,
+        transport_security=transport_security,
+    )
 
     # N4: this used to reach into `inner_app.router.lifespan_context` — a
     # PRIVATE Starlette attribute, not ours or the MCP SDK's to depend on
     # (Starlette itself went 0.52.1 -> 1.3.1 during this release cycle,
     # unconstrained by this project). `streamable_http_app()` above wires
     # its own inner Starlette app with `lifespan=lambda app:
-    # self.session_manager.run()` (mcp/server/fastmcp/server.py) — calling
+    # self.session_manager.run()` (mcp/server/lowlevel/server.py:828) — calling
     # `lifespan_ctx(inner_app)` therefore did nothing but reach `.run()`
-    # through a private indirection. `FastMCP.session_manager` is the
+    # through a private indirection. `MCPServer.session_manager` is the
     # SDK-documented public accessor for the exact same object, and
     # `.run()` takes no arguments, so we call it directly from OUR outer
     # lifespan instead — Starlette only ever runs the outermost lifespan,
@@ -681,17 +727,18 @@ def _build_http_app(token: str | None) -> Any:
         session_manager = mcp.session_manager
     except RuntimeError as exc:
         raise RuntimeError(
-            "FastMCP's session manager was not initialized by "
+            "MCPServer's session manager was not initialized by "
             "streamable_http_app() — this used to also populate "
             "Starlette's private router.lifespan_context, which "
             "ssh-mcp no longer depends on. The MCP SDK may have changed "
-            "its internal wiring; update the lifespan wiring in "
-            "server.py._build_http_app or pin a known-good mcp[cli]."
+            "its internal wiring (as of mcp 2.1.1 it lives in "
+            "mcp/server/lowlevel/server.py); update the lifespan wiring "
+            "in server.py._build_http_app or pin a known-good mcp."
         ) from exc
 
     @asynccontextmanager
     async def _lifespan(_app: Starlette) -> Any:
-        # Step 1: start the FastMCP session manager's task group via the
+        # Step 1: start the MCPServer session manager's task group via the
         # public session_manager.run() API (see note above).
         async with session_manager.run():
             try:
@@ -834,6 +881,95 @@ def _make_bearer_auth_middleware() -> Any:
     return _BearerAuth
 
 
+def _build_transport_security(
+    raw_allowed_hosts: str | None, host: str
+) -> TransportSecuritySettings:
+    """Build DNS-rebinding-protection settings, refusing wildcard hosts.
+
+    ``raw_allowed_hosts`` is the unprocessed
+    ``os.environ.get("SSH_MCP_HTTP_ALLOWED_HOSTS")`` value: ``None`` means
+    unset, ``""`` means set-but-empty, and a whitespace-only string is a
+    third, separately-refused case. This function does the stripping, so
+    it needs no second parameter.
+
+    Pure: no globals read or written, so the refusal set is unit-testable.
+    In v1 this mutated ``mcp.settings.transport_security``; v2 removed
+    that field and takes the object on ``streamable_http_app()`` instead.
+    """
+    allowed_hosts_env = (raw_allowed_hosts or "").strip()
+
+    base_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    extra_hosts: list[str] = []
+    if (
+        raw_allowed_hosts is not None
+        and raw_allowed_hosts != ""
+        and not allowed_hosts_env
+    ):
+        # Explicitly set but whitespace-only after stripping. Distinct from
+        # "unset" (which falls through to the localhost-only default below)
+        # — a whitespace value almost always means a broken env-file
+        # substitution, and silently treating it as "no extra hosts" would
+        # mask that from the operator.
+        raise RuntimeError(
+            "SSH_MCP_HTTP_ALLOWED_HOSTS is set but contains only whitespace. "
+            "Unset the variable to use the localhost-only default, or "
+            "provide a concrete hostname (e.g. 'ssh-mcp.internal:*')."
+        )
+    if allowed_hosts_env:
+        extra_hosts = [h.strip() for h in allowed_hosts_env.split(",") if h.strip()]
+        # H4: reject wildcards — they silently disable DNS-rebinding
+        # protection. An operator setting "*" almost certainly means
+        # "match my specific hostname" and doesn't realize the security
+        # implication. Fail loud instead of silently letting it through.
+        #
+        # Ordering trap (regression found on ci/fix-digest-verification):
+        # the previous implementation special-cased entries starting with
+        # "*." as "always a permitted suffix wildcard, skip refusal" via a
+        # `continue` evaluated before the `entry in {"*", "*:*", "*.*"}`
+        # refusal was reached. "*.*" itself starts with "*." too, so that
+        # `continue` fired first and let "*.*" — which matches essentially
+        # any dotted hostname and is semantically identical to the bare
+        # "*" this gate exists to block — through as PERMITTED even though
+        # it was listed in the refusal set. Do not reintroduce a
+        # startswith("*.")-first shortcut. The fix below strips the two
+        # deliberately-permitted wildcard *forms* (a trailing ":*" port
+        # wildcard, then a leading "*." subdomain wildcard) and only
+        # afterwards demands a concrete, wildcard-free remainder.
+        for entry in extra_hosts:
+            remainder = entry
+            if remainder.endswith(":*"):
+                remainder = remainder[:-2]
+            if remainder.startswith("*."):
+                remainder = remainder[2:]
+            if not remainder or "*" in remainder or not remainder.strip("."):
+                raise RuntimeError(
+                    f"SSH_MCP_HTTP_ALLOWED_HOSTS wildcard entry {entry!r} "
+                    "would disable DNS-rebinding protection. "
+                    "Use a concrete hostname (e.g. 'ssh-mcp.internal:*') instead."
+                )
+
+    # Also add the actual bind host if it's not already covered
+    if host not in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:  # nosec B104
+        base_hosts.append(f"{host}:*")
+
+    default_origins = [
+        "http://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::1]:*",
+    ]
+    # v2's own field default is True (mcp/server/transport_security.py:26),
+    # but we always pass this explicitly (D7) rather than relying on
+    # either default: passing any transport_security object at all
+    # suppresses the SDK's loopback-only auto-enable
+    # (mcp/server/lowlevel/server.py:735), so the value has to be stated
+    # here.
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[*base_hosts, *extra_hosts],
+        allowed_origins=default_origins,
+    )
+
+
 def _run_http() -> None:
     """Run ssh-mcp over MCP streamable HTTP transport.
 
@@ -858,7 +994,7 @@ def _run_http() -> None:
     * ``SSH_MCP_HTTP_NETWORK_NO_AUTH`` — magic-string opt-out for the
       ``auth=none`` + non-localhost combination. Must equal literal
       ``I_ACCEPT_RCE_RISK`` to take effect.
-    * ``SSH_MCP_HTTP_STATELESS`` — if ``true``, FastMCP runs in stateless
+    * ``SSH_MCP_HTTP_STATELESS`` — if ``true``, MCPServer runs in stateless
       mode. Recommended for load-balanced or serverless deployments.
     * ``SSH_MCP_HTTP_ALLOWED_HOSTS`` — comma-separated extra Host headers
       for DNS-rebinding protection (in addition to localhost). Protection is
@@ -904,7 +1040,6 @@ def _run_http() -> None:
     # default instead of failing loud on what is almost always a config
     # generation mistake.
     _allowed_hosts_raw = os.environ.get("SSH_MCP_HTTP_ALLOWED_HOSTS")
-    allowed_hosts_env = (_allowed_hosts_raw or "").strip()
 
     # Auth-mode dispatch. Default ``bearer`` preserves v0.3.1 behavior.
     # ``none`` disables the bearer middleware entirely — useful when a
@@ -958,85 +1093,14 @@ def _run_http() -> None:
                     "proceed."
                 )
 
-    # Apply settings to the module-level FastMCP instance. The SDK reads
-    # these fields at ``streamable_http_app()`` construction time.
-    mcp.settings.host = host
-    mcp.settings.port = port
-    mcp.settings.stateless_http = stateless
-    # P3: Always enable DNS rebinding protection, even without
-    # SSH_MCP_HTTP_ALLOWED_HOSTS. The MCP SDK defaults to
-    # enable_dns_rebinding_protection=False which is unsafe.
-    from mcp.server.transport_security import TransportSecuritySettings
-
-    base_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-    extra_hosts: list[str] = []
-    if (
-        _allowed_hosts_raw is not None
-        and _allowed_hosts_raw != ""
-        and not allowed_hosts_env
-    ):
-        # Explicitly set but whitespace-only after stripping. Distinct from
-        # "unset" (which falls through to the localhost-only default below)
-        # — a whitespace value almost always means a broken env-file
-        # substitution, and silently treating it as "no extra hosts" would
-        # mask that from the operator.
-        raise RuntimeError(
-            "SSH_MCP_HTTP_ALLOWED_HOSTS is set but contains only whitespace. "
-            "Unset the variable to use the localhost-only default, or "
-            "provide a concrete hostname (e.g. 'ssh-mcp.internal:*')."
-        )
-    if allowed_hosts_env:
-        extra_hosts = [h.strip() for h in allowed_hosts_env.split(",") if h.strip()]
-        # H4: reject wildcards — they silently disable DNS-rebinding
-        # protection. An operator setting "*" almost certainly means
-        # "match my specific hostname" and doesn't realize the security
-        # implication. Fail loud instead of silently letting it through.
-        #
-        # Ordering trap (regression found on ci/fix-digest-verification):
-        # the previous implementation special-cased entries starting with
-        # "*." as "always a permitted suffix wildcard, skip refusal" via a
-        # `continue` evaluated before the `entry in {"*", "*:*", "*.*"}`
-        # refusal was reached. "*.*" itself starts with "*." too, so that
-        # `continue` fired first and let "*.*" — which matches essentially
-        # any dotted hostname and is semantically identical to the bare
-        # "*" this gate exists to block — through as PERMITTED even though
-        # it was listed in the refusal set. Do not reintroduce a
-        # startswith("*.")-first shortcut. The fix below strips the two
-        # deliberately-permitted wildcard *forms* (a trailing ":*" port
-        # wildcard, then a leading "*." subdomain wildcard) and only
-        # afterwards demands a concrete, wildcard-free remainder.
-        for entry in extra_hosts:
-            remainder = entry
-            if remainder.endswith(":*"):
-                remainder = remainder[:-2]
-            if remainder.startswith("*."):
-                remainder = remainder[2:]
-            if not remainder or "*" in remainder or not remainder.strip("."):
-                raise RuntimeError(
-                    f"SSH_MCP_HTTP_ALLOWED_HOSTS wildcard entry {entry!r} "
-                    "would disable DNS-rebinding protection. "
-                    "Use a concrete hostname (e.g. 'ssh-mcp.internal:*') instead."
-                )
-
-    # Also add the actual bind host if it's not already covered
-    if host not in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:  # nosec B104
-        base_hosts.append(f"{host}:*")
-
-    existing = mcp.settings.transport_security
-    default_origins = [
-        "http://127.0.0.1:*",
-        "http://localhost:*",
-        "http://[::1]:*",
-    ]
-    mcp.settings.transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=[*base_hosts, *extra_hosts],
-        allowed_origins=(
-            list(existing.allowed_origins) if existing is not None else default_origins
-        ),
-    )
-
-    from ssh_mcp import __version__
+    # v2 removed the mcp.settings.host / .port / .stateless_http /
+    # .transport_security fields entirely (assigning them now raises
+    # ValueError); host/stateless are threaded through
+    # _build_http_app's streamable_http_app() call instead, and port is
+    # only ever needed by uvicorn.run() below. transport_security is
+    # built by the pure, unit-testable _build_transport_security so no
+    # module global is mutated.
+    transport_security = _build_transport_security(_allowed_hosts_raw, host)
 
     effective_auth = "bearer" if token else "none"
     logger.info(
@@ -1069,7 +1133,9 @@ def _run_http() -> None:
                 port,
             )
 
-    app = _build_http_app(token)
+    app = _build_http_app(
+        token, host=host, stateless=stateless, transport_security=transport_security
+    )
 
     # Tuning knobs for uvicorn — see `_parse_http_tuning` for defaults
     # and rationale. These exist because the v0.4.0 default (uvicorn's

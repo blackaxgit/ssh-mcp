@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError
 
 import ssh_mcp.server as server_module
 from ssh_mcp.config import ServerRegistry
