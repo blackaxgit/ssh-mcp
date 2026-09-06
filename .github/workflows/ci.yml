@@ -33,14 +33,14 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
-          version: "0.11.32"
+          version: "0.12.10"
           enable-cache: true
 
       - name: Install Python ${{ matrix.python-version }}
@@ -50,6 +50,12 @@ jobs:
         run: uv sync --locked --extra dev
 
       - name: Run tests
+        env:
+          # 200 examples instead of the `dev` default's 50 — no workflow has
+          # ever set this, so the security fuzzers (_redact_secrets,
+          # _is_dangerous_command) have always run at a quarter of the
+          # intended exploration.
+          HYPOTHESIS_PROFILE: ci
         run: uv run python -m pytest tests/ -v --cov=ssh_mcp --cov-report=term-missing
 
   lint:
@@ -59,14 +65,14 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
-          version: "0.11.32"
+          version: "0.12.10"
           enable-cache: true
 
       - name: Install Python
@@ -82,7 +88,7 @@ jobs:
       # [tool.ruff.lint] for the explicitly declared rule set.
       #
       # mypy also gates this job (below) but is NOT exactly pinned
-      # (`mypy>=1.15` in pyproject.toml); its determinism rests on uv.lock
+      # (`mypy>=2.3.1` in pyproject.toml); its determinism rests on uv.lock
       # alone, not on the pin rationale above. Same blind spot in
       # PINNED_LINT_TOOLS in tests/test_ci_lint_determinism.py.
       - name: Check formatting with ruff
@@ -118,14 +124,14 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
-          version: "0.11.32"
+          version: "0.12.10"
           enable-cache: true
 
       - name: Install Python
@@ -159,16 +165,16 @@ jobs:
       # Publishing is the exception, not the default. PRs build + scan only.
       PUBLISH: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
       - name: Log in to GHCR
         if: env.PUBLISH == 'true'
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -179,7 +185,7 @@ jobs:
       # the publish build passes no `labels:`, so published images carry none.
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ${{ env.IMAGE }}
           tags: |
@@ -209,7 +215,7 @@ jobs:
       - name: Build image (publish path — push by digest, no tags)
         id: build
         if: env.PUBLISH == 'true'
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
@@ -221,7 +227,7 @@ jobs:
       - name: Build image (PR path — local only)
         id: build_local
         if: env.PUBLISH != 'true'
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
           push: false
@@ -337,7 +343,7 @@ jobs:
 
       - name: Attest build provenance for the image
         if: env.PUBLISH == 'true'
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}   # no tag — the digest identifies the subject
           subject-digest: ${{ steps.build.outputs.digest }}

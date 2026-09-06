@@ -8,13 +8,21 @@
 # `severity: CRITICAL` (ci.yml), so fixable HIGH/MEDIUM OS CVEs are never
 # surfaced by that gate at all. Re-review each entry when the pinned base-image
 # digest in the Dockerfile changes: the base is pinned by digest, so the tag
-# string (python:3.13-slim-trixie) does NOT move when the scanned bytes — and
+# string (python:3.14-slim-trixie) does NOT move when the scanned bytes — and
 # the perl version in them — do. Nothing in CI or tests enforces this review.
 #
-# Last reviewed: CVE-2026-42496 / CVE-2026-8376 — 2026-07-02 (perl version not
-# recorded); CVE-2026-13221 / CVE-2026-57433 — 2026-07-25.
+# Last reviewed 2026-09-06, on the base-image bump to
+# python:3.14-slim-trixie@sha256:cad9a2c8 (Debian 13.6, perl-base 5.40.1-6).
+# Trivy reported exactly three CRITICALs, all perl-base and all already listed:
+# CVE-2026-13221, CVE-2026-42496, CVE-2026-8376. CVE-2026-57433 did NOT surface
+# as CRITICAL in that run, but it is NOT stale and was deliberately kept: the
+# Debian tracker still reports trixie "vulnerable" at 5.40.1-6, fixed only in
+# forky/sid (5.42.3-1). Trivy's severity rating moves with its database; the
+# vulnerability does not. Deleting the entry would just hand CI a future red.
+# Earlier reviews: CVE-2026-42496 / CVE-2026-8376 — 2026-07-02 (perl version
+# not recorded); CVE-2026-13221 / CVE-2026-57433 — 2026-07-25.
 
-# perl-base (from python:3.13-slim-trixie). perl is never invoked at runtime:
+# perl-base (from python:3.14-slim-trixie). perl is never invoked at runtime:
 # ssh-mcp never shells out locally (no subprocess/os.system in src/ssh_mcp/) and
 # jump hosts go through asyncssh's in-process tunnel, not an `ssh` ProxyCommand.
 # Debian has not published a fix for any of these.
