@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.7.1] - 2026-09-06
+## [0.8.0] - 2026-09-06
+
+> **Why 0.8.0 and not 0.7.1:** two of the changes below make a configuration that started successfully on 0.7.0 **refuse to start**, which is a breaking change to operator-visible behaviour rather than a bug fix. An empty or whitespace-only `SSH_MCP_HTTP_TOKEN_FILE`, a whitespace-only `SSH_MCP_HTTP_TOKEN`, and a token containing non-ASCII, a control character or an interior space all used to boot; all now abort. A token file with mode `0666` does too. Shipping that as a patch would let `~=0.7.0` pull it in silently and take a working deployment down on its next restart, so it takes the minor — the same reasoning recorded above for 0.6.0 over 0.5.7. The 0.6.1 precedent of a "BREAKING" patch does not apply: that one renamed the PyPI distribution while keeping an `ssh-mcp` alias, the import package and the image, so only the install command changed, never the behaviour of a running server.
 
 ### Security
 
@@ -36,6 +38,8 @@ Symlinks are **followed on purpose**, which is the one place this diverges from 
 **Lint standard: adopted `I` (import sorting) and `BLE` (blind-except); rejected the rest of ruff 0.16's 413-rule default.** The default set was measured, not guessed (`ruff check --isolated`, ruff 0.16.6): 70 findings, dominated by `SIM117` (17) and `SIM115` (15) — both tests-only cosmetics — so adopting it wholesale would buy 30-odd suppressions for no safety.
 
 The two adopted groups earn their place. `I` is deterministic and fully autofixable (9 files reordered). `BLE` is the valuable one: the 9 broad `except Exception` blocks are load-bearing — 6 in `ssh.py` back `ExecResult`'s documented never-raises contract, 2 in `healthcheck.py` are deliberately fail-safe, 1 is `server.py`'s atexit cleanup — and each now carries a `# noqa: BLE001` naming *why*. That converts them from accidents-that-look-deliberate into reviewed decisions, and makes a **new** accidental blind except fail CI. `RUF100` is deliberately not enabled: under this select it fires only on the two `# noqa: S310` directives documenting a deliberate `urllib` choice, so it would force deleting intent for no gain.
+
+**Every CI job now declares `timeout-minutes`.** All eleven jobs across `ci.yml`, `release.yml` and `audit.yml` previously inherited GitHub's **360-minute** default. That is not hypothetical: while writing this release a test that removed `O_NONBLOCK` did not fail, it **hung** on opening a writer-less fifo, and the only reason it surfaced in seconds was a `SIGALRM` deadline added inside that one test. Limits are `test: 10`, `lint: 5`, `audit: 5`, `build: 15`, `publish-pypi: 10`, `github-release: 10`, `docker: 20` — each at least 10x the measured duration (14-69 s), so a hang fails fast while a slow-but-healthy run cannot trip it. `tests/test_ci_lint_determinism.py::test_every_job_declares_a_timeout` asserts every job has one and that the value is a positive integer, since `timeout-minutes: 0` parses fine and would fail every job instantly. Verified against the v0.7.0 release run that `publish-pypi`'s limit does **not** consume the reviewer-approval wait: the job's `startedAt` follows approval, so its own runtime was 16 seconds against a 7-minute wait.
 
 ## [0.7.0] - 2026-09-06
 

@@ -1434,7 +1434,7 @@ class TestTokenFileValidation:
         """The token file must still be readable where POSIX APIs are absent.
 
         0.7.0 read this with ``Path.read_text()``, which works on Windows.
-        0.7.1 introduced three POSIX-only dependencies and a validator caught
+        0.8.0 introduced three POSIX-only dependencies and a validator caught
         each: ``os.O_NONBLOCK`` and ``os.geteuid`` do not exist there
         (``AttributeError`` is neither ``OSError`` nor ``UnicodeDecodeError``,
         so it would escape both handlers as a raw traceback), and CPython
@@ -1591,7 +1591,7 @@ class TestTokenFileValidation:
     ) -> None:
         """A configured-but-empty token file must ABORT, not disable auth.
 
-        Behaviour change in 0.7.1, and the reason is worth stating: until
+        Behaviour change in 0.8.0, and the reason is worth stating: until
         now an empty (or whitespace-only) token file flowed through
         ``token = raw_token or None``, so the bearer middleware was never
         attached at all. On a loopback bind that means the RCE-capable MCP

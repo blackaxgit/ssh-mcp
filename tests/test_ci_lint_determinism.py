@@ -619,3 +619,39 @@ def test_triggers_helper_handles_yaml_boolean_on_key() -> None:
     """`on:` parses as the boolean True under YAML 1.1."""
     assert _triggers({True: {"schedule": []}}) == {"schedule": []}
     assert _triggers({"on": {"push": {}}}) == {"push": {}}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [CI_WORKFLOW_PATH, AUDIT_WORKFLOW_PATH, RELEASE_WORKFLOW_PATH],
+    ids=["ci", "audit", "release"],
+)
+def test_every_job_declares_a_timeout(path: Path) -> None:
+    """A hanging job must fail fast instead of burning GitHub's 6h default.
+
+    Without an explicit ``timeout-minutes`` a job inherits GitHub's 360-minute
+    default. That is not hypothetical here: while writing 0.8.0 a test that
+    removed ``O_NONBLOCK`` did not FAIL, it HUNG on opening a writer-less
+    fifo, and the only reason it surfaced in seconds was a ``SIGALRM``
+    deadline added inside that one test. This asserts the workflow-level net
+    that covers the whole class, since measured job durations are 14-69
+    seconds and every declared limit is at least 10x that.
+
+    Also pins the value as a positive int: ``timeout-minutes: 0`` is
+    accepted by the YAML schema and would make every job fail immediately.
+    """
+    jobs = _load_workflow(path)["jobs"]
+    assert jobs, f"{path.name} declares no jobs"
+
+    missing = [name for name, job in jobs.items() if "timeout-minutes" not in job]
+    assert not missing, (
+        f"{path.name}: {missing} have no timeout-minutes, so they inherit "
+        "GitHub's 360-minute default. A hung job would hold a runner for six "
+        "hours; see this test's docstring for the incident."
+    )
+    for name, job in jobs.items():
+        limit = job["timeout-minutes"]
+        assert isinstance(limit, int) and limit > 0, (
+            f"{path.name}:{name} has timeout-minutes={limit!r}; it must be a "
+            "positive integer (0 would fail the job instantly)"
+        )

@@ -25,6 +25,7 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     strategy:
@@ -61,6 +62,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
 
@@ -120,6 +122,7 @@ jobs:
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
 
@@ -146,6 +149,7 @@ jobs:
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # `audit` is REQUIRED here. When pip-audit lived inside `lint` this
     # dependency existed only implicitly; making it explicit is what keeps a
     # known-vulnerable image from reaching GHCR. Do not remove it — a

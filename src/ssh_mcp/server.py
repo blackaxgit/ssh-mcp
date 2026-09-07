@@ -1096,7 +1096,7 @@ def _read_token_file(token_file: str) -> str:
         # read this file with Path.read_text(), which worked on Windows, so a
         # hard reference would be a platform regression — and CI is
         # ubuntu-only, so nothing here would have caught it. Falling back to
-        # 0 just means no O_NONBLOCK, which is exactly the pre-0.7.1
+        # 0 just means no O_NONBLOCK, which is exactly the pre-0.8.0
         # behaviour on the one platform that has no fifos to guard against.
         # NB: this is unlike the SFTP subsystem, which fails closed off
         # POSIX on purpose (paths.py::ensure_root) — the HTTP transport has
