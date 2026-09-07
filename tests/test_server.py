@@ -20,8 +20,7 @@ import ssh_mcp
 import ssh_mcp.server as server_module
 from ssh_mcp.config import ServerRegistry
 from ssh_mcp.models import ExecResult
-from ssh_mcp.ssh import SSHManager, _REDACTION_PLACEHOLDER
-
+from ssh_mcp.ssh import _REDACTION_PLACEHOLDER, SSHManager
 
 # ---------------------------------------------------------------------------
 # Fixtures

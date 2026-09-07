@@ -172,16 +172,41 @@ constraint-dependencies = [
 
 [tool.ruff.lint]
 # Declared explicitly so the lint standard is a property of THIS repo rather
-# than of whatever default the installed ruff happens to ship. This is the
-# pre-0.16 default set that the codebase has always been held to and is
-# currently 100% clean against — no rule is being dropped here. Adopting
-# ruff 0.16's wider 413-rule default is a deliberate standard change and is
-# deferred: it surfaces ~60 findings (17 in src/, 43 in tests/), several of
-# which need judgment rather than an autofix — notably the 9 deliberate broad
-# `except Exception` blocks (BLE001), 6 of them in ssh.py backing ExecResult's
-# never-raises contract, the rest in healthcheck.py and server.py. Do that as
-# its own PR.
-select = ["E4", "E7", "E9", "F"]
+# than of whatever default the installed ruff happens to ship.
+#
+# ruff 0.16 widened its default set from 59 to 413 rules. That default was
+# measured on this codebase (`ruff check --isolated`, 0.16.6) rather than
+# guessed, and adopting it wholesale is deliberately REJECTED: 70 findings,
+# of which the large blocks are `SIM117` (17) and `SIM115` (15) — both
+# tests-only cosmetics, `SIM115` being the `NamedTemporaryFile(delete=False)`
+# helpers, which notably does NOT touch the SFTP confinement code. Buying
+# 30-odd suppressions for that is a poor trade.
+#
+# `RUF100` (unused-noqa) is also deliberately NOT enabled, and the reason is
+# worth writing down because the `--isolated` run misreports it: there it
+# fires on a `# noqa: F401` that is perfectly legitimate under this config,
+# purely because `--isolated` re-derives which rules are on. Under the real
+# select it fires on exactly two directives — the `# noqa: S310` pair in
+# healthcheck.py:152,162 — which are inert only because `S` is not selected.
+# They document a deliberate `urllib.request` decision, so enabling RUF100
+# would force deleting intent-documenting comments to satisfy a linter. No
+# safety is bought; leave it off.
+#
+# Two groups earn their place and are adopted:
+#
+#   I   — import sorting. Deterministic, fully autofixable, ends the
+#         hand-maintained import order that has drifted across 15 files.
+#   BLE — blind-except. NOT to remove the 9 broad `except Exception` blocks;
+#         they are load-bearing (6 in ssh.py back ExecResult's documented
+#         never-raises contract, 2 in healthcheck.py are deliberately
+#         fail-safe, 1 is server.py's atexit connection-cleanup handler).
+#         Each now carries an
+#         explicit `# noqa: BLE001` naming why, which converts them from
+#         accidents-that-look-deliberate into reviewed decisions — and makes
+#         a NEW accidental blind except fail CI. In a codebase where a
+#         swallowed exception can silently drop a security control, that is a
+#         real guard rather than style.
+select = ["E4", "E7", "E9", "F", "I", "BLE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

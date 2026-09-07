@@ -6,7 +6,6 @@ and group execution summaries.
 
 from __future__ import annotations
 
-
 from ssh_mcp.formatting import (
     format_exec_result,
     format_group_results,

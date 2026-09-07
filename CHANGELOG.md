@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-06
+
+### Security
+
+**`SSH_MCP_HTTP_TOKEN_FILE` now validates the file it reads.** It was a bare `Path(p).read_text()` — no checks at all — for a secret that authenticates an endpoint which executes shell commands on remote hosts. Now:
+
+- The descriptor is `fstat`-ed and read, so every check applies to the **same object** that supplies the token. The previous stat-then-open shape would have been a TOCTOU window on exactly the file an attacker would want to swap.
+- A **non-regular file aborts startup** — a directory, socket or device is unambiguous misconfiguration. `O_NONBLOCK` means a fifo is refused instead of blocking startup forever waiting for a writer.
+- A file over **64 KiB aborts startup** (`_MAX_TOKEN_FILE_BYTES`); a mistyped path pointing at a log file is no longer slurped into memory and used as a secret. Checked twice: on the `st_size` snapshot, and again on the bytes actually read — the same descriptor removes *pathname* TOCTOU but not *content-mutation* TOCTOU, so a file that grows between `fstat` and `read` would otherwise sail past the cap the error message promises.
+- A mode **writable** by group or other **aborts startup**. This is an integrity hole, strictly worse than disclosure: whoever can write the file chooses the token that authorises remote command execution, then waits for a restart. Refusing costs nothing in the deployments below — neither `0444` nor `0644` carries a group/other write bit.
+- A mode **readable** beyond its owner logs a warning naming the octal mode, and so does an **owner that is neither this process nor root** (which is also what catches a hardlink to another user's file). Both deliberately do **not** refuse: Docker Swarm mounts secrets `0444`, Kubernetes defaults to `0644`, and both are commonly root-owned while the process runs unprivileged — refusing either would break the two most common secret mounts outright. World-readable inside an isolated image is a different risk from world-readable on a shared host, and the process cannot reliably tell which it is in, so it reports and lets the operator judge. An execute bit alone is silent; it discloses nothing about a regular file.
+- **Content that is not valid UTF-8 aborts startup with an actionable message.** `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so it escaped the handler and killed startup with a raw codec traceback that never named the env var or the path. The old `Path.read_text()` had the identical hole, so this is not a regression — but a binary file is exactly the wrong-path case this validation exists to report in words.
+
+`O_NONBLOCK` is deliberately **not** claimed as a liveness guarantee: it stops a fifo hanging startup, but a regular file on a slow or hostile FUSE mount can still block the read. That is accepted as a local denial of service by whoever already controls both the mount and the configuration pointing at it; bounding it would need a reader thread and a timeout, which is not worth the complexity on a startup-only path whose input is operator configuration rather than request data.
+
+Symlinks are **followed on purpose**, which is the one place this diverges from `paths.py::ensure_root`'s `O_NOFOLLOW`. Kubernetes projects each secret key as `key` -> `..data/key` -> `..<timestamp>/key` so updates are atomic; refusing symlinks would reject every Kubernetes secret mount. A regression test pins this, because "add `O_NOFOLLOW` for consistency" is the obvious wrong hardening.
+
+`healthcheck.py` is deliberately left lenient — it returns `None` on an unreadable token file so a missing token still yields a 401 that counts as alive. The server is the enforcement point; a container `HEALTHCHECK` re-warning every 30s would be noise.
+
+### Changed
+
+**Lint standard: adopted `I` (import sorting) and `BLE` (blind-except); rejected the rest of ruff 0.16's 413-rule default.** The default set was measured, not guessed (`ruff check --isolated`, ruff 0.16.6): 70 findings, dominated by `SIM117` (17) and `SIM115` (15) — both tests-only cosmetics — so adopting it wholesale would buy 30-odd suppressions for no safety.
+
+The two adopted groups earn their place. `I` is deterministic and fully autofixable (9 files reordered). `BLE` is the valuable one: the 9 broad `except Exception` blocks are load-bearing — 6 in `ssh.py` back `ExecResult`'s documented never-raises contract, 2 in `healthcheck.py` are deliberately fail-safe, 1 is `server.py`'s atexit cleanup — and each now carries a `# noqa: BLE001` naming *why*. That converts them from accidents-that-look-deliberate into reviewed decisions, and makes a **new** accidental blind except fail CI. `RUF100` is deliberately not enabled: under this select it fires only on the two `# noqa: S310` directives documenting a deliberate `urllib` choice, so it would force deleting intent for no gain.
+
 ## [0.7.0] - 2026-09-06
 
 ### Security

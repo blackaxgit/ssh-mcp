@@ -9,6 +9,8 @@ exercised via a mocked ``uvicorn.run``.
 
 from __future__ import annotations
 
+import os
+import signal
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
@@ -1041,4 +1043,377 @@ class TestTokenFile:
 
         assert captured == ["env-token-should-win-ok"], (
             f"Env token did not take precedence: got {captured!r}"
+        )
+
+
+class TestTokenFileValidation:
+    """The token file authenticates an endpoint that runs shell commands, so
+    what is read gets validated. Panel finding 2026-09-06: the previous
+    implementation was a bare ``Path(p).read_text()`` with no checks at all.
+
+    Every test here calls ``_read_token_file`` directly: it owns the decision
+    and is pure apart from the filesystem, so there is no global transport
+    state to set up or restore.
+    """
+
+    _TOKEN = "file-based-secret-token-long"
+
+    def test_owner_only_file_is_read_without_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A 0600 file is the recommended case: read it, say nothing."""
+        p = tmp_path / "token"
+        p.write_text(f"  {self._TOKEN}\n")
+        p.chmod(0o600)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.server"):
+            assert server_module._read_token_file(str(p)) == self._TOKEN
+
+        assert "readable beyond" not in caplog.text
+
+    @pytest.mark.parametrize("mode", [0o644, 0o444, 0o604, 0o640])
+    def test_group_or_other_READABLE_warns_but_still_works(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, mode: int
+    ) -> None:
+        """Group/other READ warns and must NOT refuse.
+
+        Docker Swarm mounts secrets 0444 and Kubernetes defaults to 0644, so
+        refusing world-readable would break the two most common secret mounts
+        outright. The warning has to name the mode to be actionable.
+
+        Every mode here is deliberately free of group/other WRITE bits, which
+        are refused by the sibling test below.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(mode)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.server"):
+            assert server_module._read_token_file(str(p)) == self._TOKEN
+
+        assert "readable beyond" in caplog.text
+        assert oct(mode) in caplog.text, (
+            f"warning must name the octal mode, got: {caplog.text!r}"
+        )
+
+    @pytest.mark.parametrize("mode", [0o622, 0o660, 0o606, 0o666])
+    def test_group_or_other_WRITABLE_is_refused(
+        self, tmp_path: Path, mode: int
+    ) -> None:
+        """Group/other WRITE aborts startup — an integrity hole, not disclosure.
+
+        Panel finding 2026-09-06: the first implementation tested a single
+        ``& 0o077`` and merely warned, lumping three different things
+        together. Anyone who can WRITE this file chooses the token that
+        authorises remote command execution, then waits for a restart — which
+        is strictly worse than being able to read it. Refusing is free
+        compatibility-wise: Docker's 0444 and Kubernetes' 0644 carry no
+        group/other write bit, so the mounts this code bends to support are
+        unaffected.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(mode)
+
+        with pytest.raises(RuntimeError, match="writable beyond"):
+            server_module._read_token_file(str(p))
+
+    def test_execute_bit_alone_does_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An execute bit on a regular file discloses nothing.
+
+        The check is ``& 0o044``, not ``& 0o077``, precisely so this is
+        silent. Warning about it was noise.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(0o611)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.server"):
+            assert server_module._read_token_file(str(p)) == self._TOKEN
+
+        assert "readable beyond" not in caplog.text
+
+    def test_bounded_read_catches_a_file_that_grows_after_fstat(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cap must bind on bytes READ, not just on the ``fstat`` snapshot.
+
+        Panel finding: the pre-read ``st_size`` check is only a snapshot, so
+        an unbounded ``fh.read()`` would sail past the limit if the file grew
+        between ``fstat`` and ``read`` — the descriptor being the same object
+        removes pathname TOCTOU but not content-mutation TOCTOU. Simulated by
+        making ``fstat`` under-report, which is exactly what a growing file
+        looks like from the check's point of view.
+        """
+        p = tmp_path / "token"
+        p.write_bytes(b"y" * (server_module._MAX_TOKEN_FILE_BYTES + 10))
+        p.chmod(0o600)
+
+        real_fstat = os.fstat
+
+        def lying_fstat(fd: int) -> os.stat_result:
+            st = real_fstat(fd)
+            # Same mode/uid, but a size well under the cap.
+            fields = list(st)
+            fields[6] = 10
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(server_module.os, "fstat", lying_fstat)
+
+        with pytest.raises(RuntimeError, match="while being read"):
+            server_module._read_token_file(str(p))
+
+    def test_owner_is_this_process_does_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The ownership warning must not fire on the normal case.
+
+        A file owned by a third unprivileged user cannot be created without
+        root, so the positive case is not testable in CI; this pins the
+        negative so the check cannot degrade into warning on every startup.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(0o600)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.server"):
+            server_module._read_token_file(str(p))
+
+        assert "owned by uid" not in caplog.text
+
+    def test_kubernetes_symlink_chain_is_followed(self, tmp_path: Path) -> None:
+        """A Kubernetes-shaped symlink chain must resolve, not be refused.
+
+        kubelet's atomic writer projects each key as ``key`` ->
+        ``..data/key`` -> ``..<timestamp>/key`` so that updates are atomic.
+        ``paths.py::ensure_root`` uses O_NOFOLLOW; copying that here would
+        reject every Kubernetes secret mount, which is why this file
+        deliberately follows symlinks. This test is the guard against someone
+        "hardening" it by adding O_NOFOLLOW.
+        """
+        data_dir = tmp_path / "..2026_09_06_04_00_00.123456789"
+        data_dir.mkdir()
+        (data_dir / "token").write_text(self._TOKEN)
+        (tmp_path / "..data").symlink_to(data_dir)
+        (tmp_path / "token").symlink_to(tmp_path / "..data" / "token")
+
+        assert server_module._read_token_file(str(tmp_path / "token")) == self._TOKEN
+
+    def test_directory_is_refused(self, tmp_path: Path) -> None:
+        """A directory is unambiguous misconfiguration, not a token."""
+        with pytest.raises(RuntimeError, match="not a regular file"):
+            server_module._read_token_file(str(tmp_path))
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="fifos are POSIX-only")
+    def test_fifo_is_refused_and_does_not_hang(self, tmp_path: Path) -> None:
+        """A fifo must be refused rather than blocking startup forever.
+
+        This is what O_NONBLOCK buys: a plain O_RDONLY open on a writer-less
+        fifo blocks indefinitely, so the server would hang before binding
+        instead of failing loudly.
+
+        The SIGALRM deadline is the point of this test, not decoration.
+        Panel finding 2026-09-06: without it, deleting O_NONBLOCK does not
+        turn this test RED -- it HANGS the whole suite, and `ci.yml` sets no
+        `timeout-minutes`, so the runner would sit at GitHub's 360-minute
+        default. A mutation that hangs CI is strictly worse than one that
+        fails it, so the failure mode is forced to be a fast, legible error.
+        Chosen over adding a `pytest-timeout` dependency for one test.
+        """
+        fifo = tmp_path / "fifo"
+        os.mkfifo(fifo)
+
+        def _deadline(signum: int, frame: object) -> None:
+            raise TimeoutError(
+                "_read_token_file blocked opening a writer-less fifo — "
+                "O_NONBLOCK was lost"
+            )
+
+        previous = signal.signal(signal.SIGALRM, _deadline)
+        signal.setitimer(signal.ITIMER_REAL, 5.0)
+        try:
+            with pytest.raises(RuntimeError, match="not a regular file"):
+                server_module._read_token_file(str(fifo))
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+
+    def test_oversized_file_is_refused(self, tmp_path: Path) -> None:
+        """A file over the cap is the wrong path, not a secret."""
+        p = tmp_path / "token"
+        p.write_bytes(b"x" * (server_module._MAX_TOKEN_FILE_BYTES + 1))
+
+        with pytest.raises(RuntimeError, match="over the .*-byte limit"):
+            server_module._read_token_file(str(p))
+
+    def test_file_at_the_size_limit_is_accepted(self, tmp_path: Path) -> None:
+        """The cap is inclusive — the boundary must not be off by one."""
+        p = tmp_path / "token"
+        p.write_bytes(b"x" * server_module._MAX_TOKEN_FILE_BYTES)
+
+        got = server_module._read_token_file(str(p))
+        assert len(got) == server_module._MAX_TOKEN_FILE_BYTES
+
+    def test_empty_file_yields_empty_string(self, tmp_path: Path) -> None:
+        """An empty file must stay non-fatal.
+
+        ``_run_http`` maps ``"" -> None``, which on a loopback bind means
+        "no auth" -- the pre-0.7.0 behaviour. Changing this to raise would
+        turn a documented deployment into a startup failure.
+        """
+        p = tmp_path / "token"
+        p.write_text("")
+        p.chmod(0o600)
+
+        assert server_module._read_token_file(str(p)) == ""
+
+    def test_non_utf8_file_is_refused_with_a_runtime_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Invalid UTF-8 must surface as RuntimeError, not a raw traceback.
+
+        ``UnicodeDecodeError`` is a ``ValueError``, NOT an ``OSError``, so the
+        ``except OSError`` arm does not catch it and it escaped as an
+        unhandled traceback at startup until this was fixed. The old
+        ``Path.read_text()`` had the same hole, so this is not a regression --
+        but the helper documents that it raises ``RuntimeError``, and a
+        binary file is exactly the wrong-path case an operator needs told
+        about in words.
+        """
+        p = tmp_path / "token"
+        p.write_bytes(b"\xff\xfe\x00not-text")
+        p.chmod(0o600)
+
+        with pytest.raises(RuntimeError, match="not valid UTF-8"):
+            server_module._read_token_file(str(p))
+
+    @pytest.mark.skipif(
+        not os.path.isdir("/dev/fd"), reason="/dev/fd is POSIX-specific"
+    )
+    def test_no_file_descriptor_is_leaked_on_any_path(self, tmp_path: Path) -> None:
+        """Every exit path must close the descriptor exactly once.
+
+        The helper hands the fd to ``os.fdopen`` on success and sets a ``-1``
+        sentinel so ``finally`` does not double-close, while the four refusal
+        paths raise BEFORE ``fdopen`` and rely on ``finally``. That is easy to
+        get subtly wrong, and a leak in a long-lived server is a real
+        resource bug -- the repo has a prior incident where accumulated
+        connections exhausted the container's 1024 fd limit (see the
+        ``SSH_MCP_HTTP_KEEPALIVE_TIMEOUT`` note in README).
+
+        Counting ``/dev/fd`` is POSIX-specific, which is acceptable here:
+        the sibling fifo test already requires ``os.mkfifo``.
+        """
+        ok = tmp_path / "ok"
+        ok.write_text("token-1234567890abcdef")
+        ok.chmod(0o600)
+        big = tmp_path / "big"
+        big.write_bytes(b"x" * (server_module._MAX_TOKEN_FILE_BYTES + 1))
+        binary = tmp_path / "bin"
+        binary.write_bytes(b"\xff\xfe\x00")
+        binary.chmod(0o600)
+
+        targets = [ok, big, tmp_path, tmp_path / "missing", binary]
+
+        def _open_fd_count() -> int:
+            return len(os.listdir("/dev/fd"))
+
+        before = _open_fd_count()
+        for _ in range(50):
+            for t in targets:
+                try:
+                    server_module._read_token_file(str(t))
+                except RuntimeError:
+                    pass
+        after = _open_fd_count()
+
+        assert after <= before, (
+            f"descriptor leak: {before} open fds before, {after} after "
+            f"250 calls across {len(targets)} paths"
+        )
+
+    def test_io_error_after_open_becomes_a_runtime_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An OSError raised while READING must also be wrapped.
+
+        The open-fails case is covered by ``TestTokenFile
+        ::test_token_file_missing_raises``, but the ``except OSError`` arm
+        also has to catch a failure from the READ -- e.g. EIO on a failing
+        disk, or a procfs pseudo-file that stats as a regular file and then
+        refuses to be read (a validator demonstrated exactly that with
+        ``/proc/self/mem``). Without this the operator would get a raw
+        OSError traceback naming neither the env var nor the path.
+
+        The failure is injected at ``read`` rather than at ``fdopen``
+        because that is the real uncovered branch, and because a fake that
+        makes ``fdopen`` itself raise gets the ownership handoff wrong: the
+        helper only sets its ``fd = -1`` sentinel once ``fdopen`` has
+        returned, so a fake that closes the descriptor and then raises makes
+        the ``finally`` double-close and fail with EBADF -- an artefact of
+        the fake, not a defect in the code under test.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(0o600)
+
+        real_fdopen = os.fdopen
+
+        class _UnreadableFile:
+            def __init__(self, wrapped: object) -> None:
+                self._wrapped = wrapped
+
+            def __enter__(self) -> _UnreadableFile:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                self._wrapped.close()  # type: ignore[attr-defined]
+
+            def read(self, *_a: object) -> str:
+                raise OSError(5, "Input/output error")
+
+        def unreadable_fdopen(fd: int, *a: object, **kw: object) -> _UnreadableFile:
+            return _UnreadableFile(real_fdopen(fd, *a, **kw))  # type: ignore[arg-type]
+
+        monkeypatch.setattr(server_module.os, "fdopen", unreadable_fdopen)
+
+        with pytest.raises(RuntimeError, match="could not be read"):
+            server_module._read_token_file(str(p))
+
+    def test_empty_token_file_yields_no_auth_through_run_http(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """End-to-end: an empty token file must still mean "no token".
+
+        ``_read_token_file`` returning ``""`` is only half the contract; what
+        matters to an operator is that ``_run_http`` maps it to ``None`` at
+        `token = raw_token or None`, which on a loopback bind is the
+        documented unauthenticated mode. Panel finding 2026-09-06: the
+        unit-level test alone stays green if that mapping is changed to
+        `token = raw_token`, which would attach the bearer middleware with an
+        empty secret and abort startup on the 16-character minimum -- turning
+        a configuration that worked in 0.7.0 into a hard failure.
+        """
+        token_path = tmp_path / "token"
+        token_path.write_text("")
+        token_path.chmod(0o600)
+
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN_FILE", str(token_path))
+
+        captured: list[str | None] = []
+
+        def fake_build(token, **_kwargs):  # type: ignore[no-untyped-def]
+            captured.append(token)
+            return _make_dummy_asgi_app()
+
+        with patch("ssh_mcp.server._build_http_app", side_effect=fake_build):
+            with patch("uvicorn.run"):
+                _run_http()
+
+        assert captured == [None], (
+            f"empty token file must yield token=None, got {captured!r}"
         )

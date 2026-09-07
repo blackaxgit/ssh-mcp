@@ -22,6 +22,7 @@ import contextlib
 import functools
 import logging
 import os
+import stat
 import sys
 import traceback
 from collections.abc import Awaitable, Callable, Iterator
@@ -34,7 +35,6 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 
 from ssh_mcp import __version__
-
 from ssh_mcp.config import ServerRegistry
 from ssh_mcp.formatting import (
     format_exec_result,
@@ -277,7 +277,7 @@ def _cleanup_connections() -> None:
         return
     try:
         asyncio.run(_ssh.close_all())
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - atexit cleanup: must never raise during interpreter shutdown
         logger.warning("Error during connection cleanup: %s", e)
 
 
@@ -1003,6 +1003,181 @@ def _build_transport_security(
     )
 
 
+# A bearer token is tens of bytes. The cap exists so a mistyped
+# SSH_MCP_HTTP_TOKEN_FILE pointing at a log file or a device node is refused
+# instead of being slurped into memory and then used as a secret. Kept as a
+# module-level constant rather than a Settings field for the same reason as
+# ssh.py's tunables: greppable and testable without widening the
+# operator-facing config surface.
+_MAX_TOKEN_FILE_BYTES = 65536
+
+
+def _read_token_file(token_file: str) -> str:
+    """Read the bearer token from a file, validating what we actually read.
+
+    This guards a secret that authenticates an endpoint which executes shell
+    commands, so the checks are deliberate rather than defensive boilerplate:
+
+    * The descriptor is ``fstat``-ed and read, so every check applies to the
+      SAME object that supplies the token. Stat-then-open would be a TOCTOU
+      window on exactly the file an attacker would want to swap.
+    * ``O_NONBLOCK`` means a fifo does not hang startup forever waiting for a
+      writer. It is a no-op on a regular file, and deliberately NOT claimed
+      as a liveness guarantee: a regular file on a slow or hostile FUSE
+      mount can still block the read, which is a local denial of service by
+      whoever controls that mount and the config pointing at it. Bounding
+      that would need a reader thread plus a timeout, which is not worth the
+      complexity for a startup-only path whose input is operator
+      configuration rather than request data.
+    * A non-regular file is REFUSED: no deployment legitimately points this at
+      a directory, socket or device, so it is unambiguously misconfiguration.
+    * An oversized file is REFUSED, both on the ``st_size`` snapshot and on
+      the bytes actually read (see ``_MAX_TOKEN_FILE_BYTES``).
+    * A group/other WRITABLE mode is REFUSED. Whoever can write the file
+      chooses the token that authorises remote command execution, so this is
+      an integrity hole rather than a disclosure one, and it costs nothing to
+      refuse: neither Docker's ``0444`` nor Kubernetes' ``0644`` carries a
+      group/other write bit.
+    * A group/other READABLE mode only WARNS. It deliberately does not
+      refuse: Docker Swarm mounts secrets ``0444`` and Kubernetes defaults to
+      ``0644``, so refusing would break the two most common secret mounts
+      outright. World-readable inside an isolated container image is a very
+      different risk from world-readable on a shared host, and this code
+      cannot reliably tell which it is in — so it reports the mode and leaves
+      the judgement to the operator. An execute bit alone is silent: it
+      discloses nothing about a regular file's contents.
+    * An owner that is neither this process nor root only WARNS, for the same
+      container reason — secret mounts are commonly root-owned and consumed
+      unprivileged — but it is worth saying, because that user can rewrite
+      the token at will. This also covers the hardlink-to-another-users-file
+      case, where the inode's owner is the giveaway.
+
+    Symlinks are FOLLOWED on purpose, which is the one place this diverges
+    from ``paths.py::ensure_root``'s ``O_NOFOLLOW``. Kubernetes projects each
+    secret key as a symlink (``key`` -> ``..data/key`` -> ``..<ts>/key``) so
+    that updates are atomic; refusing symlinks here would reject every
+    Kubernetes secret mount. The confinement argument that justifies
+    ``O_NOFOLLOW`` for ``transfer_root`` does not transfer: there is no tree
+    beneath this path to confine, and the ``fstat`` below still describes the
+    real file the token came from.
+
+    Raises:
+        RuntimeError: on an unreadable, non-regular or oversized file.
+    """
+    try:
+        # getattr, not os.O_NONBLOCK: the constant is POSIX-only and absent
+        # on Windows, where a bare reference raises AttributeError before the
+        # OSError handler below can turn it into an actionable message. 0.7.0
+        # read this file with Path.read_text(), which worked on Windows, so a
+        # hard reference would be a platform regression — and CI is
+        # ubuntu-only, so nothing here would have caught it. Falling back to
+        # 0 just means no O_NONBLOCK, which is exactly the pre-0.7.1
+        # behaviour on the one platform that has no fifos to guard against.
+        # NB: this is unlike the SFTP subsystem, which fails closed off
+        # POSIX on purpose (paths.py::ensure_root) — the HTTP transport has
+        # never been documented POSIX-only.
+        fd = os.open(token_file, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except OSError as e:
+        raise RuntimeError(
+            f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} could not be read: {e}"
+        ) from e
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(
+                f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} is not a regular file "
+                f"(mode {stat.filemode(st.st_mode)}). Point it at a file "
+                "containing the token."
+            )
+        if st.st_size > _MAX_TOKEN_FILE_BYTES:
+            raise RuntimeError(
+                f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} is "
+                f"{st.st_size} bytes, over the {_MAX_TOKEN_FILE_BYTES}-byte "
+                "limit. A bearer token is tens of bytes — this is almost "
+                "certainly the wrong path."
+            )
+        # Group/other WRITE is refused, not warned. Panel finding: the
+        # original single `& 0o077` test lumped three different things
+        # together. A writable token file is an INTEGRITY hole, strictly
+        # worse than disclosure — anyone who can write it chooses the secret
+        # that authorises remote command execution, then waits for a
+        # restart. Refusing costs nothing in the deployments this code
+        # bends over backwards to support: Docker Swarm mounts secrets 0444
+        # and Kubernetes defaults to 0644, neither of which carries a
+        # group/other write bit.
+        if st.st_mode & 0o022:
+            raise RuntimeError(
+                f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} is writable beyond "
+                f"its owner (mode {oct(stat.S_IMODE(st.st_mode))}). Anyone "
+                "who can write this file chooses the token that authorises "
+                "remote command execution. Run: chmod go-w "
+                f"{token_file!r}"
+            )
+        # READ access only warns — see the docstring for why this cannot be
+        # fatal. Note this tests 0o044 rather than 0o077: an execute bit on
+        # a regular file discloses nothing, so warning about it was noise.
+        if st.st_mode & 0o044:
+            logger.warning(
+                "SSH_MCP_HTTP_TOKEN_FILE %r is readable beyond its owner "
+                "(mode %s). This token authenticates remote command "
+                "execution; prefer 0600. Container secret mounts are "
+                "commonly 0444 (Docker) or 0644 (Kubernetes), which is "
+                "usually acceptable inside an isolated image but not on a "
+                "shared host.",
+                token_file,
+                oct(stat.S_IMODE(st.st_mode)),
+            )
+        # Ownership warns rather than refuses, for the same container reason:
+        # Docker and Kubernetes secret mounts are commonly root-owned while
+        # the process runs unprivileged, so `st_uid == geteuid()` would
+        # reject them. But a file owned by some OTHER unprivileged user is
+        # worth saying out loud: that user can rewrite it whenever they like.
+        if st.st_uid not in (os.geteuid(), 0):
+            logger.warning(
+                "SSH_MCP_HTTP_TOKEN_FILE %r is owned by uid %d, which is "
+                "neither this process (uid %d) nor root. That user can "
+                "replace the token at any time.",
+                token_file,
+                st.st_uid,
+                os.geteuid(),
+            )
+        with os.fdopen(fd, encoding="utf-8") as fh:
+            fd = -1  # fdopen owns it now; do not double-close in `finally`
+            # Bounded read, because `st_size` above is only a pre-read
+            # snapshot: a regular file can grow between `fstat` and `read`,
+            # so an unbounded `fh.read()` would blow past the limit the
+            # message promises. Reading MAX+1 makes the cap real rather than
+            # advisory, and costs one extra byte.
+            data = fh.read(_MAX_TOKEN_FILE_BYTES + 1)
+            if len(data) > _MAX_TOKEN_FILE_BYTES:
+                raise RuntimeError(
+                    f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} exceeds the "
+                    f"{_MAX_TOKEN_FILE_BYTES}-byte limit while being read. "
+                    "A bearer token is tens of bytes — this is almost "
+                    "certainly the wrong path."
+                )
+            return data.strip()
+    except UnicodeDecodeError as e:
+        # UnicodeDecodeError is a ValueError, NOT an OSError, so the handler
+        # below does not catch it and it would escape as a raw traceback at
+        # startup. Found by exercising a token file containing invalid UTF-8.
+        # The old `Path.read_text()` raised the same thing, so this is not a
+        # regression — but the docstring promises RuntimeError, and a binary
+        # file is exactly the kind of wrong path an operator needs told.
+        raise RuntimeError(
+            f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} is not valid UTF-8 "
+            f"({e.reason} at byte {e.start}). A bearer token must be text; "
+            "this looks like a binary file."
+        ) from e
+    except OSError as e:
+        raise RuntimeError(
+            f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} could not be read: {e}"
+        ) from e
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
 def _run_http() -> None:
     """Run ssh-mcp over MCP streamable HTTP transport.
 
@@ -1060,12 +1235,7 @@ def _run_http() -> None:
     if not raw_token:
         token_file = os.environ.get("SSH_MCP_HTTP_TOKEN_FILE", "").strip()
         if token_file:
-            try:
-                raw_token = Path(token_file).read_text().strip()
-            except (OSError, FileNotFoundError) as e:
-                raise RuntimeError(
-                    f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} could not be read: {e}"
-                ) from e
+            raw_token = _read_token_file(token_file)
     token = raw_token or None
     stateless = (
         os.environ.get("SSH_MCP_HTTP_STATELESS", "false").strip().lower() == "true"

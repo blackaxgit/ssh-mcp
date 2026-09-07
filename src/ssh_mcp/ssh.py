@@ -1706,7 +1706,7 @@ class SSHManager:
                 error=f"SSH error: {redacted}",
             )
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - execute() documents that it NEVER raises; failures ride inside ExecResult.error
             redacted = _redact_secrets(str(e))
             logger.error(
                 "Unexpected error on %s: %s",
@@ -1798,7 +1798,7 @@ class SSHManager:
                 for future in asyncio.as_completed(actual_tasks):
                     try:
                         result = await future
-                    except Exception:
+                    except Exception:  # noqa: BLE001 - B3: guards `await future` so execute()'s never-raises promise actually holds
                         # B3 (new finding): execute() promises never to
                         # raise, but that promise is only as strong as
                         # every code path inside it. An unguarded `await
@@ -1929,7 +1929,7 @@ class SSHManager:
                 )
             ]
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - execute_on_group() documents that it NEVER raises; see ExecResult in models.py
             redacted = _redact_secrets(str(e))
             logger.error(
                 "Unexpected error in group execution: %s", _safe_log_value(redacted)
@@ -2452,7 +2452,7 @@ class SSHManager:
                 conn.close()
                 await conn.wait_closed()
                 logger.info("Closed connection to %s", _safe_log_value(server_name))
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - close_all() must drain every remaining connection; one failure cannot abort the loop
                 logger.warning(
                     "Error closing connection to %s: %s",
                     _safe_log_value(server_name),
@@ -2736,7 +2736,7 @@ class SSHManager:
                                     server_name,
                                     now - current_last_used,
                                 )
-                            except Exception as e:
+                            except Exception as e:  # noqa: BLE001 - evicting one connection must not kill the eviction loop
                                 logger.warning(
                                     "Error evicting connection to %s: %s",
                                     _safe_log_value(server_name),
@@ -2764,7 +2764,7 @@ class SSHManager:
 
         except asyncio.CancelledError:
             logger.info("Connection eviction loop cancelled")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - eviction loop top level: must reset _running so the loop can restart, never die silently
             logger.error("Unexpected error in eviction loop: %s", _safe_exc(e))
             # R5 finding #6: reset _running so _start_eviction_loop() can
             # restart the loop on the next _get_connection() call. Without
