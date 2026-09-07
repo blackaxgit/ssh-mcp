@@ -11,6 +11,7 @@ import itertools
 import os
 import time
 
+import asyncssh
 import pytest
 from hypothesis import assume, given
 from hypothesis import strategies as st
@@ -2602,6 +2603,10 @@ class TestExecResultErrorRedaction:
     sites were the inconsistent ones.
     """
 
+    # One credential-bearing message for both single-host arms; kept short
+    # enough that the parametrize list below stays one line per case.
+    _CRED_ERROR = "auth failed for https://deploy:hunter2@bastion.example.com"
+
     def _make_registry(self) -> ServerRegistry:
         import tempfile
 
@@ -2617,33 +2622,28 @@ groups = ["t"]
         f.close()
         return ServerRegistry(f.name)
 
-    async def test_ssh_error_result_redacts_credentials(self) -> None:
-        """``except (DisconnectError, PermissionDenied, OSError)`` arm of
-        ``_execute_impl`` (site 1). Driven via ``_get_connection`` raising,
-        per the existing injection shape (see ``TestDryRun``)."""
-        import asyncssh
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            asyncssh.DisconnectError(2, _CRED_ERROR),
+            RuntimeError(_CRED_ERROR),
+        ],
+        ids=["site1_disconnect_permission_oserror", "site2_catch_all"],
+    )
+    async def test_single_host_error_result_redacts_credentials(
+        self, exc: Exception
+    ) -> None:
+        """Both single-host arms of ``_execute_impl``: the
+        ``except (DisconnectError, PermissionDenied, OSError)`` tuple
+        (site 1, reached by ``DisconnectError``) and the ``except
+        Exception`` catch-all (site 2, reached by ``RuntimeError``, which
+        is not a member of that tuple). Same injection shape for both —
+        ``_get_connection`` raising, per ``TestDryRun`` — so only the
+        exception varies.
+        """
         from unittest.mock import AsyncMock, patch
 
         manager = SSHManager(self._make_registry(), Settings())
-        exc = asyncssh.DisconnectError(
-            2, "auth failed for https://deploy:hunter2@bastion.example.com"
-        )
-
-        with patch.object(manager, "_get_connection", AsyncMock(side_effect=exc)):
-            result = await manager.execute("web1", "true")
-
-        assert result.error is not None
-        assert "hunter2" not in result.error, f"Leaked: {result.error!r}"
-        assert _REDACTION_PLACEHOLDER in result.error
-
-    async def test_unexpected_error_result_redacts_credentials(self) -> None:
-        """``except Exception`` arm of ``_execute_impl`` (site 2) — same
-        shape as site 1 but for the catch-all handler, driven by a plain
-        ``RuntimeError`` rather than an asyncssh-specific exception."""
-        from unittest.mock import AsyncMock, patch
-
-        manager = SSHManager(self._make_registry(), Settings())
-        exc = RuntimeError("auth failed for https://deploy:hunter2@bastion.example.com")
 
         with patch.object(manager, "_get_connection", AsyncMock(side_effect=exc)):
             result = await manager.execute("web1", "true")

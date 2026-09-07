@@ -19,11 +19,26 @@ from starlette.testclient import TestClient
 import ssh_mcp.server as server_module
 from ssh_mcp.server import (
     _assert_valid_bearer_token,
-    _build_http_app,
     _make_bearer_auth_middleware,
     _run_http,
     main,
 )
+
+
+def _loopback_app(token: str | None):
+    """Build the HTTP app as it is built for a default loopback bind.
+
+    ``_build_http_app`` deliberately has no defaults for ``stateless`` or
+    ``transport_security`` (a ``None`` transport_security would disable
+    DNS-rebinding protection), so every caller must spell them out. The
+    tests below vary only ``token``; transport-security behaviour is
+    covered separately against ``_build_transport_security`` directly.
+    """
+    return server_module._build_http_app(
+        token=token,
+        stateless=False,
+        transport_security=server_module._build_transport_security(None, "127.0.0.1"),
+    )
 
 
 def _make_dummy_asgi_app():
@@ -271,14 +286,7 @@ class TestGracefulShutdown:
         original_ssh = server_module._ssh
         server_module._ssh = mock_ssh
         try:
-            app = server_module._build_http_app(
-                token=None,
-                host="127.0.0.1",
-                stateless=False,
-                transport_security=server_module._build_transport_security(
-                    None, "127.0.0.1"
-                ),
-            )
+            app = _loopback_app(None)
             # Starlette's TestClient drives the lifespan via context manager
             with TestClient(app):
                 pass  # entering/exiting the context runs startup/shutdown
@@ -294,14 +302,7 @@ class TestGracefulShutdown:
         original_ssh = server_module._ssh
         server_module._ssh = None
         try:
-            app = server_module._build_http_app(
-                token=None,
-                host="127.0.0.1",
-                stateless=False,
-                transport_security=server_module._build_transport_security(
-                    None, "127.0.0.1"
-                ),
-            )
+            app = _loopback_app(None)
             # Simply entering and exiting the lifespan should not raise
             with TestClient(app):
                 pass
@@ -316,14 +317,7 @@ class TestBuildHttpApp:
         """When token is None, no auth wrapper is added."""
         from starlette.applications import Starlette
 
-        app = _build_http_app(
-            token=None,
-            host="127.0.0.1",
-            stateless=False,
-            transport_security=server_module._build_transport_security(
-                None, "127.0.0.1"
-            ),
-        )
+        app = _loopback_app(None)
         # The raw MCPServer app is a Starlette instance; the wrapper one
         # is also a Starlette, so identity check isn't enough — verify
         # there is no BearerAuth middleware in the stack.
@@ -337,14 +331,7 @@ class TestBuildHttpApp:
 
     def test_with_token_wraps_app(self) -> None:
         """When token is set, middleware is registered on the wrapper."""
-        app = _build_http_app(
-            token="secret-xyz-abcdefghij",
-            host="127.0.0.1",
-            stateless=False,
-            transport_security=server_module._build_transport_security(
-                None, "127.0.0.1"
-            ),
-        )
+        app = _loopback_app("secret-xyz-abcdefghij")
         # The wrapper must expose user_middleware with at least one entry
         assert hasattr(app, "user_middleware")
         assert len(app.user_middleware) > 0
@@ -360,14 +347,7 @@ class TestBuildHttpApp:
         MCP session manager (which would otherwise raise a different
         error due to its own lifespan requirement).
         """
-        app = _build_http_app(
-            token="middleware-integration-test-token",
-            host="127.0.0.1",
-            stateless=False,
-            transport_security=server_module._build_transport_security(
-                None, "127.0.0.1"
-            ),
-        )
+        app = _loopback_app("middleware-integration-test-token")
         client = TestClient(app)
         # No Authorization header → middleware must 401 before the MCP
         # session manager is reached. If the middleware was bypassed,
@@ -400,14 +380,7 @@ class TestBuildHttpApp:
         ``token`` branch alone is sufficient to catch the regression.
         """
         token = "auth-reaches-session-manager-ok"
-        app = _build_http_app(
-            token=token,
-            host="127.0.0.1",
-            stateless=False,
-            transport_security=server_module._build_transport_security(
-                None, "127.0.0.1"
-            ),
-        )
+        app = _loopback_app(token)
         with TestClient(app) as client:
             resp = client.get(
                 "/mcp",
@@ -938,12 +911,7 @@ class TestLifespanAssertionFires:
 
         with patch.object(srv.mcp, "streamable_http_app", return_value=fake_inner):
             with pytest.raises(RuntimeError, match="lifespan_context"):
-                srv._build_http_app(
-                    token=None,
-                    host="127.0.0.1",
-                    stateless=False,
-                    transport_security=srv._build_transport_security(None, "127.0.0.1"),
-                )
+                _loopback_app(None)
 
 
 # ---------------------------------------------------------------------------
@@ -964,9 +932,6 @@ class TestDnsRebindingAlwaysEnabled:
         required ``transport_security`` kwarg on ``_build_http_app``.)
         """
         ts = server_module._build_transport_security(None, "127.0.0.1")
-        assert ts is not None, (
-            "transport_security must be set even without ALLOWED_HOSTS"
-        )
         assert ts.enable_dns_rebinding_protection is True
 
     def test_dns_rebinding_includes_localhost_defaults(self) -> None:

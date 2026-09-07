@@ -654,7 +654,6 @@ _MIN_TOKEN_LENGTH: int = 16
 def _build_http_app(
     token: str | None,
     *,
-    host: str,
     stateless: bool,
     transport_security: TransportSecuritySettings,
 ) -> Any:
@@ -679,13 +678,14 @@ def _build_http_app(
     outermost lifespan ran, so the MCPServer task group was never
     initialized. This single-app approach fixes that regression.
 
-    ``host``, ``stateless`` and ``transport_security`` have no defaults
-    on purpose: the SDK only auto-enables DNS-rebinding protection for a
-    loopback ``host`` when ``transport_security is None``
-    (mcp/server/lowlevel/server.py:735), and a bare ``None`` there
-    constructs a settings object with protection OFF
-    (mcp/server/transport_security.py:48). A default here would make
-    that fail-open path reachable by omission.
+    ``stateless`` and ``transport_security`` have no defaults on purpose:
+    a bare ``None`` transport_security constructs a settings object with
+    DNS-rebinding protection OFF (mcp/server/transport_security.py:48),
+    so a default here would make that fail-open path reachable by
+    omission. Note there is deliberately no ``host`` parameter: the SDK
+    consults ``host`` only to auto-enable loopback protection when
+    ``transport_security is None`` (mcp/server/lowlevel/server.py:735),
+    which this signature forbids, so forwarding it had no effect.
 
     Returns a ``Starlette`` instance ready to hand to ``uvicorn.run``.
     """
@@ -695,7 +695,6 @@ def _build_http_app(
     from starlette.routing import Mount
 
     inner_app = mcp.streamable_http_app(
-        host=host,
         stateless_http=stateless,
         transport_security=transport_security,
     )
@@ -890,7 +889,7 @@ def _build_transport_security(
     ``os.environ.get("SSH_MCP_HTTP_ALLOWED_HOSTS")`` value: ``None`` means
     unset, ``""`` means set-but-empty, and a whitespace-only string is a
     third, separately-refused case. This function does the stripping, so
-    it needs no second parameter.
+    callers hand it the raw value.
 
     Pure: no globals read or written, so the refusal set is unit-testable.
     In v1 this mutated ``mcp.settings.transport_security``; v2 removed
@@ -900,11 +899,10 @@ def _build_transport_security(
 
     base_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
     extra_hosts: list[str] = []
-    if (
-        raw_allowed_hosts is not None
-        and raw_allowed_hosts != ""
-        and not allowed_hosts_env
-    ):
+    # Truthy covers exactly "neither None nor empty", the two values that
+    # both mean "unset"; a non-empty value that strips to nothing is the
+    # third, refused case.
+    if raw_allowed_hosts and not allowed_hosts_env:
         # Explicitly set but whitespace-only after stripping. Distinct from
         # "unset" (which falls through to the localhost-only default below)
         # — a whitespace value almost always means a broken env-file
@@ -1095,11 +1093,12 @@ def _run_http() -> None:
 
     # v2 removed the mcp.settings.host / .port / .stateless_http /
     # .transport_security fields entirely (assigning them now raises
-    # ValueError); host/stateless are threaded through
-    # _build_http_app's streamable_http_app() call instead, and port is
-    # only ever needed by uvicorn.run() below. transport_security is
-    # built by the pure, unit-testable _build_transport_security so no
-    # module global is mutated.
+    # ValueError); stateless is threaded through _build_http_app's
+    # streamable_http_app() call instead, and host and port are only
+    # ever needed by _build_transport_security's allow-list entry and
+    # uvicorn.run() below. transport_security is built by the pure,
+    # unit-testable _build_transport_security so no module global is
+    # mutated.
     transport_security = _build_transport_security(_allowed_hosts_raw, host)
 
     effective_auth = "bearer" if token else "none"
@@ -1134,7 +1133,7 @@ def _run_http() -> None:
             )
 
     app = _build_http_app(
-        token, host=host, stateless=stateless, transport_security=transport_security
+        token, stateless=stateless, transport_security=transport_security
     )
 
     # Tuning knobs for uvicorn — see `_parse_http_tuning` for defaults
