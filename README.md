@@ -44,7 +44,7 @@ Requires Python 3.11+. Install [uv](https://docs.astral.sh/uv/getting-started/in
 
 #### Docker
 
-A prebuilt image is published to GitHub Container Registry:
+A prebuilt image is published to GitHub Container Registry for **`linux/amd64` and `linux/arm64`** (0.8.1 and newer — 0.8.0 and earlier are amd64-only and will not run on Apple Silicon or AWS Graviton):
 
 ```bash
 docker pull ghcr.io/blackaxgit/ssh-mcp:latest
@@ -387,10 +387,11 @@ Command strings longer than `max_command_bytes` (default 65536 encoded UTF-8 byt
 - `chmod 777 /` — flag before *or* after the mode (`chmod -R 777 /`, `chmod 777 -R /`)
 - Fork bombs (spaced and adjacent variants)
 - Payload-execution wrappers: `base64 -d | bash|sh|zsh|python|perl|ruby`, `eval "…"`, `python|python3|perl|ruby -c`, `bash -c`
+- Host-availability destruction, matched only in **command position** (string start, after a shell separator, or after `sudo`/`doas`): `reboot`, `poweroff`, `halt`, `shutdown`, `init 0|6`, `telinit 0|6`, `systemctl reboot|poweroff|halt|kexec`, `iptables|ip6tables -F|--flush`, `nft flush ruleset`, `userdel`, `passwd -l`
 
-> **Note the last bullet — it catches ordinary commands too.** `bash -c '…'`, `python3 -c '…'` and `eval …` are blocked by default even when entirely benign. Wrap them differently (a script file, a heredoc) or pass `force=true` for an audited call.
+> **Note the payload-execution bullet — it catches ordinary commands too.** `bash -c '…'`, `python3 -c '…'` and `eval …` are blocked by default even when entirely benign. Wrap them differently (a script file, a heredoc) or pass `force=true` for an audited call. The host-availability bullet is anchored the other way on purpose, so read-only diagnostics like `last reboot` or `grep reboot /var/log/messages` are *not* blocked — the cost of that anchor is that `sudo -n reboot` slips past it.
 
-ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normalized to spaces before matching, so `rm\x00-rf /` is caught just like `rm -rf /`. The regex is fuzz-tested with Hypothesis on every CI run.
+ASCII control characters (null bytes, `\x01..\x1f`, `\x7f`) are normalized to spaces before matching, so `rm\x00-rf /` is caught just like `rm -rf /`. Line breaks are matched **both** ways — as whitespace and as the statement separator they are — because `rm -rf\n/` needs the first reading and a second line `reboot` needs the second, where it sits in command position rather than reading as an argument to line one. The regexes are fuzz-tested with Hypothesis on every CI run.
 
 > **This is a TRIPWIRE, not a security boundary.** The regex catches obvious accidents and shortcut destructive commands. It does NOT defend against a motivated attacker:
 > - The base64/`eval`/`-c` wrappers above are matched *literally*; any rewrite the regex does not spell out (a different decoder, a temp file, `sh <<'EOF'`) gets through
@@ -405,6 +406,8 @@ ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normal
 **Credential redaction in logs.** ssh-mcp automatically redacts known credential patterns (MySQL `-p<pass>`, `--password=`, `PGPASSWORD=`, `Authorization: Bearer`, URL basic-auth `user:pass@host`, plus any env var ending in `_PASSWORD`, `_SECRET`, `_TOKEN`, `_KEY`, `_CREDENTIAL`, `_PWD`) from audit logs and OTel span attributes before they reach stderr or trace backends. The asyncssh internal channel logger is suppressed to WARNING level so it never emits the raw command.
 
 > **Known limitation: command OUTPUT is NOT redacted.** If you run `cat /etc/mysql/my.cnf`, `env | grep PASSWORD`, or `kubectl get secret X -o yaml`, the stdout/stderr returned to the MCP client will contain plaintext secrets. The redaction pipeline only filters the COMMAND string (what you asked to run), not the OUTPUT (what it printed). Avoid running commands that print secrets via ssh-mcp — pass credentials through env vars, Docker/K8s secrets, or dedicated config files instead.
+
+> **`{REDACTED+ELIDED}` means more than a secret was cut.** Redaction replaces from the credential marker to the end of the whitespace-delimited token, so a shell separator inside that token is consumed with it — before 0.8.1, `echo --password=X;reboot` was logged as `echo --password={REDACTED}` and the chained command did not appear in the record at all, though it ran. The secret is still never partially printed; the placeholder changes instead, so the log does not read as a faithful transcript. It errs toward flagging, so a password that merely *contains* `;`, `|`, `&`, a backtick or `$(` is flagged too.
 
 **Local path confinement (new in 0.6.0; versions ≤ 0.5.6 are affected by the flaw it fixes — see [CHANGELOG.md](https://github.com/blackaxgit/ssh-mcp/blob/main/CHANGELOG.md)).** SFTP `upload_file` and `download_file` no longer accept arbitrary absolute local paths. Every local path is **relative to a configured transfer root** and is resolved one component at a time beneath it, refusing a symbolic link at *any* component:
 

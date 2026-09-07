@@ -24,7 +24,7 @@ import shlex
 import stat
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from typing import Any, TypeVar
 
 import asyncssh
@@ -48,8 +48,16 @@ try:
     from opentelemetry import trace as _otel_trace
 
     _ssh_tracer: Any = _otel_trace.get_tracer("ssh_mcp.ssh")
+    # Bound in both branches, same reason as server.py: the error paths
+    # below are guarded by `_ssh_tracer is not None`, which no checker can
+    # correlate with the import, and rebinding `_otel_trace` would shadow
+    # an imported name.
+    _otel_status: Any = _otel_trace.Status
+    _otel_error_code: Any = _otel_trace.StatusCode.ERROR
 except ImportError:  # pragma: no cover - exercised by env without extras
     _ssh_tracer = None
+    _otel_status = None
+    _otel_error_code = None
 
 # ---------------------------------------------------------------------------
 # Tunable constants — promoted from inline literals for discoverability.
@@ -153,6 +161,65 @@ def _safe_exc(e: BaseException) -> str:
 # ---------------------------------------------------------------------------
 
 _REDACTION_PLACEHOLDER: str = "{REDACTED}"
+
+# Distinct placeholder for the case where redaction consumed MORE than a
+# credential value.
+#
+# Redaction replaces from the credential marker to the end of the
+# whitespace-delimited token, which is what makes leaking a partially
+# quoted secret impossible. Shell separators are not whitespace, so
+# ``--password=X;touch /tmp/f`` redacted to the plain placeholder reads
+# ``--password={REDACTED} /tmp/f`` — the ``touch`` verb is gone from the
+# audit record, and ``--password=X;reboot`` loses ``reboot`` entirely
+# while the command still RUNS. Reproduced end-to-end against a live host
+# on 2026-09-07: the elided ``touch`` created its file.
+#
+# Narrowing the replacement to the separator was rejected: a secret
+# containing ``;`` would then have its tail printed. So the value stays
+# fully hidden and the RECORD stops being silent instead — an auditor
+# reading ``{REDACTED+ELIDED}`` knows the token carried something beyond
+# the secret and that the log is not a faithful transcript. This is a
+# tripwire like the rest of this module: it cannot say WHAT was elided,
+# only that something was.
+_REDACTION_ELIDED_PLACEHOLDER: str = "{REDACTED+ELIDED}"
+
+# Shell separators that can chain a second command onto a credential
+# token. ``$(`` is listed explicitly because ``(`` alone is common in
+# legitimate quoted values. Newline and CR are deliberately absent: both
+# callers operate on tokens produced by ``_split_ws_preserving``, so
+# whitespace has already split the text and neither can appear inside a
+# token being elided — listing them would be an unreachable branch in a
+# security-relevant predicate.
+_SHELL_SEPARATOR_RE = re.compile(r"[;|&`]|\$\(")
+
+
+def _placeholder_for(elided: str) -> str:
+    """Pick the placeholder for text about to be replaced wholesale.
+
+    The pipeline runs several rules over the SAME string, so a later rule
+    can be handed text an earlier one already redacted. Found by CI's
+    200-example Hypothesis profile 2026-09-07: rule 3a flagged
+    ``--…-token=x&`` correctly and then ``_redact_long_flags`` re-matched
+    the same flag and replaced ``{REDACTED+ELIDED}`` — which holds no
+    separator — with the plain placeholder, silently DOWNGRADING the
+    record. A marker that a later rule can erase is worse than no marker,
+    so an existing one is preserved. The plain placeholder is not sticky:
+    it carries no claim to lose.
+
+    Args:
+        elided: The exact text redaction is discarding.
+
+    Returns:
+        ``{REDACTED+ELIDED}`` if that text could chain another command, or
+        already records that something was elided; otherwise the plain
+        ``{REDACTED}``.
+    """
+    if _REDACTION_ELIDED_PLACEHOLDER in elided:
+        return _REDACTION_ELIDED_PLACEHOLDER
+    if _SHELL_SEPARATOR_RE.search(elided):
+        return _REDACTION_ELIDED_PLACEHOLDER
+    return _REDACTION_PLACEHOLDER
+
 
 # Environment variables that are known credential sinks. Matched
 # case-insensitively as ``<NAME>=<value>`` substrings.
@@ -415,7 +482,7 @@ def _redact_credential_in_token(token: str) -> str:
     for match in _LONG_FLAG_EQ_RE.finditer(token):
         name = match.group()[2:-1]  # strip leading "--" and trailing "="
         if _long_flag_is_credential(name):
-            return token[: match.end()] + _REDACTION_PLACEHOLDER
+            return token[: match.end()] + _placeholder_for(token[match.end() :])
     return token
 
 
@@ -491,7 +558,7 @@ def _redact_long_flags(text: str) -> str:
             # redacted; only a genuine "--"-prefixed long flag is
             # treated as this flag being boolean/valueless.
             if j < n and not chunks[j][1] and not chunks[j][0].startswith("--"):
-                out[j] = _REDACTION_PLACEHOLDER
+                out[j] = _placeholder_for(chunks[j][0])
                 i = j + 1
                 continue
         i += 1
@@ -523,6 +590,19 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
     return [
         # 1. Basic auth credentials embedded in a URL:
         #    ``scheme://user:password@host``. See _redact_url_basic_auth.
+        #
+        # Keeps the PLAIN placeholder: the replacement is bounded on both
+        # sides (``:`` … ``@``), so nothing beyond the secret is consumed
+        # and there is nothing to flag. Same for rule 4 below, whose value
+        # is delimited by its closing quote. Every OTHER rule here
+        # replaces to the end of a whitespace-delimited run and therefore
+        # goes through ``_placeholder_for`` — a rule that swallows
+        # ``;reboot`` must say so. Reported by CI's 200-example Hypothesis
+        # profile 2026-09-07: `--…-password=x&` was flagged while
+        # `--…-token=x&` was not, because rule 3a's enumerated env names
+        # matched the second one first. An inconsistent marker is worse
+        # than none, since a reader would take its absence as proof that
+        # nothing was cut.
         _redact_url_basic_auth,
         # 2. HTTP ``Authorization:`` header with Bearer/Basic/Digest/Token.
         _regex_step(
@@ -530,7 +610,7 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
                 r"(Authorization:\s*(?:Bearer|Basic|Digest|Token)\s+)(\S+)",
                 re.IGNORECASE,
             ),
-            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}{_placeholder_for(m.group(2))}",
         ),
         # 3a. Known credential env vars (enumerated list, exact match).
         _regex_step(
@@ -538,7 +618,7 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
                 r"\b(" + env_alt + r")=(\S+)",
                 re.IGNORECASE,
             ),
-            lambda m: f"{m.group(1)}={_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}={_placeholder_for(m.group(2))}",
         ),
         # 3b. (v0.4.3 G2) Generic env var SUFFIX patterns:
         #     ``*_PASSWORD=``, ``*_SECRET=``, ``*_TOKEN=``, ``*_KEY=``,
@@ -554,9 +634,10 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
                 r"\b(\w+(?:_PASSWORD|_SECRET|_TOKEN|_KEY|_CREDENTIAL|_PWD))=(\S+)",
                 re.IGNORECASE,
             ),
-            lambda m: f"{m.group(1)}={_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}={_placeholder_for(m.group(2))}",
         ),
-        # 4. MySQL/MariaDB short password flag QUOTED form.
+        # 4. MySQL/MariaDB short password flag QUOTED form. Plain
+        #    placeholder: the closing quote bounds the replacement.
         _regex_step(
             re.compile(r"(?<![\w-])(-p)(['\"])([^'\"]*)(\2)"),
             lambda m: f"{m.group(1)}{m.group(2)}{_REDACTION_PLACEHOLDER}{m.group(4)}",
@@ -564,13 +645,13 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
         # 5. MySQL/MariaDB short password flag UNQUOTED form (≥3 chars).
         _regex_step(
             re.compile(r"(?<![\w-])(-p)(\S{3,})"),
-            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}{_placeholder_for(m.group(2))}",
         ),
         # 6. (v0.4.3 G4) ``curl -u user:password`` basic auth flag.
         #    Redacts the password portion after the colon.
         _regex_step(
             re.compile(r"(?<!\w)(-u\s+\S+:)(\S+)"),
-            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}{_placeholder_for(m.group(2))}",
         ),
         # 7. (v0.4.3 G4) ``sshpass -p PASSWORD`` (space-separated).
         #    sshpass uses ``-p`` with a SPACE before the password, unlike
@@ -578,7 +659,7 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
         #    disambiguate from the MySQL rule.
         _regex_step(
             re.compile(r"(sshpass\s+-p\s+)(\S+)", re.IGNORECASE),
-            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}{_placeholder_for(m.group(2))}",
         ),
         # 8/9. Long flags with ``=`` or whitespace separator. See
         #      _redact_long_flags — merges the old rules 8 and 9 into one
@@ -632,6 +713,22 @@ def _redact_secrets(value: Any) -> Any:
 # fork-bomb pattern below matches no letters, so it needs no flag). The
 # rm-flag patterns use lookaheads instead of ordered character classes so
 # `-rfv`, `-vfr`, `-rfvi` (any order with extra flags) all match.
+
+# Prefix asserting a word sits where a COMMAND goes, not where an
+# argument does: string start, after a shell separator (``;``, ``&&``,
+# ``|``, newline), or after a privilege wrapper. Used by the
+# host-availability entries below, whose verbs — unlike ``mkfs`` or
+# ``dd if=`` — are ordinary English words that appear constantly as
+# arguments to harmless commands.
+#
+# Deliberately not a shell parser. It cannot see through quoting,
+# ``xargs``, or a backslash-newline continuation, and it is not meant to;
+# see the tripwire caveat above.
+# Newline is absent because it never reaches a pattern: both renderings
+# in ``_is_dangerous_command`` rewrite line breaks first — to a space, or
+# to the ``;`` this class already covers.
+_CMD_START = r"(?:^|[;&|]\s*|\b(?:sudo|doas)\s+)"
+
 _DANGEROUS_PATTERNS = [
     # Filesystem root wipe via rm -rf — catches `/`, `~`, `$HOME`, `$USER`
     # forms. Flag cluster must contain BOTH `r` and `f` anywhere, plus
@@ -706,6 +803,38 @@ _DANGEROUS_PATTERNS = [
     re.compile(r"\beval\s+[\"'\$\(]", re.IGNORECASE),
     re.compile(r"\b(python|python3|perl|ruby)\s+-(c|e)\s+", re.IGNORECASE),
     re.compile(r"\bbash\s+-c\s+", re.IGNORECASE),
+    # Host availability. Added 2026-09-07 after end-to-end testing against
+    # a live host showed this table covered filesystem and device
+    # destruction thoroughly and host availability not at all: `reboot`,
+    # `poweroff`, `init 0`, `iptables -F` and `userdel -r` all reached the
+    # host, while a routine `rm -rf /tmp/build-cache` was blocked. That is
+    # an inverted priority for a tool whose `execute_on_group` fans one
+    # command across a fleet — a single `reboot` takes the whole group
+    # down, and `iptables -F` on a host reached through those rules is
+    # unrecoverable without out-of-band console access.
+    #
+    # Anchored on COMMAND POSITION (``_CMD_START``), not on the bare word.
+    # A bare `\breboot\b` would block `last reboot`, `grep reboot
+    # /var/log/messages` and `journalctl | grep -i poweroff` — common
+    # read-only diagnostics, and blocking those is how a tripwire trains
+    # operators to route around it. Cost of the anchor: `sudo -n reboot`
+    # is not matched, because the flag breaks the prefix. Accepted — it is
+    # a tripwire, and the same class of gap is already documented for the
+    # rest of the table (`$(printf 'reboo\\164')` defeats every entry).
+    re.compile(_CMD_START + r"(?:reboot|poweroff|halt|shutdown)\b", re.IGNORECASE),
+    re.compile(_CMD_START + r"(?:tel)?init\s+[06]\b", re.IGNORECASE),
+    re.compile(
+        _CMD_START + r"systemctl\s+(?:\S+\s+)*?(?:reboot|poweroff|halt|kexec)\b",
+        re.IGNORECASE,
+    ),
+    # Firewall flush — severs access to the host it runs on. Case-sensitive
+    # on purpose: `-F` flushes, `-f` does not exist for iptables, and
+    # IGNORECASE would conflate them.
+    re.compile(_CMD_START + r"(?:ip6?tables)\b(?:\s+\S+)*?\s+(?:-F|--flush)\b"),
+    re.compile(_CMD_START + r"nft\s+flush\s+ruleset\b", re.IGNORECASE),
+    # Account destruction — locks the operator out of the host.
+    re.compile(_CMD_START + r"userdel\b", re.IGNORECASE),
+    re.compile(_CMD_START + r"passwd\s+(?:-l|--lock)\b", re.IGNORECASE),
 ]
 
 # Sensitive paths that should be blocked in SFTP operations.
@@ -838,6 +967,14 @@ def _is_dangerous_command(command: str) -> bool:
     remain a known bypass, per the tripwire caveat above
     ``_DANGEROUS_PATTERNS``.
 
+    Matching runs over TWO renderings of the command, because collapsing a
+    newline to a space is right for one class of pattern and wrong for the
+    other. ``rm -rf\\n/`` only matches while the newline reads as
+    whitespace; a second line ``reboot`` only matches while it reads as a
+    command position rather than as an argument to the first line. Added
+    2026-09-07 with the host-availability entries: with the space
+    rendering alone, ``echo hi\\nreboot`` was measurably not caught.
+
     Args:
         command: Command string to check
 
@@ -848,9 +985,15 @@ def _is_dangerous_command(command: str) -> bool:
     # space before matching.  Deletion would collapse adjacent tokens (e.g.
     # "rm\x00-rf" → "rm-rf") and miss the pattern; replacement preserves
     # token boundaries while removing the bypass character.
-    sanitized = re.sub(r"[\x00-\x1f\x7f]", " ", command)
+    as_whitespace = re.sub(r"[\x00-\x1f\x7f]", " ", command)
+    # Same sanitization, but line breaks become the shell separator they
+    # actually are, so ``_CMD_START`` still sees a command position.
+    as_statements = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", command)
+    as_statements = re.sub(r"[\n\r]+", ";", as_statements)
     for pattern in _DANGEROUS_PATTERNS:
-        if pattern.search(sanitized):
+        if pattern.search(as_whitespace) or (
+            as_statements != as_whitespace and pattern.search(as_statements)
+        ):
             return True
     return False
 
@@ -1246,7 +1389,7 @@ class SSHManager:
         # Eviction loop starts on first connection (deferred if no event loop)
 
     @contextlib.asynccontextmanager
-    async def _transfer_root(self) -> AsyncIterator[int]:
+    async def _transfer_root(self) -> AsyncGenerator[int]:
         """Yield the pinned transfer-root fd, safe against concurrent shutdown.
 
         See the ``__init__`` comment (Defect 5) for the races this closes.
@@ -1313,9 +1456,20 @@ class SSHManager:
                         leaked_fd = await _await_shielded_until_done(ensure_task)
                         os.close(leaked_fd)
                     raise
+            fd = self._transfer_root_fd
+            if fd is None:  # pragma: no cover - the block above just set it
+                raise RuntimeError(
+                    "transfer root fd is unset after setup — this should be "
+                    "unreachable; refusing to yield an invalid descriptor"
+                )
             self._transfer_root_refcount += 1
         try:
-            yield self._transfer_root_fd
+            # The local, not the attribute: `close_all()` may clear the
+            # attribute while this transfer holds a refcount, and the fd is
+            # kept open until the refcount drops. Reading the attribute here
+            # would also reintroduce an `int | None` that no checker can
+            # narrow across the lock re-entry.
+            yield fd
         finally:
             async with self._transfer_root_cond:
                 self._transfer_root_refcount -= 1
@@ -1382,7 +1536,7 @@ class SSHManager:
                 # Truncate error messages into spans — some operators ingest
                 # traces into cost-sensitive backends.
                 span.set_attribute("ssh.error", _redact_secrets(result.error[:200]))
-                span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
+                span.set_status(_otel_status(_otel_error_code))
             return result
 
     async def _execute_impl(
@@ -1979,7 +2133,7 @@ class SSHManager:
                 return await self._upload_impl(server_name, local_path, remote_path)
             except Exception as e:
                 span.set_attribute("ssh.error_type", type(e).__name__)
-                span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
+                span.set_status(_otel_status(_otel_error_code))
                 raise
 
     async def _upload_impl(
@@ -2041,8 +2195,29 @@ class SSHManager:
                 # open_beneath does blocking syscalls (openat per
                 # component) — off the event loop thread, same as the
                 # read loop below.
+                #
+                # O_NONBLOCK is load-bearing, not defensive: without it an
+                # O_RDONLY open of a fifo beneath transfer_root blocks
+                # forever waiting for a writer, so the S_ISREG refusal
+                # immediately below is UNREACHABLE for exactly the file
+                # type it exists to reject. The open runs in a worker
+                # thread, so the event loop survives — but the thread does
+                # not: measured 2026-09-07, 16 concurrent fifo uploads
+                # exhaust the default executor (min(32, cpu+4)) and every
+                # later to_thread call, i.e. ALL SFTP in the process,
+                # stalls until restart while `execute` keeps working.
+                # This is the same defect 0.8.0 fixed for
+                # SSH_MCP_HTTP_TOKEN_FILE (server.py::_read_token_file) and
+                # missed here. Referenced bare rather than via getattr
+                # because this subsystem is POSIX-only by design:
+                # _transfer_root() awaits paths.py::ensure_root first,
+                # which fails closed without O_NOFOLLOW/O_DIRECTORY, so
+                # this line is unreachable on a platform lacking the
+                # constant. O_NONBLOCK is a no-op on a regular file and is
+                # NOT a liveness guarantee — a regular file on a hostile
+                # FUSE mount can still block the read.
                 local_fd = await asyncio.to_thread(
-                    open_beneath, root_fd, local_path, os.O_RDONLY
+                    open_beneath, root_fd, local_path, os.O_RDONLY | os.O_NONBLOCK
                 )
 
                 # fstat the descriptor we are ABOUT TO READ, not a path —
@@ -2193,7 +2368,7 @@ class SSHManager:
                 return await self._download_impl(server_name, remote_path, local_path)
             except Exception as e:
                 span.set_attribute("ssh.error_type", type(e).__name__)
-                span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
+                span.set_status(_otel_status(_otel_error_code))
                 raise
 
     async def _download_impl(
@@ -2275,11 +2450,20 @@ class SSHManager:
                             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                         )
                     except FileExistsError as e:
+                        # A SYMLINK at this name lands here too, and that is
+                        # worth naming: `open_beneath` adds O_NOFOLLOW, so
+                        # `O_CREAT|O_EXCL` on a symlink reports EEXIST rather
+                        # than following it. Without the second sentence the
+                        # message reads as "a regular file is in the way",
+                        # and an operator can spend a while wondering why
+                        # `ls` shows a link pointing somewhere writable.
                         raise ValueError(
                             f"local destination already exists: {local_path!r} "
                             "under transfer_root. Downloads never overwrite an "
                             "existing file — remove or rename it first, or "
-                            "choose a different destination name."
+                            "choose a different destination name. A symlink at "
+                            "this name reports the same error and is refused "
+                            "rather than followed, whatever it points at."
                         ) from e
                     local_file_created = True
                     # Capture identity while local_fd is still ours (before

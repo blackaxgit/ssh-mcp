@@ -22,11 +22,13 @@ from ssh_mcp.paths import PathConfinementError
 from ssh_mcp.ssh import (
     _DANGEROUS_PATTERNS,
     _LONG_FLAG_KEYWORDS,
+    _REDACTION_ELIDED_PLACEHOLDER,
     _REDACTION_PLACEHOLDER,
     _SENSITIVE_PATHS,
     SSHManager,
     _is_dangerous_command,
     _make_connection_id,
+    _placeholder_for,
     _redact_secrets,
     _safe_exc,
     _unlink_beneath,
@@ -1302,6 +1304,100 @@ groups = ["test"]
         assert manager._connection_ids == {}
 
 
+class TestDangerousCommandHostAvailability:
+    """Taking the host down is as destructive as wiping its disk.
+
+    Found by end-to-end testing against a live host on 2026-09-07: the
+    table covered filesystem and device destruction thoroughly and host
+    availability not at all. ``reboot``, ``poweroff``, ``init 0``,
+    ``iptables -F`` and ``userdel -r`` all reached the host, while a
+    routine ``rm -rf /tmp/build-cache`` was blocked — an inverted priority
+    for a tool whose ``execute_on_group`` fans one command across a fleet.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "reboot",
+            "poweroff",
+            "halt",
+            "shutdown -h now",
+            "sudo reboot",
+            "doas poweroff",
+            "uptime; reboot",
+            "true && reboot",
+            "init 0",
+            "init 6",
+            "telinit 6",
+            "systemctl poweroff",
+            "systemctl --force reboot",
+            "iptables -F",
+            "ip6tables --flush",
+            "sudo iptables -t nat -F",
+            "nft flush ruleset",
+            "userdel -r tester",
+            "passwd -l root",
+        ],
+    )
+    def test_availability_destruction_is_blocked(self, command: str) -> None:
+        assert _is_dangerous_command(command), (
+            f"{command!r} reached the host — it takes the host, or access to it, away"
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Diagnostics. Blocking these is how a tripwire teaches
+            # operators to route around it, so a bare `\\breboot\\b` was
+            # rejected in favour of a command-position anchor.
+            "last reboot",
+            "grep reboot /var/log/messages",
+            "journalctl | grep -i poweroff",
+            "who -b",
+            "uptime",
+            "echo rebooted_at",
+            # systemctl verbs that are not availability destruction.
+            "systemctl status nginx",
+            "systemctl restart nginx",
+            # iptables read-only, and the lowercase flag that does not
+            # flush — proving the pattern is case-sensitive on purpose.
+            "iptables -L -n",
+            "iptables -f",
+            "passwd --status bob",
+            "apt-get install -y userdel-helper",
+        ],
+    )
+    def test_diagnostics_and_lookalikes_are_allowed(self, command: str) -> None:
+        assert not _is_dangerous_command(command), (
+            f"{command!r} was blocked; it does not take the host down"
+        )
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ("echo hi\nreboot", True),
+            ("set -e\nsystemctl poweroff", True),
+            # Pre-existing coverage that the newline rendering must not
+            # cost: this one only matches while a line break reads as
+            # WHITESPACE, which is why both renderings are searched.
+            ("rm -rf\n/", True),
+            ("echo hello\nls -la", False),
+        ],
+    )
+    def test_a_second_line_is_a_command_position(
+        self, command: str, expected: bool
+    ) -> None:
+        """Both renderings of a newline must be searched.
+
+        Sanitization replaces control characters with a space, so a second
+        line used to read as an ARGUMENT to the first — measured: plain
+        ``echo hi\\nreboot`` was not caught. Rewriting newlines to ``;``
+        instead would have lost ``rm -rf\\n/``, which needs the whitespace
+        reading, so neither rendering alone is sufficient.
+        """
+        assert _is_dangerous_command(command) is expected
+
+
 # ---------------------------------------------------------------------------
 # Property-based fuzz tests for _is_dangerous_command (B3)
 #
@@ -1698,11 +1794,17 @@ class TestRedactSecrets:
         # secret='credenti' inside keyword='credential', which reported a
         # "leak" via the FLAG NAME, not via any leaked value. Exact equality is
         # immune to that whole class and is a strictly stronger property.
-        expected = f"myapp --{junk}-{keyword}={_REDACTION_PLACEHOLDER} run"
+        # The placeholder is content-dependent: a secret containing a shell
+        # separator gets `{REDACTED+ELIDED}`, because redaction cannot tell a
+        # separator INSIDE a secret from one chaining a second command, and
+        # errs toward flagging (see `_placeholder_for`). Exact equality is
+        # preserved — the whole string is still pinned byte for byte.
+        placeholder = _placeholder_for(secret)
+        expected = f"myapp --{junk}-{keyword}={placeholder} run"
         assert redacted == expected, (
             f"junk_len={len(junk)} keyword={keyword!r} secret={secret!r} → {redacted!r}"
         )
-        assert _REDACTION_PLACEHOLDER in redacted
+        assert placeholder in redacted
 
     @given(
         userinfo=st.text(
@@ -1775,6 +1877,146 @@ class TestRedactSecrets:
         redacted = _redact_secrets(cmd)
         assert "Secret123" not in redacted
         assert _REDACTION_PLACEHOLDER in redacted
+
+
+class TestRedactionElidedMarker:
+    """A redacted token that swallowed a second command must say so.
+
+    Found by end-to-end testing against a live SSH host on 2026-09-07, not
+    by this suite. Redaction replaces from the credential marker to the end
+    of the whitespace-delimited token — which is what stops a partially
+    quoted secret leaking — but shell separators are not whitespace. So
+    ``--password=X;reboot`` logged as ``--password={REDACTED}``: the
+    ``reboot`` was ABSENT from the audit record while the command still ran
+    on the host. The elided ``touch /tmp/f`` in that session created its
+    file, which is how the erasure was proven rather than inferred.
+
+    Narrowing the replacement to the separator was rejected — a secret
+    containing ``;`` would then have its tail printed. The value stays
+    fully hidden and the record stops being SILENT instead.
+    """
+
+    def test_command_chained_after_an_eq_credential_is_flagged(self) -> None:
+        """The exact shape reproduced against a live host."""
+        redacted = _redact_secrets("echo --password=PW1;touch /tmp/f")
+        assert "PW1" not in redacted
+        assert _REDACTION_ELIDED_PLACEHOLDER in redacted
+
+    def test_command_chained_after_a_spaced_credential_is_flagged(self) -> None:
+        """``--flag value`` replaces the whole next token, same erasure."""
+        redacted = _redact_secrets("docker login --password PW2;reboot")
+        assert "PW2" not in redacted
+        assert "reboot" not in redacted, "the value must still be fully hidden"
+        assert _REDACTION_ELIDED_PLACEHOLDER in redacted
+
+    def test_ordinary_credential_is_not_flagged(self) -> None:
+        """The marker must stay meaningful: no separator, no marker.
+
+        Without this the change could degrade into tagging every command
+        and telling an auditor nothing.
+        """
+        redacted = _redact_secrets('mysql --password=plain -e "select 1"')
+        assert redacted == 'mysql --password={REDACTED} -e "select 1"'
+
+    def test_separate_token_after_a_credential_is_not_flagged(self) -> None:
+        """Only text actually consumed counts.
+
+        ``$(id)`` here is its own token and survives into the log, so
+        flagging would be a lie about what was lost.
+        """
+        redacted = _redact_secrets("curl --token=T $(id)")
+        assert redacted == "curl --token={REDACTED} $(id)"
+
+    @pytest.mark.parametrize("sep", [";", "|", "&", "`", "$("])
+    def test_every_separator_that_can_chain_is_flagged(self, sep: str) -> None:
+        """Each separator in the set, so removing one from the regex fails.
+
+        Newline and CR are absent on purpose: whitespace has already split
+        the text into tokens before either caller runs, so nothing can be
+        elided across one. Measured — asserting them here failed, which is
+        why they were removed from the regex rather than left as an
+        unreachable branch in a security-relevant predicate.
+        """
+        redacted = _redact_secrets(f"cmd --password=PW{sep}rest")
+        assert "PW" not in redacted
+        assert _REDACTION_ELIDED_PLACEHOLDER in redacted, (
+            f"separator {sep!r} elided text without flagging the record"
+        )
+
+    def test_a_secret_containing_a_separator_is_also_flagged(self) -> None:
+        """Documents the deliberate false-positive bias.
+
+        Deciding whether a ``;`` inside a token separates a command or is
+        just a character in the password needs shell parsing, which this
+        module refuses to do on purpose. So the marker means "this record
+        MAY be incomplete", never "a command was definitely hidden", and it
+        errs toward flagging — a noisy marker is recoverable, a silently
+        truncated audit record is not.
+        """
+        redacted = _redact_secrets("app --password=pa;ss run")
+        assert "pa;ss" not in redacted
+        assert _REDACTION_ELIDED_PLACEHOLDER in redacted
+
+    @pytest.mark.parametrize(
+        "keyword", ["password", "token", "secret", "key", "credential", "pass"]
+    )
+    def test_the_marker_does_not_depend_on_which_rule_matched(
+        self, keyword: str
+    ) -> None:
+        """Every rule that swallows text to end-of-token must flag it.
+
+        Reported by CI's 200-example Hypothesis profile 2026-09-07, which
+        the 50-example dev profile had missed: `--…-password=x&` was
+        flagged and `--…-token=x&` was not, because rule 3a's enumerated
+        env names (`TOKEN`, `SECRET`, …) matched the second one first and
+        used the plain placeholder. An inconsistent marker is worse than
+        none — a reader takes its absence as proof nothing was cut.
+        """
+        junk = "0" * 41
+        redacted = _redact_secrets(f"myapp --{junk}-{keyword}=0000000& run")
+        assert _REDACTION_ELIDED_PLACEHOLDER in redacted, (
+            f"keyword {keyword!r} lost the marker; which rule matched must "
+            "not change what the record claims"
+        )
+
+    def test_a_later_rule_cannot_downgrade_the_marker(self) -> None:
+        """The marker must survive re-redaction by a subsequent rule.
+
+        Same CI finding, one layer down: rule 3a flagged the value
+        correctly and then `_redact_long_flags` re-matched the same flag
+        and replaced `{REDACTED+ELIDED}` — which contains no separator —
+        with the plain placeholder. A marker a later rule can erase is
+        worth nothing, so `_placeholder_for` treats an existing one as
+        sticky.
+        """
+        assert (
+            _placeholder_for(_REDACTION_ELIDED_PLACEHOLDER)
+            == _REDACTION_ELIDED_PLACEHOLDER
+        )
+        # The plain placeholder carries no claim, so it must NOT be sticky —
+        # otherwise re-redacting an ordinary secret would invent a marker.
+        assert _placeholder_for(_REDACTION_PLACEHOLDER) == _REDACTION_PLACEHOLDER
+
+    @pytest.mark.parametrize(
+        ("command", "flagged"),
+        [
+            ("PGPASSWORD=a&b psql", True),
+            ("VAULT_TOKEN=x;id", True),
+            ("curl -u bob:pw;id http://x/", True),
+            ("sshpass -p pw;id ssh h", True),
+            ('curl -H "Authorization: Bearer tok;id" http://x/', True),
+            # Bounded replacements cannot swallow a following command, so
+            # flagging them would be a pure false positive: the closing
+            # quote and the `@` respectively terminate the value.
+            ("mysql -p'quoted;value' -e x", False),
+            ("https://u:p;q@host/", False),
+            ("mysql -pplain -e x", False),
+        ],
+    )
+    def test_only_unbounded_rules_flag(self, command: str, flagged: bool) -> None:
+        """The distinction is whether the rule replaces to end-of-token."""
+        redacted = _redact_secrets(command)
+        assert (_REDACTION_ELIDED_PLACEHOLDER in redacted) is flagged, redacted
 
 
 class TestRedactSecretsPerformance:

@@ -25,7 +25,7 @@ import os
 import stat
 import sys
 import traceback
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -68,12 +68,23 @@ try:
     from opentelemetry import trace as _otel_trace
 
     _tracer: Any = _otel_trace.get_tracer("ssh_mcp")
+    # Captured here rather than reached through `_otel_trace` in the error
+    # path below. The module name is only bound inside this `try`, and its
+    # use down there is guarded by `_tracer is not None` — a correlation no
+    # type checker can see, so it reported the name possibly-unbound on a
+    # branch that cannot execute. Binding the two symbols in BOTH branches
+    # removes the report without a suppression, and rebinding
+    # `_otel_trace` itself is not an option: that shadows an imported name.
+    _otel_status: Any = _otel_trace.Status
+    _otel_error_code: Any = _otel_trace.StatusCode.ERROR
 except ImportError:  # pragma: no cover - unreachable; see comment above
     _tracer = None
+    _otel_status = None
+    _otel_error_code = None
 
 
 @contextlib.contextmanager
-def _span(name: str, **attributes: Any) -> Iterator[Any]:
+def _span(name: str, **attributes: Any) -> Generator[Any]:
     """Start an OTel span if the API is available, else a no-op.
 
     Usage::
@@ -97,7 +108,7 @@ def _span(name: str, **attributes: Any) -> Iterator[Any]:
             yield span
         except Exception as e:
             span.record_exception(e)
-            span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
+            span.set_status(_otel_status(_otel_error_code))
             raise
 
 
@@ -752,7 +763,7 @@ def _build_http_app(
         ) from exc
 
     @asynccontextmanager
-    async def _lifespan(_app: Starlette) -> Any:
+    async def _lifespan(_app: Starlette) -> AsyncGenerator[None]:
         # Step 1: start the MCPServer session manager's task group via the
         # public session_manager.run() API (see note above).
         async with session_manager.run():

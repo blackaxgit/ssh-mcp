@@ -65,7 +65,7 @@ The `execute` and `execute_on_group` tools run arbitrary shell commands on remot
 
 ### Dangerous Command Detection
 
-ssh-mcp **blocks** commands matching a list of commonly destructive patterns (e.g. `rm -rf /`, `mkfs`, disk wipes) and returns an error instead of executing them. A caller may bypass the block by passing `force=true`. This is a safety feature, not a vulnerability.
+ssh-mcp **blocks** commands matching a list of commonly destructive patterns and returns an error instead of executing them. Two kinds are covered: destruction of *data* (`rm -rf /`, `mkfs`, disk wipes, `chmod 777 /`) and, since 0.8.1, destruction of *availability* — `reboot`, `poweroff`, `init 0`, `systemctl poweroff`, `iptables -F`, `nft flush ruleset`, `userdel`, `passwd -l`. The second group matters because `execute_on_group` fans one command across a fleet, so a single `reboot` takes the whole group down and an `iptables -F` on a host reached through those rules needs console access to recover. These are matched only in *command position* — after the string start, a shell separator, or `sudo`/`doas` — so read-only diagnostics such as `last reboot` and `grep reboot /var/log/messages` still run. A caller may bypass the block by passing `force=true`. This is a safety feature, not a vulnerability.
 
 **The bypass is not recorded in the audit log.** Audit records carry `server`, `command`, `exit_code` and `duration_ms` only; `force` is emitted solely as an OpenTelemetry span attribute (`ssh.force`), and therefore only when an OpenTelemetry SDK and exporter are configured. The tracing API itself now ships as a required dependency of the MCP SDK, so spans are always created — but with no SDK installed they are no-ops that record nothing. A block is logged as a warning on the operational logger, not the audit logger. If you need a paper trail for bypasses, export traces or withhold `force=true` at the MCP client.
 
@@ -115,6 +115,8 @@ Like the dangerous-command list, this is a **tripwire, not a security boundary**
 Known credential patterns in the **command string** (`-p<pass>`, `--password=`, `PGPASSWORD=`, `Authorization: Bearer`, URL basic-auth, `*_PASSWORD`/`_SECRET`/`_TOKEN`/`_KEY` env assignments) are redacted before reaching audit logs, stderr, or OTel span attributes.
 
 This is a tripwire too, with two documented limits: multi-word **quoted** values are only partially redacted, and command **output** is never redacted at all — `env | grep PASSWORD` returns plaintext to the MCP client by design. Pass credentials via env files, secret stores, or stdin rather than argv.
+
+**`{REDACTED+ELIDED}` means the record is incomplete.** Redaction replaces from the credential marker to the end of the whitespace-delimited token, so a shell separator inside that token — `--password=X;reboot` — is consumed with it, and before 0.8.1 the log read `--password={REDACTED}` while the chained command still ran. The value is still never partially printed; instead the placeholder changes so the record does not read as a faithful transcript. It errs toward flagging: a secret that merely *contains* `;`, `|`, `&`, a backtick or `$(` is flagged too, because distinguishing those requires shell parsing that this redactor deliberately does not attempt. Treat the marker as "something beyond the secret was cut here", never as proof a command was hidden — and never as proof one was not.
 
 ### Resource Limits
 

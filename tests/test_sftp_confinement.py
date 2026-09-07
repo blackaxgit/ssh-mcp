@@ -23,6 +23,8 @@ blocked" would have passed against the old denylist too.
 from __future__ import annotations
 
 import os
+import signal
+import stat
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -31,8 +33,10 @@ import asyncssh
 import pytest
 from asyncssh.constants import FILEXFER_TYPE_REGULAR, FILEXFER_TYPE_SYMLINK
 
+import ssh_mcp.ssh
 from ssh_mcp.config import ServerRegistry
 from ssh_mcp.models import Settings
+from ssh_mcp.paths import open_beneath
 from ssh_mcp.ssh import SSHManager
 
 pytestmark = pytest.mark.asyncio
@@ -277,6 +281,29 @@ async def test_download_no_clobber_existing_file(root: Path) -> None:
     fake_sftp.get.assert_not_called()
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are POSIX-only")
+async def test_download_onto_a_symlink_is_refused_not_followed(root: Path) -> None:
+    """A symlink at the destination must not be written through.
+
+    ``open_beneath`` adds ``O_NOFOLLOW``, so ``O_CREAT|O_EXCL`` reports
+    EEXIST for a symlink rather than following it — which is the whole
+    point, since the link may aim anywhere on the operator's machine. This
+    pins both halves: nothing is written to the target, and the error names
+    the symlink case so it does not read as "a regular file is in the way".
+    """
+    outside = root.parent / "outside-transfer-root.txt"
+    outside.write_bytes(b"untouched")
+    os.symlink(outside, root / "link.txt")
+    fake_sftp = _FakeSFTP()
+    manager = _make_manager(root, fake_sftp)
+
+    with pytest.raises(ValueError, match="symlink at this name"):
+        await manager.download("test-host", "/remote/src.txt", "link.txt")
+
+    assert outside.read_bytes() == b"untouched", "wrote through the symlink"
+    fake_sftp.get.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Audit record reports the real transferred file and byte count (S13/TOCTOU)
 # ---------------------------------------------------------------------------
@@ -340,6 +367,82 @@ async def test_upload_rejects_non_regular_local_file(root: Path) -> None:
 
     with pytest.raises(ValueError, match="not a regular file"):
         await manager.upload("test-host", "adir", "/remote/dest.txt")
+
+
+async def test_upload_opens_the_local_file_non_blocking(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Upload must pass ``O_NONBLOCK``, or a fifo makes ``S_ISREG`` unreachable.
+
+    The sibling test above uses a directory, which opens fine and so does
+    reach the ``S_ISREG`` refusal. A fifo does not: a plain ``O_RDONLY``
+    open blocks until a writer appears, so the refusal never runs for
+    precisely the file type it exists to reject.
+
+    Measured 2026-09-07 against 0.8.0: the open runs in a worker thread, so
+    the event loop survives — but the thread does not. 16 concurrent fifo
+    uploads exhausted the default executor and every later ``to_thread``
+    call, i.e. ALL SFTP in the process, stalled until restart while
+    ``execute`` kept working. Same defect class 0.8.0 fixed for
+    ``SSH_MCP_HTTP_TOKEN_FILE``.
+
+    Asserting the flag rather than uploading a real fifo is deliberate and
+    was measured, not assumed. The obvious end-to-end version — mkfifo,
+    upload, ``asyncio.wait_for`` — does go red on mutation, and then HANGS
+    the run: the blocked executor thread is non-daemon, so pytest cannot
+    exit (observed 120 s, killed externally). A mutation that hangs CI is
+    strictly worse than one that fails it. The sibling test below proves
+    the flag is what actually makes a fifo open return.
+    """
+    (root / "payload.txt").write_bytes(b"hi")
+    seen: list[int] = []
+    real_open_beneath = ssh_mcp.ssh.open_beneath
+
+    def spy(root_fd: int, path: str, flags: int, *args: object, **kw: object) -> int:
+        seen.append(flags)
+        return real_open_beneath(root_fd, path, flags, *args, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ssh_mcp.ssh, "open_beneath", spy)
+    manager = _make_manager(root, _FakeSFTP())
+
+    await manager.upload("test-host", "payload.txt", "/remote/dest.txt")
+
+    assert seen, "open_beneath was never called — the spy is not wired up"
+    assert seen[0] & os.O_NONBLOCK, (
+        f"upload opened the local file with flags {seen[0]:#o}, without "
+        "O_NONBLOCK: a fifo beneath transfer_root would block the open "
+        "forever and never reach the S_ISREG refusal"
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="fifos are POSIX-only")
+def test_o_nonblock_is_what_makes_a_fifo_open_return(root: Path) -> None:
+    """Pins the assumption the test above depends on.
+
+    Run in the MAIN thread on purpose: a blocked ``open`` here is
+    interrupted by ``SIGALRM`` instead of leaking a non-daemon executor
+    thread that would outlive the test. Without the deadline this would
+    hang rather than fail if the platform ever stopped honouring
+    ``O_NONBLOCK`` on a fifo.
+    """
+    os.mkfifo(root / "afifo")
+    root_fd = os.open(root, os.O_RDONLY)
+
+    def _deadline(signum: int, frame: object) -> None:
+        raise TimeoutError("O_RDONLY|O_NONBLOCK blocked on a writer-less fifo")
+
+    previous = signal.signal(signal.SIGALRM, _deadline)
+    signal.setitimer(signal.ITIMER_REAL, 5.0)
+    try:
+        fd = open_beneath(root_fd, "afifo", os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            assert not stat.S_ISREG(os.fstat(fd).st_mode)
+        finally:
+            os.close(fd)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        os.close(root_fd)
 
 
 # ---------------------------------------------------------------------------
