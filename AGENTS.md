@@ -20,7 +20,7 @@ Command sources: `.github/workflows/ci.yml` (the gates), `.github/workflows/rele
 
 ```bash
 uv sync --locked --extra dev        # setup. --locked is required; see Gotchas
-uv run pytest                       # full suite (833 tests, seconds)
+uv run pytest                       # full suite (848 tests, seconds)
 uv run pytest tests/test_ssh.py::TestRedactSecrets -v          # one class
 uv run pytest 'tests/test_ssh.py::TestRedactSecrets::<test_name>' -v   # one test
 uv run pytest -k "confinement" -v                              # by keyword
@@ -84,6 +84,8 @@ Four module-level tunables in `ssh.py` are *deliberately* not `Settings` fields 
 ## Testing
 
 Tests mirror modules (`test_ssh.py` ↔ `ssh.py`). `pytest-asyncio` runs in `asyncio_mode = "auto"`, so `async def test_*` needs no decorator. Hypothesis drives the redaction and dangerous-command property tests.
+
+**Run `HYPOTHESIS_PROFILE=ci uv run pytest` before pushing any change to `_redact_secrets` or `_DANGEROUS_PATTERNS`.** A bare `uv run pytest` uses the `dev` profile — 50 examples — while CI runs 200 (`tests/conftest.py`). That gap is not theoretical: 0.8.1's redaction change passed the local suite and CI found two real defects in it on the first run, both needing a generated secret containing `&`. One was an inconsistent marker (a value flagged under `--password=` and not under `--token=`, because a different pipeline rule matched first); the other was a later rule *downgrading* a marker an earlier rule had set. The 200-example run costs about a second here.
 
 Not every test file mirrors a module. `tests/test_input_limits.py` (18 tests) guards `max_command_bytes` at the tool boundary; `tests/test_logging.py` (7) and `tests/test_otel.py` (7) cover the observability wiring in `server.py`.
 

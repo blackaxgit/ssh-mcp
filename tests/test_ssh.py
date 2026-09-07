@@ -1957,6 +1957,67 @@ class TestRedactionElidedMarker:
         assert "pa;ss" not in redacted
         assert _REDACTION_ELIDED_PLACEHOLDER in redacted
 
+    @pytest.mark.parametrize(
+        "keyword", ["password", "token", "secret", "key", "credential", "pass"]
+    )
+    def test_the_marker_does_not_depend_on_which_rule_matched(
+        self, keyword: str
+    ) -> None:
+        """Every rule that swallows text to end-of-token must flag it.
+
+        Reported by CI's 200-example Hypothesis profile 2026-09-07, which
+        the 50-example dev profile had missed: `--…-password=x&` was
+        flagged and `--…-token=x&` was not, because rule 3a's enumerated
+        env names (`TOKEN`, `SECRET`, …) matched the second one first and
+        used the plain placeholder. An inconsistent marker is worse than
+        none — a reader takes its absence as proof nothing was cut.
+        """
+        junk = "0" * 41
+        redacted = _redact_secrets(f"myapp --{junk}-{keyword}=0000000& run")
+        assert _REDACTION_ELIDED_PLACEHOLDER in redacted, (
+            f"keyword {keyword!r} lost the marker; which rule matched must "
+            "not change what the record claims"
+        )
+
+    def test_a_later_rule_cannot_downgrade_the_marker(self) -> None:
+        """The marker must survive re-redaction by a subsequent rule.
+
+        Same CI finding, one layer down: rule 3a flagged the value
+        correctly and then `_redact_long_flags` re-matched the same flag
+        and replaced `{REDACTED+ELIDED}` — which contains no separator —
+        with the plain placeholder. A marker a later rule can erase is
+        worth nothing, so `_placeholder_for` treats an existing one as
+        sticky.
+        """
+        assert (
+            _placeholder_for(_REDACTION_ELIDED_PLACEHOLDER)
+            == _REDACTION_ELIDED_PLACEHOLDER
+        )
+        # The plain placeholder carries no claim, so it must NOT be sticky —
+        # otherwise re-redacting an ordinary secret would invent a marker.
+        assert _placeholder_for(_REDACTION_PLACEHOLDER) == _REDACTION_PLACEHOLDER
+
+    @pytest.mark.parametrize(
+        ("command", "flagged"),
+        [
+            ("PGPASSWORD=a&b psql", True),
+            ("VAULT_TOKEN=x;id", True),
+            ("curl -u bob:pw;id http://x/", True),
+            ("sshpass -p pw;id ssh h", True),
+            ('curl -H "Authorization: Bearer tok;id" http://x/', True),
+            # Bounded replacements cannot swallow a following command, so
+            # flagging them would be a pure false positive: the closing
+            # quote and the `@` respectively terminate the value.
+            ("mysql -p'quoted;value' -e x", False),
+            ("https://u:p;q@host/", False),
+            ("mysql -pplain -e x", False),
+        ],
+    )
+    def test_only_unbounded_rules_flag(self, command: str, flagged: bool) -> None:
+        """The distinction is whether the rule replaces to end-of-token."""
+        redacted = _redact_secrets(command)
+        assert (_REDACTION_ELIDED_PLACEHOLDER in redacted) is flagged, redacted
+
 
 class TestRedactSecretsPerformance:
     """B2-regex: quadratic backtracking in rules 0, 8, 9 fixed via bounded

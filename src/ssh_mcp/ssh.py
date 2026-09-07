@@ -196,13 +196,26 @@ _SHELL_SEPARATOR_RE = re.compile(r"[;|&`]|\$\(")
 def _placeholder_for(elided: str) -> str:
     """Pick the placeholder for text about to be replaced wholesale.
 
+    The pipeline runs several rules over the SAME string, so a later rule
+    can be handed text an earlier one already redacted. Found by CI's
+    200-example Hypothesis profile 2026-09-07: rule 3a flagged
+    ``--…-token=x&`` correctly and then ``_redact_long_flags`` re-matched
+    the same flag and replaced ``{REDACTED+ELIDED}`` — which holds no
+    separator — with the plain placeholder, silently DOWNGRADING the
+    record. A marker that a later rule can erase is worse than no marker,
+    so an existing one is preserved. The plain placeholder is not sticky:
+    it carries no claim to lose.
+
     Args:
         elided: The exact text redaction is discarding.
 
     Returns:
-        ``{REDACTED+ELIDED}`` if that text could chain another command,
-        otherwise the plain ``{REDACTED}``.
+        ``{REDACTED+ELIDED}`` if that text could chain another command, or
+        already records that something was elided; otherwise the plain
+        ``{REDACTED}``.
     """
+    if _REDACTION_ELIDED_PLACEHOLDER in elided:
+        return _REDACTION_ELIDED_PLACEHOLDER
     if _SHELL_SEPARATOR_RE.search(elided):
         return _REDACTION_ELIDED_PLACEHOLDER
     return _REDACTION_PLACEHOLDER
@@ -577,6 +590,19 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
     return [
         # 1. Basic auth credentials embedded in a URL:
         #    ``scheme://user:password@host``. See _redact_url_basic_auth.
+        #
+        # Keeps the PLAIN placeholder: the replacement is bounded on both
+        # sides (``:`` … ``@``), so nothing beyond the secret is consumed
+        # and there is nothing to flag. Same for rule 4 below, whose value
+        # is delimited by its closing quote. Every OTHER rule here
+        # replaces to the end of a whitespace-delimited run and therefore
+        # goes through ``_placeholder_for`` — a rule that swallows
+        # ``;reboot`` must say so. Reported by CI's 200-example Hypothesis
+        # profile 2026-09-07: `--…-password=x&` was flagged while
+        # `--…-token=x&` was not, because rule 3a's enumerated env names
+        # matched the second one first. An inconsistent marker is worse
+        # than none, since a reader would take its absence as proof that
+        # nothing was cut.
         _redact_url_basic_auth,
         # 2. HTTP ``Authorization:`` header with Bearer/Basic/Digest/Token.
         _regex_step(
@@ -584,7 +610,7 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
                 r"(Authorization:\s*(?:Bearer|Basic|Digest|Token)\s+)(\S+)",
                 re.IGNORECASE,
             ),
-            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}{_placeholder_for(m.group(2))}",
         ),
         # 3a. Known credential env vars (enumerated list, exact match).
         _regex_step(
@@ -592,7 +618,7 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
                 r"\b(" + env_alt + r")=(\S+)",
                 re.IGNORECASE,
             ),
-            lambda m: f"{m.group(1)}={_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}={_placeholder_for(m.group(2))}",
         ),
         # 3b. (v0.4.3 G2) Generic env var SUFFIX patterns:
         #     ``*_PASSWORD=``, ``*_SECRET=``, ``*_TOKEN=``, ``*_KEY=``,
@@ -608,9 +634,10 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
                 r"\b(\w+(?:_PASSWORD|_SECRET|_TOKEN|_KEY|_CREDENTIAL|_PWD))=(\S+)",
                 re.IGNORECASE,
             ),
-            lambda m: f"{m.group(1)}={_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}={_placeholder_for(m.group(2))}",
         ),
-        # 4. MySQL/MariaDB short password flag QUOTED form.
+        # 4. MySQL/MariaDB short password flag QUOTED form. Plain
+        #    placeholder: the closing quote bounds the replacement.
         _regex_step(
             re.compile(r"(?<![\w-])(-p)(['\"])([^'\"]*)(\2)"),
             lambda m: f"{m.group(1)}{m.group(2)}{_REDACTION_PLACEHOLDER}{m.group(4)}",
@@ -618,13 +645,13 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
         # 5. MySQL/MariaDB short password flag UNQUOTED form (≥3 chars).
         _regex_step(
             re.compile(r"(?<![\w-])(-p)(\S{3,})"),
-            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}{_placeholder_for(m.group(2))}",
         ),
         # 6. (v0.4.3 G4) ``curl -u user:password`` basic auth flag.
         #    Redacts the password portion after the colon.
         _regex_step(
             re.compile(r"(?<!\w)(-u\s+\S+:)(\S+)"),
-            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}{_placeholder_for(m.group(2))}",
         ),
         # 7. (v0.4.3 G4) ``sshpass -p PASSWORD`` (space-separated).
         #    sshpass uses ``-p`` with a SPACE before the password, unlike
@@ -632,7 +659,7 @@ def _build_credential_subs() -> list[Callable[[str], str]]:
         #    disambiguate from the MySQL rule.
         _regex_step(
             re.compile(r"(sshpass\s+-p\s+)(\S+)", re.IGNORECASE),
-            lambda m: f"{m.group(1)}{_REDACTION_PLACEHOLDER}",
+            lambda m: f"{m.group(1)}{_placeholder_for(m.group(2))}",
         ),
         # 8/9. Long flags with ``=`` or whitespace separator. See
         #      _redact_long_flags — merges the old rules 8 and 9 into one
