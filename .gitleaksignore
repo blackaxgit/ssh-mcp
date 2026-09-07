@@ -51,3 +51,25 @@
 
 # tests/test_ssh.py:2058 (generic-api-key)
 e09955c2be3c55dfd10d041e88c91569f65ba591:tests/test_ssh.py:generic-api-key:2058
+
+# tests/test_ssh.py:2058 (generic-api-key) — same fixture as the e09955c entry
+# above, re-pinned for the commit that actually landed on main.
+#
+# Appended 2026-09-06. `gitleaks git` over full history failed with exactly one
+# finding: the entry above pins e09955c, which is NOT an ancestor of main --
+# it survives only on origin/fix/p1-security-hardening, because PR #47 was
+# squash-merged and the squash commit fde7222 got a different sha. The
+# fingerprint's <sha> component therefore never matched a main-history scan.
+#
+# Both entries are kept deliberately, per the append-only rule above: e09955c
+# still suppresses the finding when that branch is scanned, and fde7222 covers
+# main. If origin/fix/p1-security-hardening is ever deleted the e09955c pin
+# becomes inert, which is harmless -- do not prune it as "dead", because a pin
+# that matches nothing costs one line and removing the wrong one reopens a
+# known-noise finding.
+#
+# Verified synthetic before recording: the line is
+# `_redact_secrets("cmd --password=<value> run")` in TestRedactSecretsTokenwise,
+# an INPUT the test asserts gets replaced by {REDACTED}. Not a real credential,
+# no rotation needed.
+fde72221541c4928d209ccb8bd7163f590f82328:tests/test_ssh.py:generic-api-key:2058
