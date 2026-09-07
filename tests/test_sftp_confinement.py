@@ -281,6 +281,29 @@ async def test_download_no_clobber_existing_file(root: Path) -> None:
     fake_sftp.get.assert_not_called()
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are POSIX-only")
+async def test_download_onto_a_symlink_is_refused_not_followed(root: Path) -> None:
+    """A symlink at the destination must not be written through.
+
+    ``open_beneath`` adds ``O_NOFOLLOW``, so ``O_CREAT|O_EXCL`` reports
+    EEXIST for a symlink rather than following it — which is the whole
+    point, since the link may aim anywhere on the operator's machine. This
+    pins both halves: nothing is written to the target, and the error names
+    the symlink case so it does not read as "a regular file is in the way".
+    """
+    outside = root.parent / "outside-transfer-root.txt"
+    outside.write_bytes(b"untouched")
+    os.symlink(outside, root / "link.txt")
+    fake_sftp = _FakeSFTP()
+    manager = _make_manager(root, fake_sftp)
+
+    with pytest.raises(ValueError, match="symlink at this name"):
+        await manager.download("test-host", "/remote/src.txt", "link.txt")
+
+    assert outside.read_bytes() == b"untouched", "wrote through the symlink"
+    fake_sftp.get.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Audit record reports the real transferred file and byte count (S13/TOCTOU)
 # ---------------------------------------------------------------------------

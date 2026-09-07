@@ -369,11 +369,14 @@ def test_digest_verification_accounts_for_index_wrapping() -> None:
     workflow = _load_workflow(CI_WORKFLOW_PATH)
     docker_job = workflow["jobs"]["docker"]
 
+    # Matched on what the step DOES, not on its exact title: the name has
+    # already been reworded once (0.8.1, "scanned digest" -> "scanned image
+    # manifests" when the build went multi-arch), and a title-only matcher
+    # turns this guard into a silent no-op the moment someone renames it.
     verify_steps = [
         step
         for step in docker_job.get("steps", [])
-        if "serves only the scanned digest" in step.get("name", "")
-        or "resolves to the scanned digest" in step.get("name", "")
+        if "imagetools inspect" in step.get("run", "")
     ]
     assert verify_steps, (
         "the docker job no longer verifies that published tags serve the "
@@ -408,6 +411,60 @@ def test_digest_verification_accounts_for_index_wrapping() -> None:
     )
     assert attest is not None, (
         "the docker job no longer attests build provenance for the image"
+    )
+
+
+def test_published_image_is_multi_arch_and_every_platform_is_scanned() -> None:
+    """0.8.1: the published image must cover arm64, and the CRITICAL gate
+    must cover every platform it publishes.
+
+    Until 0.8.1 the image was amd64-only, so ``docker run`` on Apple Silicon
+    or AWS Graviton failed outright with "no matching manifest" — verified
+    against the published ``0.8.0`` manifest, whose only entry was
+    ``linux/amd64``. Reaching remote infrastructure is this tool's whole job,
+    and Graviton is a plausible host for it.
+
+    The second half is the part that could regress silently. A multi-arch
+    push produces an INDEX, and Trivy resolves an index to the runner's own
+    platform, so ONE scan step gates amd64 and lets arm64 through
+    unscanned — with the gate still green. So the platform set built must
+    equal the platform set scanned.
+    """
+    docker_job = _load_workflow(CI_WORKFLOW_PATH)["jobs"]["docker"]
+    steps = docker_job.get("steps", [])
+
+    publish_builds = [
+        step
+        for step in steps
+        if "build-push-action" in step.get("uses", "")
+        and "push=true" in str(step.get("with", {}).get("outputs", ""))
+    ]
+    assert len(publish_builds) == 1, (
+        f"expected exactly one publish-path build step, found {len(publish_builds)}"
+    )
+
+    built = {
+        p.strip()
+        for p in str(publish_builds[0]["with"]["platforms"]).split(",")
+        if p.strip()
+    }
+    assert built == {"linux/amd64", "linux/arm64"}, (
+        f"the publish build declares platforms {sorted(built)}; dropping one "
+        "makes the image unrunnable on that architecture"
+    )
+
+    scanned = {
+        str(step.get("env", {}).get("TRIVY_PLATFORM", "")).strip()
+        for step in steps
+        if "trivy-action" in step.get("uses", "")
+        and "@${{ steps.build.outputs.digest }}"
+        in str(step.get("with", {}).get("image-ref", ""))
+    }
+    assert scanned == built, (
+        f"platforms built {sorted(built)} but scanned {sorted(scanned)}. Trivy "
+        "resolves a multi-arch index to the runner's own platform, so an "
+        "unscanned platform is published with a green CRITICAL gate. Add a "
+        "scan step with the matching TRIVY_PLATFORM."
     )
 
 

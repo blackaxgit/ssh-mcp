@@ -424,3 +424,74 @@ class TestFormatGroupResults:
         output = format_group_results(results, "test")
         assert "Summary: 0 succeeded, 1 failed" in output
         assert "exit unknown" in output
+
+    def test_registry_failure_is_not_framed_as_a_one_server_group(self) -> None:
+        """An unknown group must not be reported as a group with one member.
+
+        Observed 2026-09-07 during end-to-end testing: asking for a group
+        that does not exist printed ``Executing on group 'no-such-group'
+        (1 servers)...``, which asserts two false things — that the group
+        exists, and that it has a member. ``execute_on_group`` cannot raise
+        (see ExecResult in models.py), so a registry failure arrives as a
+        single result whose ``server`` IS the group name.
+        """
+        results = [
+            ExecResult(
+                server="no-such-group",
+                command="hostname",
+                stdout="",
+                stderr="",
+                exit_code=None,
+                error="Group not found: 'no-such-group'",
+            ),
+        ]
+        output = format_group_results(results, "no-such-group")
+        assert "Executing on group" not in output, (
+            "a nonexistent group must not get a group-run header"
+        )
+        assert "servers" not in output, "no server count may be claimed"
+        assert "Group not found" in output, "the actual reason must survive"
+
+    def test_a_real_single_host_group_still_gets_its_header(self) -> None:
+        """Guards the test above from over-reaching.
+
+        A genuine one-member group differs from a registry failure only in
+        that its result names a SERVER, not the group. Suppressing the
+        header for both would hide a real run.
+        """
+        results = [
+            ExecResult(
+                server="web1",
+                command="hostname",
+                stdout="web1",
+                stderr="",
+                exit_code=0,
+                duration_ms=12,
+            ),
+        ]
+        output = format_group_results(results, "solo")
+        assert "Executing on group 'solo' (1 server)..." in output, (
+            "a real single-host group needs its header, correctly pluralised"
+        )
+        assert "1 servers" not in output
+
+    def test_a_failed_host_named_like_its_group_still_runs(self) -> None:
+        """The registry-failure shape needs all three conditions.
+
+        A host that happens to share its group's name and failed is a real
+        run, and must keep the header. Pins that the check is not just
+        "one result with an error".
+        """
+        results = [
+            ExecResult(
+                server="web1",
+                command="hostname",
+                stdout="",
+                stderr="",
+                exit_code=None,
+                error="SSH error: connection refused",
+            ),
+        ]
+        output = format_group_results(results, "web")
+        assert "Executing on group 'web' (1 server)..." in output
+        assert "Summary: 0 succeeded, 1 failed" in output

@@ -173,6 +173,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # arm64 is built under emulation. Measured tradeoff: the alternative —
+      # a second native `ubuntu-24.04-arm` runner plus a manifest-merge job —
+      # is faster but splits one digest across two jobs, which the promote and
+      # verify steps below are built around. The image installs prebuilt
+      # manylinux aarch64 wheels rather than compiling, so emulation only
+      # pays for UV_COMPILE_BYTECODE and `useradd`.
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a  # v4.3.0
+        with:
+          platforms: arm64
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
@@ -222,6 +233,7 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           provenance: false
           sbom: false
@@ -248,10 +260,31 @@ jobs:
       # Scope of the gate, deliberately narrow: `severity: CRITICAL` only, so
       # HIGH image findings never fail the build, and `ignore-unfixed` is unset.
       # Open posture decision, tracked in docs/fixes/05-followups.md §3.
+      #
+      # ONE STEP PER PLATFORM, and that is load-bearing since the build became
+      # multi-arch: the pushed digest is now an INDEX, and Trivy resolves an
+      # index to the runner's own platform. A single step would therefore have
+      # gated amd64 and published arm64 unscanned — the gate would still be
+      # green and half the image would be uninspected. `TRIVY_PLATFORM` is
+      # used because trivy-action v0.36.0 exposes no `platform` input; it
+      # passes environment variables through to Trivy, which reads this one.
       # -----------------------------------------------------------------------
-      - name: Scan published digest with Trivy
+      - name: Scan published digest with Trivy (amd64)
         if: env.PUBLISH == 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL
+          exit-code: 1
+          trivyignores: .trivyignore
+
+      - name: Scan published digest with Trivy (arm64)
+        if: env.PUBLISH == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
         with:
           image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           severity: CRITICAL
@@ -303,46 +336,72 @@ jobs:
       # CLI appends a newline — not the cause here, but a reason not to go back
       # to hashing stdout.)
       #
-      # So compare the right thing: the set of image manifests the tag actually
-      # serves must be exactly {scanned digest}. Attestation manifests that
-      # buildx/attest may attach are excluded — they are metadata about the
-      # image, not another runnable image. Do not "simplify" this back to
+      # So compare the right thing: the set of image manifests the tag serves
+      # must equal the set the SCANNED reference serves. Attestation manifests
+      # that buildx/attest may attach are excluded — they are metadata about
+      # the image, not another runnable image. Do not "simplify" this back to
       # comparing the tag's own digest; that asserts an invariant the promote
       # step deliberately does not hold.
-      - name: Verify every tag serves only the scanned digest
+      #
+      # The expected set is DERIVED from the scanned reference rather than
+      # assumed to be `{DIGEST}`, which the multi-arch build made necessary:
+      # `steps.build.outputs.digest` is now an index digest, and
+      # `imagetools create` copies that index's CHILDREN into the new tag. A
+      # check hardcoding `{DIGEST}` would have failed every publish run — the
+      # same shape as the 2026-07-26 incident above, one level down. Deriving
+      # also keeps the single-platform case working unchanged: a bare manifest
+      # has no children, so the expected set is just itself.
+      - name: Verify every tag serves only the scanned image manifests
         if: env.PUBLISH == 'true'
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          while IFS= read -r tag; do
-            [ -z "$tag" ] && continue
-            raw="$(docker buildx imagetools inspect --raw "$tag")"
-            # An index lists children under .manifests; a bare manifest has none.
+
+          # Image manifests a reference resolves to, one per line, sorted.
+          # An index lists children under .manifests; a bare manifest has none.
+          served_manifests() {
+            local ref="$1" raw served
+            raw="$(docker buildx imagetools inspect --raw "$ref")"
             served="$(printf '%s' "$raw" | jq -r '
               if .manifests then
-                [ .manifests[]
-                  | select((.annotations["vnd.docker.reference.type"] // "")
-                           != "attestation-manifest")
-                  | .digest ] | join(" ")
+                .manifests[]
+                | select((.annotations["vnd.docker.reference.type"] // "")
+                         != "attestation-manifest")
+                | .digest
               else
                 empty
-              end')"
+              end' | sort)"
             if [ -z "$served" ]; then
-              served="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$tag")"
+              docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref"
+            else
+              printf '%s\n' "$served"
             fi
-            echo "${tag} serves: ${served} (scanned ${DIGEST})"
-            for d in $served; do
-              if [ "$d" != "${DIGEST}" ]; then
-                echo "::error::${tag} serves ${d}, which is not the scanned digest ${DIGEST}" >&2
-                exit 1
-              fi
-            done
+          }
+
+          expected="$(served_manifests "${IMAGE}@${DIGEST}")"
+          if [ -z "$expected" ]; then
+            echo "::error::scanned ${DIGEST} resolved to no image manifest at all" >&2
+            exit 1
+          fi
+          echo "scanned ${DIGEST} serves:"
+          printf '  %s\n' $expected
+
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            served="$(served_manifests "$tag")"
             if [ -z "$served" ]; then
               echo "::error::${tag} resolved to no image manifest at all" >&2
               exit 1
             fi
+            if [ "$served" != "$expected" ]; then
+              echo "::error::${tag} serves a different set of manifests than the scanned index" >&2
+              echo "  tag:     $(printf '%s' "$served" | tr '\n' ' ')" >&2
+              echo "  scanned: $(printf '%s' "$expected" | tr '\n' ' ')" >&2
+              exit 1
+            fi
+            echo "${tag} OK — serves exactly the scanned manifests"
           done <<< "$TAGS"
 
       - name: Attest build provenance for the image

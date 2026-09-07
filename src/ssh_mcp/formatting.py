@@ -228,8 +228,18 @@ def format_group_results(results: list[ExecResult], group_name: str) -> str:
             f"Executing on group '{group_name}' (0 servers)...\n\nNo servers in group."
         )
 
+    # A registry-level failure is not a one-server group. `execute_on_group`
+    # cannot raise (see ExecResult in models.py), so an unknown group comes
+    # back as a single result whose `server` IS the group name — and framing
+    # that as "Executing on group 'x' (1 servers)..." states two false things
+    # at once: that the group exists, and that it has a member. Observed
+    # 2026-09-07 during end-to-end testing.
+    if len(results) == 1 and results[0].server == group_name and results[0].error:
+        return f"ERROR: {results[0].error}"
+
+    plural = "server" if len(results) == 1 else "servers"
     lines = [
-        f"Executing on group '{group_name}' ({len(results)} servers)...",
+        f"Executing on group '{group_name}' ({len(results)} {plural})...",
         "",
     ]
 
