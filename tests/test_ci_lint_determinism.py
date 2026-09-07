@@ -155,6 +155,22 @@ def test_ruff_rule_selection_is_declared_by_this_repo() -> None:
     )
     assert isinstance(select, list) and all(isinstance(r, str) for r in select)
 
+    # BLE is a security guard, not a style preference: the 9 broad
+    # `except Exception` blocks in src/ carry `# noqa: BLE001` naming why
+    # each exists, and the rule is what makes a NEW accidental blind
+    # except fail CI. In a codebase where a swallowed exception can
+    # silently drop a security control, quietly dropping "BLE" from this
+    # list would remove the net without removing the noqa comments that
+    # make it look like the net is still there. `I` is pinned for the
+    # duller reason that import order should not drift back to
+    # hand-maintained. Panel finding 2026-09-06: the assertion above passes
+    # for ANY non-empty list of strings, so neither group was protected.
+    for group in ("I", "BLE"):
+        assert group in select, (
+            f"[tool.ruff.lint] select lost {group!r} (now {select!r}). See the "
+            "rationale block above it in pyproject.toml before changing this."
+        )
+
 
 def test_pip_audit_has_a_dedicated_job() -> None:
     """The audit's input is world-state; it should not masquerade as a lint error."""

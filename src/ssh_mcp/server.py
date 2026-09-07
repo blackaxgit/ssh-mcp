@@ -790,16 +790,41 @@ def _build_http_app(
 
 
 def _assert_valid_bearer_token(token: str) -> None:
-    """Raise ValueError if ``token`` is too short or empty.
+    """Raise ValueError if ``token`` cannot work as an HTTP bearer credential.
 
-    Validates token length before installing the bearer middleware.
-    Called by ``_build_http_app`` so bad tokens fail fast at app
-    construction time, not on the first request.
+    Validates the token before installing the bearer middleware. Called by
+    ``_build_http_app`` so bad tokens fail fast at app construction time,
+    not on the first request. Applies to BOTH sources — the
+    ``SSH_MCP_HTTP_TOKEN`` env var and ``SSH_MCP_HTTP_TOKEN_FILE`` — because
+    both converge on the same ``token`` variable before this runs.
+
+    Two rules:
+
+    * At least ``_MIN_TOKEN_LENGTH`` characters. A short or empty secret
+      guarding remote command execution is a security risk.
+    * Printable ASCII with no interior whitespace. This is not pedantry: a
+      validator demonstrated against the installed h11 that a token
+      containing NUL or a newline raises ``LocalProtocolError: Illegal
+      header value`` in the CLIENT, and that a non-ASCII token is Latin-1
+      encoded by common clients while the middleware compares UTF-8 bytes —
+      so the server would start happily with a secret that returns 401 to
+      everyone, forever. Failing at startup turns a silently unusable
+      deployment into an actionable error. The rule is deliberately looser
+      than RFC 6750's ``b64token`` grammar, which would reject characters
+      that do work today (``:``, ``!``) and break existing deployments.
     """
     if not token or len(token) < _MIN_TOKEN_LENGTH:
         raise ValueError(
             f"bearer token must be at least {_MIN_TOKEN_LENGTH} characters "
             f"(got {len(token)}) — a short or empty token is a security risk"
+        )
+    if not token.isascii() or not token.isprintable() or any(map(str.isspace, token)):
+        raise ValueError(
+            "bearer token must be printable ASCII with no whitespace — an "
+            "HTTP header value cannot carry control characters, interior "
+            "spaces or non-ASCII text, so such a token would return 401 to "
+            "every client. Check for a stray newline, tab or non-ASCII "
+            "character in SSH_MCP_HTTP_TOKEN / SSH_MCP_HTTP_TOKEN_FILE."
         )
 
 
@@ -1096,6 +1121,15 @@ def _read_token_file(token_file: str) -> str:
                 "limit. A bearer token is tens of bytes — this is almost "
                 "certainly the wrong path."
             )
+        # Permission checks are POSIX-only. On Windows CPython SYNTHESISES
+        # st_mode as S_IFREG|0o666 for any non-read-only file (0o444 when the
+        # read-only attribute is set), so `& 0o022` would be true for every
+        # ordinary file and this would refuse EVERY Windows token file while
+        # telling the operator to run `chmod go-w`, which does not exist
+        # there. Verified against `stat.S_IFREG | 0o666`. The mode bits carry
+        # no ACL information on Windows, so there is nothing meaningful to
+        # check rather than something to fake.
+        posix_perms = os.name == "posix"
         # Group/other WRITE is refused, not warned. Panel finding: the
         # original single `& 0o077` test lumped three different things
         # together. A writable token file is an INTEGRITY hole, strictly
@@ -1105,7 +1139,15 @@ def _read_token_file(token_file: str) -> str:
         # bends over backwards to support: Docker Swarm mounts secrets 0444
         # and Kubernetes defaults to 0644, neither of which carries a
         # group/other write bit.
-        if st.st_mode & 0o022:
+        #
+        # It is load-bearing rather than advisory, but it is a SNAPSHOT: a
+        # successful O_RDONLY open proves only that THIS process may read,
+        # and says nothing about whether others may mutate the inode, so
+        # refusing here does stop a steady-state 0666 file from supplying the
+        # secret. It is not a continuous immutability guarantee — the owner,
+        # root, or a writer holding an fd opened while the file was still
+        # writable can change the content afterwards.
+        if posix_perms and st.st_mode & 0o022:
             raise RuntimeError(
                 f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} is writable beyond "
                 f"its owner (mode {oct(stat.S_IMODE(st.st_mode))}). Anyone "
@@ -1116,7 +1158,7 @@ def _read_token_file(token_file: str) -> str:
         # READ access only warns — see the docstring for why this cannot be
         # fatal. Note this tests 0o044 rather than 0o077: an execute bit on
         # a regular file discloses nothing, so warning about it was noise.
-        if st.st_mode & 0o044:
+        if posix_perms and st.st_mode & 0o044:
             logger.warning(
                 "SSH_MCP_HTTP_TOKEN_FILE %r is readable beyond its owner "
                 "(mode %s). This token authenticates remote command "
@@ -1132,31 +1174,47 @@ def _read_token_file(token_file: str) -> str:
         # the process runs unprivileged, so `st_uid == geteuid()` would
         # reject them. But a file owned by some OTHER unprivileged user is
         # worth saying out loud: that user can rewrite it whenever they like.
-        if st.st_uid not in (os.geteuid(), 0):
+        #
+        # `os.geteuid` is POSIX-only, exactly like `os.O_NONBLOCK` above, and
+        # a bare call would AttributeError on Windows for EVERY token file —
+        # a validator caught this as the same class of bug the O_NONBLOCK
+        # getattr already guards against. Windows has no uid to compare, so
+        # the check is skipped there rather than faked.
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is not None and st.st_uid not in (geteuid(), 0):
             logger.warning(
                 "SSH_MCP_HTTP_TOKEN_FILE %r is owned by uid %d, which is "
                 "neither this process (uid %d) nor root. That user can "
                 "replace the token at any time.",
                 token_file,
                 st.st_uid,
-                os.geteuid(),
+                geteuid(),
             )
-        with os.fdopen(fd, encoding="utf-8") as fh:
+        # Read BYTES, not text. `st_size` above is only a pre-read snapshot —
+        # a regular file can grow between `fstat` and `read` — so the cap has
+        # to bind on what was actually read. It must also bind on BYTES:
+        # `TextIOWrapper.read(n)` counts decoded CHARACTERS, so reading
+        # `n` from a text stream accepted 65,536 multi-byte characters =
+        # 131,072 bytes and still passed, which a validator demonstrated with
+        # a file of `é`. Decoding after the length check makes the limit mean
+        # what README and CHANGELOG say it means.
+        with os.fdopen(fd, "rb") as fh:
             fd = -1  # fdopen owns it now; do not double-close in `finally`
-            # Bounded read, because `st_size` above is only a pre-read
-            # snapshot: a regular file can grow between `fstat` and `read`,
-            # so an unbounded `fh.read()` would blow past the limit the
-            # message promises. Reading MAX+1 makes the cap real rather than
-            # advisory, and costs one extra byte.
-            data = fh.read(_MAX_TOKEN_FILE_BYTES + 1)
-            if len(data) > _MAX_TOKEN_FILE_BYTES:
-                raise RuntimeError(
-                    f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} exceeds the "
-                    f"{_MAX_TOKEN_FILE_BYTES}-byte limit while being read. "
-                    "A bearer token is tens of bytes — this is almost "
-                    "certainly the wrong path."
-                )
-            return data.strip()
+            raw = fh.read(_MAX_TOKEN_FILE_BYTES + 1)
+        if len(raw) > _MAX_TOKEN_FILE_BYTES:
+            raise RuntimeError(
+                f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} exceeds the "
+                f"{_MAX_TOKEN_FILE_BYTES}-byte limit while being read. "
+                "A bearer token is tens of bytes — this is almost "
+                "certainly the wrong path."
+            )
+        # utf-8-sig, not utf-8: a BOM is NOT whitespace, so `.strip()` leaves
+        # it on the front of the token. Windows Notepad and PowerShell's
+        # `Out-File` both write one by default, and the result was a token
+        # that looked correct to the operator, counted the BOM toward the
+        # 16-character minimum, and returned 401 to every client forever.
+        # utf-8-sig is a superset here — it decodes BOM-less UTF-8 unchanged.
+        return raw.decode("utf-8-sig").strip()
     except UnicodeDecodeError as e:
         # UnicodeDecodeError is a ValueError, NOT an OSError, so the handler
         # below does not catch it and it would escape as a raw traceback at
@@ -1230,12 +1288,41 @@ def _run_http() -> None:
             f"SSH_MCP_HTTP_PORT={port} is out of range (must be 1-65535)"
         )
     # M4: strip whitespace so env-file tokens with a trailing newline work
-    raw_token = os.environ.get("SSH_MCP_HTTP_TOKEN", "").strip()
+    env_token_raw = os.environ.get("SSH_MCP_HTTP_TOKEN", "")
+    raw_token = env_token_raw.strip()
     # P5: fall back to reading token from a file (e.g. Docker secret mount)
-    if not raw_token:
-        token_file = os.environ.get("SSH_MCP_HTTP_TOKEN_FILE", "").strip()
-        if token_file:
-            raw_token = _read_token_file(token_file)
+    token_file = os.environ.get("SSH_MCP_HTTP_TOKEN_FILE", "").strip()
+    if not raw_token and token_file:
+        raw_token = _read_token_file(token_file)
+        if not raw_token:
+            # "Configured but empty" is NOT the same as "not configured", and
+            # collapsing the two silently disabled authentication: an empty
+            # token file mapped to `token = None`, which on a loopback bind
+            # means the endpoint serves with NO bearer middleware at all.
+            # An operator who went to the trouble of mounting a secret file
+            # is not asking for that. Panel finding 2026-09-06; it also
+            # mirrors the treatment SSH_MCP_HTTP_ALLOWED_HOSTS has always
+            # had, where set-but-whitespace is refused rather than silently
+            # read as "no extra hosts".
+            raise RuntimeError(
+                f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} is empty or contains "
+                "only whitespace. A configured token source that yields no "
+                "token would silently disable authentication. Write a token "
+                "to the file, unset the variable, or set "
+                "SSH_MCP_HTTP_AUTH=none if unauthenticated is deliberate."
+            )
+    elif not raw_token and env_token_raw and not token_file:
+        # Same rule for the env var: a non-empty value that strips to nothing
+        # is a broken substitution (e.g. `SSH_MCP_HTTP_TOKEN="${SECRET}"`
+        # with SECRET unset expanding to a space), not a request for
+        # anonymous access. A literal "" is still treated as unset, matching
+        # how every other SSH_MCP_HTTP_* variable behaves.
+        raise RuntimeError(
+            "SSH_MCP_HTTP_TOKEN is set but contains only whitespace. A "
+            "configured token that strips to nothing would silently disable "
+            "authentication. Set a real token, unset the variable, or set "
+            "SSH_MCP_HTTP_AUTH=none if unauthenticated is deliberate."
+        )
     token = raw_token or None
     stateless = (
         os.environ.get("SSH_MCP_HTTP_STATELESS", "false").strip().lower() == "true"
