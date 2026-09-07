@@ -2041,8 +2041,29 @@ class SSHManager:
                 # open_beneath does blocking syscalls (openat per
                 # component) — off the event loop thread, same as the
                 # read loop below.
+                #
+                # O_NONBLOCK is load-bearing, not defensive: without it an
+                # O_RDONLY open of a fifo beneath transfer_root blocks
+                # forever waiting for a writer, so the S_ISREG refusal
+                # immediately below is UNREACHABLE for exactly the file
+                # type it exists to reject. The open runs in a worker
+                # thread, so the event loop survives — but the thread does
+                # not: measured 2026-09-07, 16 concurrent fifo uploads
+                # exhaust the default executor (min(32, cpu+4)) and every
+                # later to_thread call, i.e. ALL SFTP in the process,
+                # stalls until restart while `execute` keeps working.
+                # This is the same defect 0.8.0 fixed for
+                # SSH_MCP_HTTP_TOKEN_FILE (server.py::_read_token_file) and
+                # missed here. Referenced bare rather than via getattr
+                # because this subsystem is POSIX-only by design:
+                # _transfer_root() awaits paths.py::ensure_root first,
+                # which fails closed without O_NOFOLLOW/O_DIRECTORY, so
+                # this line is unreachable on a platform lacking the
+                # constant. O_NONBLOCK is a no-op on a regular file and is
+                # NOT a liveness guarantee — a regular file on a hostile
+                # FUSE mount can still block the read.
                 local_fd = await asyncio.to_thread(
-                    open_beneath, root_fd, local_path, os.O_RDONLY
+                    open_beneath, root_fd, local_path, os.O_RDONLY | os.O_NONBLOCK
                 )
 
                 # fstat the descriptor we are ABOUT TO READ, not a path —

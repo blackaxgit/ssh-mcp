@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+**`upload_file` on a non-regular local file no longer hangs.** The local open beneath `transfer_root` now passes `O_NONBLOCK`. `_upload_impl` has always `fstat`-ed the descriptor and refused anything that is not a regular file, but for a **fifo** that refusal was unreachable: a plain `O_RDONLY` open blocks until a writer appears, so the check never ran for exactly the file type it exists to reject. Found by end-to-end testing against a live SSH host on 2026-09-07, not by the unit suite — the existing non-regular test uses a *directory*, which opens fine and therefore does reach the guard.
+
+The open runs in a worker thread, so the event loop survived; the thread did not. Sixteen concurrent fifo uploads exhausted the default executor (`min(32, cpu+4)`) and every later `asyncio.to_thread` call — all SFTP in the process — stalled until restart, while `execute` kept working. Reaching it requires a non-regular file beneath `transfer_root`, which is `0700` and owner-only, so this is a local availability bug rather than a remote one. This is the same defect class 0.8.0 fixed for `SSH_MCP_HTTP_TOKEN_FILE`; the SFTP path was missed. The flag is referenced bare rather than through `getattr` because SFTP is POSIX-only by design — `paths.py::ensure_root` fails closed without `O_NOFOLLOW`/`O_DIRECTORY` before the open is reached.
+
 ## [0.8.0] - 2026-09-06
 
 > **Why 0.8.0 and not 0.7.1:** two of the changes below make a configuration that started successfully on 0.7.0 **refuse to start**, which is a breaking change to operator-visible behaviour rather than a bug fix. An empty or whitespace-only `SSH_MCP_HTTP_TOKEN_FILE`, a whitespace-only `SSH_MCP_HTTP_TOKEN`, and a token containing non-ASCII, a control character or an interior space all used to boot; all now abort. A token file with mode `0666` does too. Shipping that as a patch would let `~=0.7.0` pull it in silently and take a working deployment down on its next restart, so it takes the minor — the same reasoning recorded above for 0.6.0 over 0.5.7. The 0.6.1 precedent of a "BREAKING" patch does not apply: that one renamed the PyPI distribution while keeping an `ssh-mcp` alias, the import package and the image, so only the install command changed, never the behaviour of a running server.
