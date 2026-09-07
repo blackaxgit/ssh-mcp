@@ -7,6 +7,8 @@ and connection cleanup. All SSH operations are mocked to avoid real connections.
 from __future__ import annotations
 
 import asyncio
+import io
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,10 +16,11 @@ import asyncssh
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
+import ssh_mcp
 import ssh_mcp.server as server_module
 from ssh_mcp.config import ServerRegistry
 from ssh_mcp.models import ExecResult
-from ssh_mcp.ssh import SSHManager
+from ssh_mcp.ssh import SSHManager, _REDACTION_PLACEHOLDER
 
 
 # ---------------------------------------------------------------------------
@@ -704,3 +707,63 @@ class TestToolSignatureStability:
         sig = inspect.signature(server_module.list_groups)
         params = list(sig.parameters.keys())
         assert params == []
+
+
+# ---------------------------------------------------------------------------
+# Panel 2026-09-06: _mcp_tool traceback redaction
+# ---------------------------------------------------------------------------
+
+
+class TestMcpToolTracebackRedaction:
+    """``exc_info=True`` on the tool-error log path re-emitted credentials
+    verbatim inside the rendered traceback even when the log message line
+    was redacted — a validator reproduced ``hunter2`` appearing twice more
+    in the traceback below a redacted message line.
+    """
+
+    async def test_mcp_tool_error_log_redacts_traceback_credentials(
+        self, mock_init: MagicMock
+    ) -> None:
+        """Rendered ERROR output must contain no credential and must show
+        ``{REDACTED}`` in both the message and the embedded traceback text.
+        """
+        exc = RuntimeError("cmd failed: mysql --password=hunter2")
+        mock_init.upload = AsyncMock(side_effect=exc)
+
+        log_buffer = io.StringIO()
+        server_logger = logging.getLogger("ssh_mcp.server")
+        handler = logging.StreamHandler(log_buffer)
+        root = logging.getLogger()
+        if root.handlers:
+            handler.setFormatter(root.handlers[0].formatter)
+        else:
+            handler.setFormatter(logging.Formatter("%(message)s"))
+        server_logger.addHandler(handler)
+        prior_level = server_logger.level
+        server_logger.setLevel(logging.ERROR)
+        try:
+            with pytest.raises(ToolError) as raised:
+                await server_module.upload_file(
+                    server="test-web1",
+                    local_path="/tmp/leak.txt",
+                    remote_path="/home/user/leak.txt",
+                )
+        finally:
+            server_logger.removeHandler(handler)
+            server_logger.setLevel(prior_level)
+
+        rendered = log_buffer.getvalue()
+        assert "hunter2" not in rendered, f"Credential leaked in log: {rendered!r}"
+        assert _REDACTION_PLACEHOLDER in rendered
+        assert "hunter2" not in str(raised.value), (
+            f"Credential leaked in ToolError: {raised.value!r}"
+        )
+
+
+class TestMcpServerVersionIdentity:
+    """MCP SDK v2 reports serverInfo version ``""`` unless passed explicitly."""
+
+    def test_mcp_server_reports_package_version(self) -> None:
+        """The module-level ``MCPServer`` must advertise ssh-mcp's own version."""
+        assert server_module.mcp.version == ssh_mcp.__version__
+        assert server_module.mcp.version != ""

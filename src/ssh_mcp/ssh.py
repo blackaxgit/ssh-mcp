@@ -110,6 +110,31 @@ def _safe_log_value(value: Any) -> str:
     return repr(value)
 
 
+def _safe_exc(e: BaseException) -> str:
+    """Render an exception for a log line: redacted, then control-escaped.
+
+    Panel finding 2026-09-06. The 0.7.0 work redacted the three
+    ``ExecResult.error`` strings but left ten ``_safe_log_value(str(e))``
+    call sites logging the RAW exception, so a credential embedded in an
+    exception message still reached the log aggregator even though the
+    client-visible result was clean. A validator reproduced it against
+    ``asyncssh.DisconnectError(2, 'auth failed for
+    https://deploy:hunter2@bastion.example.com')``: the tool result read
+    ``{REDACTED}`` while the log line printed ``hunter2``.
+
+    ``_safe_log_value`` only escapes control characters — it has never
+    redacted anything. Composing the two in ONE helper makes the
+    invariant greppable: no exception text reaches a logger except
+    through here. Order matters. Redact first, escape second, so the
+    escaping applies to the redacted text and cannot smuggle a control
+    character past the regexes.
+
+    Redaction remains the documented TRIPWIRE: it catches command- and
+    URL-shaped credentials, not prose such as ``password: hunter2``.
+    """
+    return _safe_log_value(_redact_secrets(str(e)))
+
+
 # ---------------------------------------------------------------------------
 # Credential redaction (production incident 2026-04-11)
 #
@@ -2107,7 +2132,7 @@ class SSHManager:
                 "sftp.upload.failed error=file_not_found duration_ms=%s",
                 duration_ms,
             )
-            error_msg = f"Local file not found: {_safe_log_value(str(e))}"
+            error_msg = f"Local file not found: {_safe_exc(e)}"
             logger.error("%s", error_msg)
             raise ValueError(error_msg) from e
 
@@ -2124,8 +2149,7 @@ class SSHManager:
                 duration_ms,
             )
             error_msg = (
-                f"Upload failed to {_safe_log_value(server_name)}: "
-                f"{_safe_log_value(str(e))}"
+                f"Upload failed to {_safe_log_value(server_name)}: {_safe_exc(e)}"
             )
             logger.error("%s", error_msg)
             raise RuntimeError(error_msg) from e
@@ -2379,8 +2403,7 @@ class SSHManager:
                 duration_ms,
             )
             error_msg = (
-                f"Download failed from {_safe_log_value(server_name)}: "
-                f"{_safe_log_value(str(e))}"
+                f"Download failed from {_safe_log_value(server_name)}: {_safe_exc(e)}"
             )
             logger.error("%s", error_msg)
             raise RuntimeError(error_msg) from e
@@ -2433,7 +2456,7 @@ class SSHManager:
                 logger.warning(
                     "Error closing connection to %s: %s",
                     _safe_log_value(server_name),
-                    _safe_log_value(str(e)),
+                    _safe_exc(e),
                 )
 
         self._connections.clear()
@@ -2590,18 +2613,34 @@ class SSHManager:
                 timeout=self.settings.command_timeout,
             )
             return conn
-        except asyncssh.DisconnectError as e:
-            logger.error(
-                "SSH disconnect error connecting to %s: %s",
-                _safe_log_value(server.name),
-                _safe_log_value(str(e)),
-            )
-            raise
+        # `except asyncssh.PermissionDenied` MUST precede
+        # `except asyncssh.DisconnectError`: PermissionDenied is a
+        # SUBCLASS of DisconnectError (verified against asyncssh 2.24.0 —
+        # `PermissionDenied.__mro__` is PermissionDenied -> DisconnectError
+        # -> Error -> Exception). With DisconnectError first, which is how
+        # this stood until 0.7.0, the PermissionDenied arm was unreachable
+        # dead code and every auth failure was logged as "SSH disconnect
+        # error", sending operators chasing a network fault instead of a
+        # bad key or username. Found by a Pyright `reportUnusedExcept`
+        # during the 0.7.0 review panel.
+        #
+        # This is the SAME bug class as the TimeoutError/OSError ordering
+        # documented immediately below, which was found and fixed earlier;
+        # this pair was missed at the time. Both re-raise, so only the log
+        # message was wrong — but that message is the operator's first
+        # signal.
         except asyncssh.PermissionDenied as e:
             logger.error(
                 "SSH permission denied for %s: %s",
                 _safe_log_value(server.name),
-                _safe_log_value(str(e)),
+                _safe_exc(e),
+            )
+            raise
+        except asyncssh.DisconnectError as e:
+            logger.error(
+                "SSH disconnect error connecting to %s: %s",
+                _safe_log_value(server.name),
+                _safe_exc(e),
             )
             raise
         # `except asyncio.TimeoutError` MUST precede `except OSError`: on
@@ -2621,14 +2660,14 @@ class SSHManager:
             logger.error(
                 "Timeout connecting to %s: %s",
                 _safe_log_value(server.name),
-                _safe_log_value(str(e)),
+                _safe_exc(e),
             )
             raise
         except OSError as e:
             logger.error(
                 "OS error connecting to %s: %s",
                 _safe_log_value(server.name),
-                _safe_log_value(str(e)),
+                _safe_exc(e),
             )
             raise
 
@@ -2701,7 +2740,7 @@ class SSHManager:
                                 logger.warning(
                                     "Error evicting connection to %s: %s",
                                     _safe_log_value(server_name),
-                                    _safe_log_value(str(e)),
+                                    _safe_exc(e),
                                 )
                             finally:
                                 self._connections.pop(server_name, None)
@@ -2726,9 +2765,7 @@ class SSHManager:
         except asyncio.CancelledError:
             logger.info("Connection eviction loop cancelled")
         except Exception as e:
-            logger.error(
-                "Unexpected error in eviction loop: %s", _safe_log_value(str(e))
-            )
+            logger.error("Unexpected error in eviction loop: %s", _safe_exc(e))
             # R5 finding #6: reset _running so _start_eviction_loop() can
             # restart the loop on the next _get_connection() call. Without
             # this, _running stays True after a crash and the loop is

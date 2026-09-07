@@ -23,6 +23,7 @@ import functools
 import logging
 import os
 import sys
+import traceback
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -44,25 +45,31 @@ from ssh_mcp.formatting import (
 from ssh_mcp.ssh import SSHManager, _redact_secrets
 
 # ---------------------------------------------------------------------------
-# OpenTelemetry tracing — soft-imported so ssh_mcp[otel] is genuinely optional.
+# OpenTelemetry tracing.
 #
-# When `opentelemetry-api` is installed, every MCP tool call gets a span
-# named ``mcp.tool.{name}`` with attributes for the tool name and (on
-# failure) the exception type. Inner SSH operations create child spans
-# inside this one via automatic context propagation. Operators bring their
-# own SDK + exporter (Jaeger, Tempo, OTLP collector, etc).
+# Every MCP tool call gets a span named ``mcp.tool.{name}`` with attributes
+# for the tool name and (on failure) the exception type. Inner SSH
+# operations create child spans inside this one via automatic context
+# propagation. Operators bring their own SDK + exporter (Jaeger, Tempo,
+# OTLP collector, etc); with the API alone the spans are created and go
+# nowhere, which costs effectively nothing.
 #
-# When `opentelemetry-api` is NOT installed, the helper ``_span`` below is a
-# no-op context manager — zero runtime cost, zero import errors.
+# There is no `ssh_mcp[otel]` extra any more — 0.7.0 deleted it, because
+# mcp>=2 declares `opentelemetry-api>=1.28.0` as a HARD dependency, so the
+# API is always installed alongside the SDK this server cannot run without.
+# The try/except below is therefore vestigial: importing
+# `mcp.server.mcpserver` above eagerly imports `opentelemetry.trace`, so an
+# environment missing the API dies at that import, never here. It is kept
+# as four cheap lines of insurance in case a future mcp release drops the
+# dependency; do not read it as evidence that a no-tracing install is a
+# supported configuration.
 # ---------------------------------------------------------------------------
 try:
     from opentelemetry import trace as _otel_trace
 
     _tracer: Any = _otel_trace.get_tracer("ssh_mcp")
-    _otel_available: bool = True
-except ImportError:  # pragma: no cover - exercised by env without extras
+except ImportError:  # pragma: no cover - unreachable; see comment above
     _tracer = None
-    _otel_available = False
 
 
 @contextlib.contextmanager
@@ -356,14 +363,23 @@ def _mcp_tool(func: F) -> F:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # Same leak class as the SDK's own INFO tool-failure log
-            # (2b-bis): this string is what mcp/server/mcpserver/server.py
-            # logs at INFO and puts into CallToolResult.content, so
-            # redact it once here and reuse it for both the log line and
-            # the client-visible ToolError. exc_info=True still carries
-            # the full traceback for operators reading our own log.
+            # Redact BOTH the message and the traceback. `exc_info=True`
+            # was the leak: logging.Formatter renders the original
+            # exception (and every `__cause__` in the chain) verbatim, so
+            # the redaction on the line below was defeated on the log
+            # path while only the client-visible ToolError stayed clean.
+            # Reproduced 2026-09-06 by two validators and directly: a
+            # RuntimeError carrying `mysql --password=hunter2` logged the
+            # message as `--password={REDACTED}` and then printed
+            # `hunter2` TWICE more in the traceback below it.
+            #
+            # Formatting the traceback ourselves and redacting the whole
+            # rendered string keeps it useful for operators while holding
+            # the invariant that no raw exception text reaches a logger.
+            # Do not restore `exc_info=True` here.
             redacted = _redact_secrets(str(e))
-            logger.error("%s failed: %s", tool_name, redacted, exc_info=True)
+            redacted_tb = _redact_secrets("".join(traceback.format_exception(e)))
+            logger.error("%s failed: %s\n%s", tool_name, redacted, redacted_tb)
             raise ToolError(redacted) from e
 
     return cast(F, wrapper)
@@ -921,33 +937,41 @@ def _build_transport_security(
         # implication. Fail loud instead of silently letting it through.
         #
         # Ordering trap (regression found on ci/fix-digest-verification):
-        # the previous implementation special-cased entries starting with
+        # an earlier implementation special-cased entries starting with
         # "*." as "always a permitted suffix wildcard, skip refusal" via a
         # `continue` evaluated before the `entry in {"*", "*:*", "*.*"}`
-        # refusal was reached. "*.*" itself starts with "*." too, so that
-        # `continue` fired first and let "*.*" — which matches essentially
-        # any dotted hostname and is semantically identical to the bare
-        # "*" this gate exists to block — through as PERMITTED even though
-        # it was listed in the refusal set. Do not reintroduce a
-        # startswith("*.")-first shortcut. The fix below strips the two
-        # deliberately-permitted wildcard *forms* (a trailing ":*" port
-        # wildcard, then a leading "*." subdomain wildcard) and only
-        # afterwards demands a concrete, wildcard-free remainder.
+        # refusal was reached. "*.*" starts with "*." too, so that
+        # `continue` fired first and let "*.*" — semantically identical to
+        # the bare "*" this gate exists to block — through as PERMITTED.
+        # Do not reintroduce a startswith("*.")-first shortcut.
+        #
+        # Suffix wildcards are now REFUSED too (panel finding 2026-09-06,
+        # two independent validators plus a direct read of the installed
+        # SDK). Until 0.7.0 this gate permitted "*.internal.example.com"
+        # and three docs sites advertised it, but the SDK never
+        # implemented suffix matching: mcp 2.1.1's
+        # TransportSecurityMiddleware._validate_host
+        # (mcp/server/transport_security.py:50-69) does an exact-set
+        # lookup and then ONE trailing ":*" port-wildcard pass, and there
+        # is no "*." handling anywhere in the SDK. A "*." entry was
+        # therefore matched LITERALLY, so a real Host header such as
+        # "api.internal.example.com" got a 421 and the operator had no
+        # way to see why. Refusing at startup turns a silent
+        # reject-everything into a loud, actionable error. Only a
+        # trailing ":*" port wildcard is a real feature here.
         for entry in extra_hosts:
-            remainder = entry
-            if remainder.endswith(":*"):
-                remainder = remainder[:-2]
-            if remainder.startswith("*."):
-                remainder = remainder[2:]
+            remainder = entry[:-2] if entry.endswith(":*") else entry
             if not remainder or "*" in remainder or not remainder.strip("."):
                 raise RuntimeError(
-                    f"SSH_MCP_HTTP_ALLOWED_HOSTS wildcard entry {entry!r} "
-                    "would disable DNS-rebinding protection. "
-                    "Use a concrete hostname (e.g. 'ssh-mcp.internal:*') instead."
+                    f"SSH_MCP_HTTP_ALLOWED_HOSTS entry {entry!r} contains a "
+                    "wildcard the MCP SDK does not implement, so it would "
+                    "match no request at all. Only a trailing ':*' port "
+                    "wildcard is supported. List each concrete hostname "
+                    "instead (e.g. 'api.internal.example.com:*')."
                 )
 
     # Also add the actual bind host if it's not already covered
-    if host not in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:  # nosec B104
+    if host not in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:
         base_hosts.append(f"{host}:*")
 
     default_origins = [
@@ -997,8 +1021,10 @@ def _run_http() -> None:
     * ``SSH_MCP_HTTP_ALLOWED_HOSTS`` — comma-separated extra Host headers
       for DNS-rebinding protection (in addition to localhost). Protection is
       always ON and cannot be disabled; bare wildcard entries (``*``, ``*:*``,
-      ``*.*``) abort startup because they would silently defeat it. Wildcard
-      SUFFIXES such as ``*.internal.example.com`` are accepted.
+      ``*.*``) abort startup because they would silently defeat it. A
+      leading ``*.`` suffix wildcard is ALSO refused as of 0.7.0: the MCP
+      SDK never implemented suffix matching, so such an entry matched
+      literally and rejected every real request. List concrete hostnames.
     * ``SSH_MCP_HTTP_KEEPALIVE_TIMEOUT`` / ``SSH_MCP_HTTP_LIMIT_CONCURRENCY``
       / ``SSH_MCP_HTTP_BACKLOG`` — uvicorn tuning knobs, see
       ``_parse_http_tuning`` for defaults and accepted ranges.
@@ -1030,7 +1056,9 @@ def _run_http() -> None:
                     f"SSH_MCP_HTTP_TOKEN_FILE={token_file!r} could not be read: {e}"
                 ) from e
     token = raw_token or None
-    stateless = os.environ.get("SSH_MCP_HTTP_STATELESS", "false").lower() == "true"
+    stateless = (
+        os.environ.get("SSH_MCP_HTTP_STATELESS", "false").strip().lower() == "true"
+    )
     # Keep the raw (pre-strip) value around so we can tell "unset" apart
     # from "explicitly set to whitespace" below — os.environ.get(..., "")
     # collapses both to "", which would let a blank templated env var

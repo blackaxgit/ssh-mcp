@@ -28,6 +28,7 @@ from ssh_mcp.ssh import (
     _is_dangerous_command,
     _make_connection_id,
     _redact_secrets,
+    _safe_exc,
     _unlink_beneath,
     _validate_remote_path,
 )
@@ -2672,6 +2673,74 @@ groups = ["t"]
         assert results[0].error is not None
         assert "hunter2" not in results[0].error, f"Leaked: {results[0].error!r}"
         assert _REDACTION_PLACEHOLDER in results[0].error
+
+
+class TestCreateConnectionLogRedaction:
+    """Connect-path log leak (panel 2026-09-06): ``_create_connection`` logged
+    ``_safe_log_value(str(e))`` while ``ExecResult.error`` was already
+    redacted. ``TestExecResultErrorRedaction`` patched ``_get_connection`` and
+    never exercised this arm.
+    """
+
+    _CRED_ERROR = "auth failed for https://deploy:hunter2@bastion.example.com"
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[groups]
+t = { description = "t" }
+[servers.web1]
+description = "Test server"
+groups = ["t"]
+"""
+        f = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        f.write(config_content)
+        f.close()
+        return ServerRegistry(f.name)
+
+    async def test_disconnect_error_log_redacts_credentials(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """``asyncssh.connect`` failure must not leak credentials in logs."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), sample_settings)
+
+        with patch(
+            "ssh_mcp.ssh.asyncssh.connect",
+            AsyncMock(
+                side_effect=asyncssh.DisconnectError(2, self._CRED_ERROR),
+            ),
+        ):
+            with caplog.at_level("ERROR", logger="ssh_mcp.ssh"):
+                result = await manager.execute("web1", "true")
+
+        assert result.error is not None
+        assert "hunter2" not in result.error, f"Leaked in result: {result.error!r}"
+        assert _REDACTION_PLACEHOLDER in result.error
+
+        rendered = "\n".join(
+            r.getMessage() for r in caplog.records if r.name == "ssh_mcp.ssh"
+        )
+        assert "hunter2" not in rendered, f"Credential leaked in log: {rendered!r}"
+        assert _REDACTION_PLACEHOLDER in rendered
+
+
+class TestSafeExc:
+    """Direct unit coverage for ``_safe_exc`` — redaction plus control escape."""
+
+    def test_safe_exc_redacts_command_credential_and_escapes_newlines(self) -> None:
+        """A newline in ``str(e)`` must not forge a second log line."""
+        exc = RuntimeError("mysql --password=hunter2\nFORGED=logline")
+        rendered = _safe_exc(exc)
+
+        assert "hunter2" not in rendered
+        assert _REDACTION_PLACEHOLDER in rendered
+        assert "\nFORGED" not in rendered
+        assert "\\n" in rendered
 
 
 # ---------------------------------------------------------------------------

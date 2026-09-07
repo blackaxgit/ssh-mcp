@@ -587,27 +587,49 @@ class TestBearerAuthR3Hardening:
     @pytest.mark.parametrize(
         "entry",
         [
-            "*.internal.example.com",
-            "*.internal.example.com:*",
             "ok.example.com:*",
             "ok.example.com",
         ],
     )
-    def test_deliberate_wildcard_forms_still_permitted(self, entry: str) -> None:
-        """Suffix wildcards and port wildcards remain deliberately permitted.
+    def test_supported_entry_forms_permitted(self, entry: str) -> None:
+        """A concrete hostname, bare or with a trailing port wildcard, passes.
 
-        Documented in AGENTS.md: a leading subdomain wildcard such as
-        ``*.internal.example.com`` and a trailing port wildcard such as
-        ``ok.example.com:*`` (and combinations of the two) must keep
-        working — only entries with no concrete hostname remainder are
-        refused. Exercises ``_build_transport_security`` directly rather
-        than through ``_run_http``, since it is the pure function that
-        owns this decision (no global mutation to observe or restore).
+        These are the only two forms mcp 2.1.1 actually implements:
+        ``TransportSecurityMiddleware._validate_host``
+        (mcp/server/transport_security.py:50-69) does an exact-set lookup
+        and then one trailing ``":*"`` port-wildcard pass. Exercises
+        ``_build_transport_security`` directly rather than through
+        ``_run_http``, since it is the pure function that owns this
+        decision (no global mutation to observe or restore).
         """
         ts = server_module._build_transport_security(entry, "127.0.0.1")
         assert entry in ts.allowed_hosts, (
             f"{entry!r} should be permitted, got {ts.allowed_hosts!r}"
         )
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "*.internal.example.com",
+            "*.internal.example.com:*",
+        ],
+    )
+    def test_suffix_wildcard_refused(self, entry: str) -> None:
+        """A leading ``*.`` entry is refused as of 0.7.0.
+
+        Until 0.7.0 this form was permitted and AGENTS.md, the
+        ``_run_http`` docstring and this test all called it "deliberately
+        permitted". Two independent validators and a direct read of the
+        installed SDK established that it never worked: there is no ``*.``
+        handling anywhere in mcp 2.1.1, so the entry was compared
+        LITERALLY and a real Host header like ``api.internal.example.com``
+        got a 421 with nothing in the logs to explain it. Refusing at
+        startup turns silent reject-everything into a loud error.
+
+        This test fails against 0.6.x, which is the point.
+        """
+        with pytest.raises(RuntimeError, match="does not implement"):
+            server_module._build_transport_security(entry, "127.0.0.1")
 
     def test_token_whitespace_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """M4: SSH_MCP_HTTP_TOKEN with trailing whitespace (common from .env

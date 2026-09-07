@@ -154,7 +154,7 @@ claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx blc-ssh-mc
 | `SSH_MCP_HTTP_LIMIT_CONCURRENCY` | `256` | uvicorn `limit_concurrency`. Max simultaneous in-flight requests before returning HTTP 503. Prevents unbounded growth under burst load. Tune up for high-QPS deployments; tune down on small containers. |
 | `SSH_MCP_HTTP_BACKLOG` | `128` | uvicorn `backlog` — TCP listen backlog for the accept queue. Smaller caps SYN-flood exposure. |
 | `SSH_MCP_HTTP_STATELESS` | `false` | Set to `true` for stateless sessions (recommended for load-balanced or serverless deployments). Default is stateful with server-side sessions. |
-| `SSH_MCP_HTTP_ALLOWED_HOSTS` | — | Comma-separated extra Host-header values the SDK's DNS-rebinding protection should permit (e.g. `ssh-mcp.internal:*,api.example.com:8000`). Localhost aliases are always permitted. |
+| `SSH_MCP_HTTP_ALLOWED_HOSTS` | — | Comma-separated extra Host-header values the SDK's DNS-rebinding protection should permit (e.g. `ssh-mcp.internal:*,api.example.com:8000`). Localhost aliases are always permitted. Only a trailing `:*` port wildcard is supported: any other wildcard — including a `*.subdomain` suffix — aborts startup, because the MCP SDK matches such an entry literally and would reject every request. List concrete hostnames. |
 | `SSH_MCP_TRANSFER_ROOT` | `$XDG_DATA_HOME/ssh-mcp/transfers` | Directory SFTP transfers are confined to. Takes precedence over `transfer_root` in `[settings]`. See [Local path confinement](#security). |
 | `XDG_CONFIG_HOME` | `~/.config` | Honoured when searching for `ssh-mcp/servers.toml` (see [Config file location](#config-file-location)). |
 | `XDG_DATA_HOME` | `~/.local/share` | Base directory for the default transfer root. |
