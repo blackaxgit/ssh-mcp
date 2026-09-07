@@ -153,6 +153,22 @@ class TestConfigureLogging:
         leaked = [r for r in caplog.records if "NEVER_LEAK_AGAIN" in r.getMessage()]
         assert leaked == [], f"asyncssh INFO leaked through to root logger: {leaked}"
 
+    def test_mcp_sdk_logger_silenced_at_warning_level(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MCP SDK v2 logs tool failures at INFO on
+        ``mcp.server.mcpserver.server`` before converting to CallToolResult;
+        upload/download paths must stay suppressed like asyncssh's command log.
+        """
+        monkeypatch.delenv("SSH_MCP_LOG_FORMAT", raising=False)
+        _reload_server_module()
+
+        sdk_logger = logging.getLogger("mcp.server.mcpserver.server")
+        assert sdk_logger.level >= logging.WARNING, (
+            f"mcp.server.mcpserver.server level is {sdk_logger.level} "
+            f"(must be >= WARNING to suppress tool-failure path leaks)"
+        )
+
     def test_unknown_format_falls_back_to_console(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:

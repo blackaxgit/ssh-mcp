@@ -35,17 +35,23 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
-          version: "0.11.32"
+          version: "0.12.10"
           enable-cache: true
       - run: uv python install ${{ matrix.python-version }}
       - run: uv sync --locked --extra dev
-      - run: uv run python -m pytest tests/ -v
+      - env:
+          # 200 examples instead of the `dev` default's 50 — no workflow has
+          # ever set this, so the security fuzzers (_redact_secrets,
+          # _is_dangerous_command) have always run at a quarter of the
+          # intended exploration.
+          HYPOTHESIS_PROFILE: ci
+        run: uv run python -m pytest tests/ -v
 
   lint:
     name: Lint
@@ -53,13 +59,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
-          version: "0.11.32"
+          version: "0.12.10"
           enable-cache: true
       - run: uv python install 3.13
       - run: uv sync --locked --extra dev
@@ -74,13 +80,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
-          version: "0.11.32"
+          version: "0.12.10"
           enable-cache: true
       - run: uv python install 3.13
       - run: uv sync --locked --extra dev
@@ -98,14 +104,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57  # v8.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
-          version: "0.11.32"
+          version: "0.12.10"
           enable-cache: true
 
       - run: uv python install 3.13
@@ -185,7 +191,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/ssh-mcp
+      url: https://pypi.org/p/blc-ssh-mcp
     permissions:
       id-token: write   # mandatory for Trusted Publishing AND for PEP 740 attestations
     steps:
@@ -200,7 +206,7 @@ jobs:
       # since v1.11.0, and setting it explicitly invites someone to "simplify"
       # it to false later.
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
 
   # ---------------------------------------------------------------------------
   # GitHub Release: attach the SBOM + the exact artifacts that were built, and
@@ -248,7 +254,7 @@ jobs:
           path: dist-sbom/
 
       - name: Attest build provenance for the distributions
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-path: "dist/*"
 

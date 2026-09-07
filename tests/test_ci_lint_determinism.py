@@ -540,6 +540,39 @@ def test_github_release_survives_a_failed_pypi_publish() -> None:
     )
 
 
+def _test_job_hypothesis_profile(workflow: dict[str, Any]) -> str | None:
+    """Return ``HYPOTHESIS_PROFILE`` from the ``test`` job's pytest step, if set."""
+    job = workflow["jobs"]["test"]
+    for step in job.get("steps") or []:
+        env = step.get("env")
+        if isinstance(env, dict) and "HYPOTHESIS_PROFILE" in env:
+            return str(env["HYPOTHESIS_PROFILE"])
+    return None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [CI_WORKFLOW_PATH, RELEASE_WORKFLOW_PATH],
+    ids=["ci.yml", "release.yml"],
+)
+def test_hypothesis_profile_is_ci_in_workflows(path: Path) -> None:
+    """Security fuzzers must run the 200-example ``ci`` profile in CI, not ``dev``."""
+    profile = _test_job_hypothesis_profile(_load_workflow(path))
+    assert profile == "ci", (
+        f"{path.name} test job must set HYPOTHESIS_PROFILE=ci for pytest; "
+        f"got {profile!r}. Without it, conftest defaults to the 50-example "
+        f"dev profile and weakens _redact_secrets / _is_dangerous_command fuzzing."
+    )
+
+
+def test_conftest_registers_ci_hypothesis_profile() -> None:
+    """``tests/conftest.py`` must keep a profile named ``ci`` for workflows to select."""
+    from hypothesis import settings as hypothesis_settings
+
+    profile = hypothesis_settings.get_profile("ci")
+    assert profile.max_examples == 200
+
+
 # --- failure-path coverage for the helpers ---------------------------------
 
 

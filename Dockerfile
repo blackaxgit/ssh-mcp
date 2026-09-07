@@ -1,15 +1,15 @@
 # Multi-stage build for Python MCP server with uv package manager
-# Base: python:3.13-slim-trixie (Debian 13, 2026 standard)
-# 3.13 is a deliberate image target; the package itself supports >=3.11 and CI
+# Base: python:3.14-slim-trixie (Debian 13, 2026 standard)
+# 3.14 is a deliberate image target; the package itself supports >=3.11 and CI
 # runs the 3.11-3.14 matrix (pyproject.toml, .github/workflows/ci.yml).
 # Stage 1: Builder - compile dependencies with uv
 
-# python:3.13-slim-trixie
-FROM python:3.13-slim-trixie@sha256:d168b8d9eb761f4d3fe305ebd04aeb7e7f2de0297cec5fb2f8f6403244621664 AS builder
+# python:3.14-slim-trixie
+FROM python:3.14-slim-trixie@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6 AS builder
 
 # Copy uv from official distribution image (not using as base to keep image small)
-# ghcr.io/astral-sh/uv:0.11.3
-COPY --from=ghcr.io/astral-sh/uv:0.11.3@sha256:90bbb3c16635e9627f49eec6539f956d70746c409209041800a0280b93152823 /uv /usr/local/bin/uv
+# ghcr.io/astral-sh/uv:0.12.10
+COPY --from=ghcr.io/astral-sh/uv:0.12.10@sha256:2bb3ebca0a796a155094a27773d290c4b074572e6107f171d88d086682fd2500 /uv /usr/local/bin/uv
 
 # UV_COMPILE_BYTECODE=1 precompiles .pyc for faster cold start.
 # UV_LINK_MODE=copy copies out of the uv cache instead of hardlinking — the
@@ -25,9 +25,11 @@ WORKDIR /app
 # --no-dev is belt-and-braces here: dev deps are declared as the *extra*
 # [project.optional-dependencies].dev, and uv installs no extras by default;
 # there is no [dependency-groups] / [tool.uv] dev-dependencies in pyproject.toml.
-# The otel extra is deliberately NOT installed, so the OpenTelemetry spans in
-# server.py/ssh.py are a silent no-op in this image (they only emit when
-# opentelemetry-api is importable). Add --extra otel to both syncs to enable them.
+# mcp>=2 requires opentelemetry-api outright, so the OpenTelemetry tracing
+# API always ships in this image now — there is no `otel` extra to add any
+# more. The SDK's spans (server.py/ssh.py) are still created, but they stay
+# no-ops until an operator installs an OpenTelemetry SDK and exporter
+# alongside this image.
 # Use cache mounts for uv's package cache to speed up builds
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
@@ -43,8 +45,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Stage 2: Runtime - minimal production image
 
-# python:3.13-slim-trixie
-FROM python:3.13-slim-trixie@sha256:d168b8d9eb761f4d3fe305ebd04aeb7e7f2de0297cec5fb2f8f6403244621664
+# python:3.14-slim-trixie
+FROM python:3.14-slim-trixie@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
 
 # Create non-root user for security (uid 1000 standard)
 RUN useradd --uid 1000 --create-home --shell /sbin/nologin sshmcp
@@ -94,7 +96,7 @@ EXPOSE 8000
 # ~/.config/ssh-mcp/servers.toml reports unhealthy by design. Mount a config
 # and point SSH_MCP_CONFIG at it, as compose.yaml does.
 #
-# start_period=10s covers startup for HTTP transport (FastMCP session
+# start_period=10s covers startup for HTTP transport (MCPServer session
 # manager init + uvicorn bind). interval=30s is standard. --timeout=5s is the
 # only bound on the stdio branch (healthcheck.py's HEALTHCHECK_TIMEOUT=3
 # bounds the HTTP request alone); the stdio import costs ~0.3s.

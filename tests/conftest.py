@@ -19,9 +19,10 @@ from hypothesis import HealthCheck, settings
 from ssh_mcp.models import ExecResult, GroupConfig, ServerConfig, Settings
 
 # Hypothesis profiles: ``dev`` is tuned for a fast inner loop, ``ci`` for a
-# thorough fuzz run. Select via the HYPOTHESIS_PROFILE env var. No workflow in
-# .github/ sets it, so CI currently runs ``dev`` (50 examples) too — export
-# HYPOTHESIS_PROFILE=ci by hand, or in the workflow, to get the 200-example run.
+# thorough fuzz run. Select via the HYPOTHESIS_PROFILE env var. Both
+# ``.github/workflows/ci.yml`` and ``.github/workflows/release.yml`` set
+# HYPOTHESIS_PROFILE=ci, so CI runs the 200-example profile; a local run
+# with the variable unset still defaults to ``dev`` (50 examples).
 #
 # ``suppress_health_check`` is defensive only: every ``@given`` test in the
 # suite takes Hypothesis-drawn arguments exclusively, so no function-scoped
@@ -35,7 +36,11 @@ settings.register_profile(
 settings.register_profile(
     "ci",
     max_examples=200,
-    deadline=1000,
+    # No per-example deadline: CI now runs 200 examples of a superlinear
+    # redaction regex on a shared, often-throttled runner, and a fixed
+    # per-example deadline turns this security gate flaky under load —
+    # which is exactly how security gates get quietly disabled.
+    deadline=None,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
 settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))

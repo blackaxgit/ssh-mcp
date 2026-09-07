@@ -11,6 +11,7 @@ import itertools
 import os
 import time
 
+import asyncssh
 import pytest
 from hypothesis import assume, given
 from hypothesis import strategies as st
@@ -27,6 +28,7 @@ from ssh_mcp.ssh import (
     _is_dangerous_command,
     _make_connection_id,
     _redact_secrets,
+    _safe_exc,
     _unlink_beneath,
     _validate_remote_path,
 )
@@ -2588,6 +2590,157 @@ groups = ["t"]
         assert not any("SuperSecret" in m for m in audit_msgs), (
             "Credential leaked on timeout"
         )
+
+
+class TestExecResultErrorRedaction:
+    """M5 / rev-2 finding (§1.4): three ``_execute_impl`` /
+    ``execute_on_group`` exception handlers used to pass raw ``str(e)``
+    through ``_safe_log_value`` (control-character escaping only, not
+    credential redaction) into both the log line and ``ExecResult.error``.
+    ``formatting.py`` renders ``ExecResult.error`` verbatim to the LLM, so
+    an unredacted connection error leaked credentials straight to the
+    client. The per-task group path already redacted
+    (``ssh.py`` ``execute_on_group`` task-exception harvest); these three
+    sites were the inconsistent ones.
+    """
+
+    # One credential-bearing message for both single-host arms; kept short
+    # enough that the parametrize list below stays one line per case.
+    _CRED_ERROR = "auth failed for https://deploy:hunter2@bastion.example.com"
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[groups]
+t = { description = "t" }
+[servers.web1]
+description = "Test server"
+groups = ["t"]
+"""
+        f = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        f.write(config_content)
+        f.close()
+        return ServerRegistry(f.name)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            asyncssh.DisconnectError(2, _CRED_ERROR),
+            RuntimeError(_CRED_ERROR),
+        ],
+        ids=["site1_disconnect_permission_oserror", "site2_catch_all"],
+    )
+    async def test_single_host_error_result_redacts_credentials(
+        self, exc: Exception
+    ) -> None:
+        """Both single-host arms of ``_execute_impl``: the
+        ``except (DisconnectError, PermissionDenied, OSError)`` tuple
+        (site 1, reached by ``DisconnectError``) and the ``except
+        Exception`` catch-all (site 2, reached by ``RuntimeError``, which
+        is not a member of that tuple). Same injection shape for both —
+        ``_get_connection`` raising, per ``TestDryRun`` — so only the
+        exception varies.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+
+        with patch.object(manager, "_get_connection", AsyncMock(side_effect=exc)):
+            result = await manager.execute("web1", "true")
+
+        assert result.error is not None
+        assert "hunter2" not in result.error, f"Leaked: {result.error!r}"
+        assert _REDACTION_PLACEHOLDER in result.error
+
+    async def test_group_unexpected_error_result_redacts_credentials(self) -> None:
+        """Group-level top-level ``except Exception`` in ``execute_on_group``
+        (site 3). The per-task ``side_effect`` shape used above can't reach
+        this arm — it only catches failures in the group-setup machinery
+        itself, before any task is created. Drive it behaviorally instead:
+        make ``registry.servers_in_group`` raise something other than
+        ``KeyError`` (which has its own, separate handler) so it propagates
+        straight to this handler with no async task plumbing involved."""
+        from unittest.mock import patch
+
+        manager = SSHManager(self._make_registry(), Settings())
+        exc = RuntimeError("auth failed for https://deploy:hunter2@bastion.example.com")
+
+        with patch.object(manager.registry, "servers_in_group", side_effect=exc):
+            results = await manager.execute_on_group("t", "true")
+
+        assert len(results) == 1
+        assert results[0].error is not None
+        assert "hunter2" not in results[0].error, f"Leaked: {results[0].error!r}"
+        assert _REDACTION_PLACEHOLDER in results[0].error
+
+
+class TestCreateConnectionLogRedaction:
+    """Connect-path log leak (panel 2026-09-06): ``_create_connection`` logged
+    ``_safe_log_value(str(e))`` while ``ExecResult.error`` was already
+    redacted. ``TestExecResultErrorRedaction`` patched ``_get_connection`` and
+    never exercised this arm.
+    """
+
+    _CRED_ERROR = "auth failed for https://deploy:hunter2@bastion.example.com"
+
+    def _make_registry(self) -> ServerRegistry:
+        import tempfile
+
+        config_content = """
+[groups]
+t = { description = "t" }
+[servers.web1]
+description = "Test server"
+groups = ["t"]
+"""
+        f = tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False)
+        f.write(config_content)
+        f.close()
+        return ServerRegistry(f.name)
+
+    async def test_disconnect_error_log_redacts_credentials(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        sample_settings: Settings,
+    ) -> None:
+        """``asyncssh.connect`` failure must not leak credentials in logs."""
+        from unittest.mock import AsyncMock, patch
+
+        manager = SSHManager(self._make_registry(), sample_settings)
+
+        with patch(
+            "ssh_mcp.ssh.asyncssh.connect",
+            AsyncMock(
+                side_effect=asyncssh.DisconnectError(2, self._CRED_ERROR),
+            ),
+        ):
+            with caplog.at_level("ERROR", logger="ssh_mcp.ssh"):
+                result = await manager.execute("web1", "true")
+
+        assert result.error is not None
+        assert "hunter2" not in result.error, f"Leaked in result: {result.error!r}"
+        assert _REDACTION_PLACEHOLDER in result.error
+
+        rendered = "\n".join(
+            r.getMessage() for r in caplog.records if r.name == "ssh_mcp.ssh"
+        )
+        assert "hunter2" not in rendered, f"Credential leaked in log: {rendered!r}"
+        assert _REDACTION_PLACEHOLDER in rendered
+
+
+class TestSafeExc:
+    """Direct unit coverage for ``_safe_exc`` — redaction plus control escape."""
+
+    def test_safe_exc_redacts_command_credential_and_escapes_newlines(self) -> None:
+        """A newline in ``str(e)`` must not forge a second log line."""
+        exc = RuntimeError("mysql --password=hunter2\nFORGED=logline")
+        rendered = _safe_exc(exc)
+
+        assert "hunter2" not in rendered
+        assert _REDACTION_PLACEHOLDER in rendered
+        assert "\nFORGED" not in rendered
+        assert "\\n" in rendered
 
 
 # ---------------------------------------------------------------------------

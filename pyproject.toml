@@ -40,16 +40,35 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    # Floor is 1.28.1, NOT 1.27.0: versions <1.28.1 carry PYSEC-2026-3481
-    # (CVE-2026-52870), PYSEC-2026-3482 (CVE-2026-52869) and PYSEC-2026-3483
-    # (CVE-2026-59950). None is reachable from ssh-mcp's SDK usage, but this
-    # floor lands in the published wheel METADATA and is therefore the only
-    # thing protecting `pip install ssh-mcp` consumers — uv.lock does not.
-    "mcp[cli]>=1.28.1,<2.0.0",
-    "asyncssh>=2.23.0,<3.0.0",
-    "structlog>=25.5.0,<26.0.0",
-    "orjson>=3.10.0,<4.0.0",
-    "pydantic>=2.10.0,<3.0.0",
+    # v1.x entered maintenance mode — security fixes only — at the v2.0.0
+    # release, so 2.x is the supported line. The old floor was 1.28.1, for
+    # PYSEC-2026-3481 (CVE-2026-52870), PYSEC-2026-3482 (CVE-2026-52869) and
+    # PYSEC-2026-3483 (CVE-2026-59950); 2.x is far above all three. This
+    # floor lands in the published wheel METADATA and is the only thing
+    # protecting `pip install blc-ssh-mcp` consumers — uv.lock does not.
+    #
+    # The `[cli]` extra is deliberately NOT requested: ssh-mcp parses
+    # sys.argv directly (server.py::main) and never imports mcp.cli, typer,
+    # click or python-dotenv. Dropping it removes three packages from the
+    # published dependency closure. `click` still arrives via uvicorn, so its
+    # security floor in [tool.uv] stays load-bearing.
+    "mcp>=2.1.1,<3.0.0",
+    # 2.24.0, not 2.23.1: 2.23.1 fixed CVE-2026-54591 (GHSA-2wxc-x7rj-hg8f,
+    # SCP client path traversal to arbitrary file write via server-supplied
+    # filenames) and CVE-2026-54590 (GHSA-qr67-gv47-xwwh, incomplete fix for
+    # CVE-2026-45309 — AuthorizedKeysFile %u still escaped via a leading ~).
+    # 2.24.0 (2026-06-27) postdates 2.23.1 (2026-06-07) and is a clean
+    # superset. Neither CVE is reachable here: ssh-mcp uses SFTP and never
+    # asyncssh.scp, and it is a client, not a server. The floor still matters
+    # because it lands in the published wheel METADATA and is the only thing
+    # protecting `pip install blc-ssh-mcp` consumers — uv.lock does not.
+    "asyncssh>=2.24.0,<3.0.0",
+    # structlog uses CalVer, so the major cap is the next YEAR, not 26.
+    "structlog>=26.1.0,<27.0.0",
+    "orjson>=3.12.0,<4.0.0",
+    # mcp>=2 requires pydantic>=2.12.0. Matching that floor here keeps the
+    # wheel metadata honest instead of relying on mcp to carry it for us.
+    "pydantic>=2.12.0,<3.0.0",
 ]
 
 [project.scripts]
@@ -71,35 +90,42 @@ Documentation = "https://github.com/blackaxgit/ssh-mcp#readme"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=9.0.3",
-    "pytest-asyncio>=0.23",
-    "pytest-cov>=6.0",
-    "mypy>=1.15",
-    "pip-audit>=2.9",
-    # Patched pip in the dev/CI venv (PYSEC-2026-196); not a runtime dependency.
-    "pip>=26.1.2",
-    "hypothesis>=6.151.0,<7.0.0",
-    # OTel SDK is needed at test time for the in-memory exporter.
-    "opentelemetry-sdk>=1.30.0,<2.0.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "mypy>=2.3.1",
+    "pip-audit>=2.10.1",
+    # Patched pip in the dev/CI venv: PYSEC-2026-196 and CVE-2026-13346
+    # (GHSA-qwm4-qh6w-59xr — doubly-encoded package URLs from an index could
+    # install files to arbitrary paths; materially affects
+    # `pip download --only-binary`). Not a runtime dependency.
+    "pip>=26.2.1",
+    "hypothesis>=6.167.1,<7.0.0",
+    # OTel SDK is needed at test time for the in-memory exporter. The API
+    # half is no longer declared anywhere: mcp>=2 requires it outright.
+    "opentelemetry-sdk>=1.44.0,<2.0.0",
     # Lint tooling is PINNED and resolved from this locked dev environment,
     # never via `uvx` (which floats to the newest release at run time). On
     # 2026-07-23 ruff 0.16.0 expanded its default rule set from 59 to 413
     # rules, so `uvx ruff check` began failing CI on commits it had passed a
     # week earlier. A CI gate must be a function of the commit under review,
     # not of what the tool happens to ship today. Bump these deliberately.
-    "ruff==0.16.0",
+    "ruff==0.16.6",
     "bandit==1.9.4",
     # Used by tests/test_ci_lint_determinism.py to parse the workflow files.
     # bandit already pulls PyYAML in transitively; declared explicitly here so
     # the test suite does not depend on another package's dependency tree.
-    "pyyaml>=6.0",
+    "pyyaml>=6.0.3",
+    # Used by tests/test_dependency_floors.py. Previously present only
+    # transitively, which made the floor tests quietly env-dependent. The
+    # floor is low on purpose — nothing here needs a recent packaging.
+    "packaging>=25.0",
 ]
-# Optional runtime extras. `ssh-mcp[otel]` installs only the API layer — the
-# SDK + exporter are up to the operator (bring-your-own pipeline to Jaeger,
-# Tempo, OTLP collectors, etc). This keeps the default install lightweight.
-otel = [
-    "opentelemetry-api>=1.30.0,<2.0.0",
-]
+# There is deliberately no `otel` extra. It existed to install
+# opentelemetry-api without the SDK, but mcp>=2 requires opentelemetry-api
+# outright, so the extra became a no-op. Spans are always created; with no
+# SDK and no exporter installed they are no-ops that record nothing, which is
+# the same operator experience the extra used to describe.
 
 [build-system]
 requires = ["hatchling"]
@@ -129,11 +155,19 @@ packages = ["src/ssh_mcp"]
 constraint-dependencies = [
     # PYSEC-2026-2132 / CVE-2026-7246 — command injection in click.edit():
     # the filename argument was interpolated into a shell string with its
-    # quotes unescaped. Reaches us only via mcp[cli] -> typer -> click and
-    # uvicorn -> click; ssh-mcp never imports click (its CLI parses sys.argv
-    # directly), so this is not exploitable here. The floor exists so a
-    # future `uv lock` regeneration cannot silently regress below the fix.
+    # quotes unescaped. Reaches us via uvicorn -> click (uvicorn requires
+    # click>=7.0); the mcp[cli] -> typer -> click path is gone now that the
+    # `[cli]` extra is no longer requested. ssh-mcp never imports click (its
+    # CLI parses sys.argv directly), so this is not exploitable here. The
+    # floor exists so a future `uv lock` cannot silently regress below it.
     "click>=8.3.3",
+    # CVE-2026-69247 (GHSA-g6cj-pr64-35w5) — PKCS#7 EnvelopedData decryption
+    # exposed a Bleichenbacher oracle through distinguishable errors and
+    # timing (introduced 44.0.0, fixed 50.0.0). Transitive: asyncssh requires
+    # cryptography>=48.0.1. ssh-mcp never calls pkcs7_decrypt_*, so this is
+    # not exploitable here; the floor keeps a future `uv lock` from
+    # regressing below the fix.
+    "cryptography>=50.0.1",
 ]
 
 [tool.ruff.lint]
@@ -152,6 +186,10 @@ select = ["E4", "E7", "E9", "F"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# pytest-asyncio >=1.0 warns when this is unset. Every fixture in tests/ is
+# function-scoped, so state the default explicitly rather than inherit a
+# warning that a future release may turn into an error.
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.mypy]
 python_version = "3.11"

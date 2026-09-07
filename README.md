@@ -24,7 +24,7 @@ Connection details are read from your existing `~/.ssh/config`. No credentials a
 - SFTP local-path confinement — every local path stays inside a configured `transfer_root`
 - stdio or streamable-HTTP transport, with bearer-token auth for network deployments
 - Built-in `ssh-mcp healthcheck` subcommand for Docker's `HEALTHCHECK`
-- Optional OpenTelemetry tracing via the `otel` extra
+- Optional OpenTelemetry tracing — the API ships with the MCP SDK; add an SDK and exporter to record anything
 
 ## Quick Start
 
@@ -154,7 +154,7 @@ claude mcp add ssh-mcp -e SSH_MCP_CONFIG=/path/to/servers.toml -- uvx blc-ssh-mc
 | `SSH_MCP_HTTP_LIMIT_CONCURRENCY` | `256` | uvicorn `limit_concurrency`. Max simultaneous in-flight requests before returning HTTP 503. Prevents unbounded growth under burst load. Tune up for high-QPS deployments; tune down on small containers. |
 | `SSH_MCP_HTTP_BACKLOG` | `128` | uvicorn `backlog` — TCP listen backlog for the accept queue. Smaller caps SYN-flood exposure. |
 | `SSH_MCP_HTTP_STATELESS` | `false` | Set to `true` for stateless sessions (recommended for load-balanced or serverless deployments). Default is stateful with server-side sessions. |
-| `SSH_MCP_HTTP_ALLOWED_HOSTS` | — | Comma-separated extra Host-header values the SDK's DNS-rebinding protection should permit (e.g. `ssh-mcp.internal:*,api.example.com:8000`). Localhost aliases are always permitted. |
+| `SSH_MCP_HTTP_ALLOWED_HOSTS` | — | Comma-separated extra Host-header values the SDK's DNS-rebinding protection should permit (e.g. `ssh-mcp.internal:*,api.example.com:8000`). Localhost aliases are always permitted. Only a trailing `:*` port wildcard is supported: any other wildcard — including a `*.subdomain` suffix — aborts startup, because the MCP SDK matches such an entry literally and would reject every request. List concrete hostnames. |
 | `SSH_MCP_TRANSFER_ROOT` | `$XDG_DATA_HOME/ssh-mcp/transfers` | Directory SFTP transfers are confined to. Takes precedence over `transfer_root` in `[settings]`. See [Local path confinement](#security). |
 | `XDG_CONFIG_HOME` | `~/.config` | Honoured when searching for `ssh-mcp/servers.toml` (see [Config file location](#config-file-location)). |
 | `XDG_DATA_HOME` | `~/.local/share` | Base directory for the default transfer root. |
@@ -188,6 +188,8 @@ ssh-mcp exposes the MCP streamable HTTP transport as an alternative to stdio. Th
 - Binding to `127.0.0.1` / `localhost` / `::1` without a token is allowed — this matches the single-user workstation model.
 - Binding to ANY other address without `SSH_MCP_HTTP_TOKEN` raises `RuntimeError` at startup and the process exits.
 - The MCP SDK's DNS-rebinding protection is enabled by default. Remote clients connecting via a hostname must have it listed in `SSH_MCP_HTTP_ALLOWED_HOSTS`.
+- Streamable HTTP requests are capped at **4 MiB** by the MCP SDK — an oversized request gets HTTP 413 before its JSON is parsed or a session is created. This sits comfortably above `max_command_bytes`' 1 MiB ceiling, so no operator action is needed.
+- `serverInfo` in the MCP `initialize` response now reports ssh-mcp's own version (previously it reported the SDK's version instead).
 - Bearer-token comparison uses `hmac.compare_digest` to prevent timing attacks.
 
 Local loopback (no auth needed):
@@ -221,7 +223,7 @@ Authorization: Bearer <TOKEN>
 Host: ssh-mcp.internal
 ```
 
-For stateful sessions (default), FastMCP maintains per-client context across requests. For stateless deployments behind a load balancer, set `SSH_MCP_HTTP_STATELESS=true` — each request is handled independently with no server-side session.
+For stateful sessions (default), MCPServer maintains per-client context across requests. For stateless deployments behind a load balancer, set `SSH_MCP_HTTP_STATELESS=true` — each request is handled independently with no server-side session.
 
 ### Healthcheck
 
@@ -262,13 +264,13 @@ healthcheck:
 
 ### Tracing (OpenTelemetry)
 
-Tracing is optional and off unless `opentelemetry-api` is importable:
+Tracing uses the OpenTelemetry API, which ships as a required dependency of the MCP SDK — there is nothing to opt into at the ssh-mcp layer:
 
 ```bash
-uv pip install 'ssh-mcp[otel]'
+uv pip install opentelemetry-sdk opentelemetry-exporter-otlp   # or your exporter of choice
 ```
 
-The extra installs the **API layer only** — the SDK and exporter are yours to choose, so ssh-mcp stays lightweight for anyone who does not trace. Install and configure `opentelemetry-sdk` plus an exporter (OTLP, Jaeger, Tempo) yourself; without an SDK the API is a no-op and nothing is emitted.
+ssh-mcp's own spans and the MCP SDK's own request-handling spans are both created unconditionally; without an SDK and exporter installed, span creation is a no-op and nothing is recorded or exported.
 
 Spans produced:
 
@@ -398,7 +400,7 @@ ASCII control characters (null bytes, newlines, `\x01..\x1f`, `\x7f`) are normal
 >
 > If you need real isolation for untrusted tool callers, sandbox at a lower layer: run ssh-mcp inside a container with a restricted SSH config, use `ForceCommand` on the managed servers, or audit `force=false` usage via the structured logs. The dangerous-command filter exists to stop LLM accidents and typos, not adversaries.
 
-**The bypass is not recorded in the audit log.** Audit records carry `server`, `command`, `exit_code` and `duration_ms` only; `force` is emitted solely as an OpenTelemetry span attribute (`ssh.force`), and therefore only when the optional `otel` extra is installed and an exporter is configured. A block is logged as a warning on the operational logger, not the audit logger. If you need a paper trail for bypasses, export traces or withhold `force=true` at the MCP client. Do not grant `force=true` to untrusted MCP clients.
+**The bypass is not recorded in the audit log.** Audit records carry `server`, `command`, `exit_code` and `duration_ms` only; `force` is emitted solely as an OpenTelemetry span attribute (`ssh.force`), and therefore only when an OpenTelemetry SDK and exporter are configured. The tracing API itself now ships as a required dependency of the MCP SDK, so spans are always created — but with no SDK installed they are no-ops that record nothing. A block is logged as a warning on the operational logger, not the audit logger. If you need a paper trail for bypasses, export traces or withhold `force=true` at the MCP client. Do not grant `force=true` to untrusted MCP clients.
 
 **Credential redaction in logs.** ssh-mcp automatically redacts known credential patterns (MySQL `-p<pass>`, `--password=`, `PGPASSWORD=`, `Authorization: Bearer`, URL basic-auth `user:pass@host`, plus any env var ending in `_PASSWORD`, `_SECRET`, `_TOKEN`, `_KEY`, `_CREDENTIAL`, `_PWD`) from audit logs and OTel span attributes before they reach stderr or trace backends. The asyncssh internal channel logger is suppressed to WARNING level so it never emits the raw command.
 
