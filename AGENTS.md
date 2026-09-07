@@ -130,6 +130,13 @@ All third-party actions are pinned to a full commit SHA with a `# vX` comment, a
 
 Publishing to PyPI uses **Trusted Publishing** (OIDC) behind a reviewer-gated `pypi` environment. PEP 740 attestations are on by default in the publish action — do not add an `attestations:` input.
 
+**That reviewer gate is an out-of-band repository setting, and it was empty until 2026-09-06.** `release.yml`'s `environment:` key only *names* the environment; it cannot create the protection rule, and the file says so at `release.yml:182-186`. Nothing in the repo — not `test_ci_lint_determinism.py`, not a clean CI run — can detect its absence, so 0.6.1 and 0.6.2 both published to PyPI with no human approval while this paragraph claimed otherwise. It now has `required_reviewers`, with `prevent_self_review: false` **deliberately**: there is a single maintainer, and `true` would make every deployment unapprovable. Verify before any release rather than trusting this sentence:
+
+```bash
+gh api repos/blackaxgit/ssh-mcp/environments/pypi \
+  -q '.protection_rules'          # MUST be non-empty; [] means no gate
+```
+
 ## Git & Workflow
 
 - Branch from `main`; never commit directly to it.
