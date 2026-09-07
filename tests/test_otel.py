@@ -216,8 +216,9 @@ class TestSFTPTracing:
         mocked ``_get_connection`` OSError be the thing that actually
         fires.
         """
-        import ssh_mcp.ssh as ssh_module
         from opentelemetry.trace.status import StatusCode
+
+        import ssh_mcp.ssh as ssh_module
 
         local_path = "payload.txt"
 
@@ -247,8 +248,9 @@ class TestSFTPTracing:
 
     async def test_download_creates_span_on_failure(self, tmp_path: Path) -> None:
         """A failing download still produces a span with error status."""
-        import ssh_mcp.ssh as ssh_module
         from opentelemetry.trace.status import StatusCode
+
+        import ssh_mcp.ssh as ssh_module
 
         local_path = "downloaded.txt"
 
@@ -291,8 +293,9 @@ class TestSFTPTracing:
         assertion is now proven against a call that actually did real
         work.
         """
-        import ssh_mcp.ssh as ssh_module
         from contextlib import suppress
+
+        import ssh_mcp.ssh as ssh_module
 
         settings = Settings(transfer_root=str(tmp_path / "transfers"))
 

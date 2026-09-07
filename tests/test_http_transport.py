@@ -9,6 +9,8 @@ exercised via a mocked ``uvicorn.run``.
 
 from __future__ import annotations
 
+import os
+import signal
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
@@ -496,6 +498,55 @@ class TestBearerAuthR3Hardening:
         """H2 follow-up: tokens under a reasonable minimum are suspicious."""
         with pytest.raises(ValueError, match="token"):
             _assert_valid_bearer_token("abc")
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "has-a-nul-\x00-inside-it",
+            "has a space inside it xx",
+            "has-a-newline\ninside-it",
+            "has-a-tab\tinside-it-xx",
+            "tokén-with-non-ascii-xx",
+            "\ufeffbom-prefixed-token-xx",
+        ],
+        ids=["nul", "space", "newline", "tab", "non_ascii", "bom"],
+    )
+    def test_tokens_that_can_never_authenticate_are_refused(self, token: str) -> None:
+        """A token an HTTP client cannot send must fail at STARTUP.
+
+        Panel finding 2026-09-06. Every value here is >= 16 characters, so
+        the length check passes and the server used to start happily with a
+        secret that returns 401 to every client forever: a validator showed
+        that NUL and newline raise ``LocalProtocolError: Illegal header
+        value`` in h11 client-side, while a non-ASCII token is Latin-1
+        encoded by common clients and compared as UTF-8 bytes at the
+        middleware. An interior space breaks the ``Bearer <token>`` split,
+        and a BOM is invisible to the operator reading the file.
+
+        A silently unusable deployment is worse than a loud refusal, which
+        is the whole reason this check exists rather than trusting length.
+        """
+        with pytest.raises(ValueError, match="printable ASCII"):
+            _assert_valid_bearer_token(token)
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "ordinary-token-1234",
+            "with-punctuation:!@#$%^&*()_+-=",
+            "base64ish+/aGVsbG8=",
+        ],
+    )
+    def test_realistic_tokens_still_pass(self, token: str) -> None:
+        """The charset rule must not reject tokens that genuinely work.
+
+        Deliberately looser than RFC 6750's ``b64token`` grammar, which
+        would reject ``:`` and ``!`` — characters that are perfectly legal
+        in an HTTP header value and may already be in use. Without this
+        test the rule above could be tightened into a breaking change
+        without anyone noticing.
+        """
+        _assert_valid_bearer_token(token)
 
     def test_bearer_scheme_is_case_insensitive(self) -> None:
         """H3: RFC 7235 says scheme is case-insensitive. Accept any casing."""
@@ -1041,4 +1092,577 @@ class TestTokenFile:
 
         assert captured == ["env-token-should-win-ok"], (
             f"Env token did not take precedence: got {captured!r}"
+        )
+
+
+class TestTokenFileValidation:
+    """The token file authenticates an endpoint that runs shell commands, so
+    what is read gets validated. Panel finding 2026-09-06: the previous
+    implementation was a bare ``Path(p).read_text()`` with no checks at all.
+
+    Every test here calls ``_read_token_file`` directly: it owns the decision
+    and is pure apart from the filesystem, so there is no global transport
+    state to set up or restore.
+    """
+
+    _TOKEN = "file-based-secret-token-long"
+
+    def test_owner_only_file_is_read_without_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A 0600 file is the recommended case: read it, say nothing."""
+        p = tmp_path / "token"
+        p.write_text(f"  {self._TOKEN}\n")
+        p.chmod(0o600)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.server"):
+            assert server_module._read_token_file(str(p)) == self._TOKEN
+
+        assert "readable beyond" not in caplog.text
+
+    @pytest.mark.parametrize("mode", [0o644, 0o444, 0o604, 0o640])
+    def test_group_or_other_READABLE_warns_but_still_works(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, mode: int
+    ) -> None:
+        """Group/other READ warns and must NOT refuse.
+
+        Docker Swarm mounts secrets 0444 and Kubernetes defaults to 0644, so
+        refusing world-readable would break the two most common secret mounts
+        outright. The warning has to name the mode to be actionable.
+
+        Every mode here is deliberately free of group/other WRITE bits, which
+        are refused by the sibling test below.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(mode)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.server"):
+            assert server_module._read_token_file(str(p)) == self._TOKEN
+
+        assert "readable beyond" in caplog.text
+        assert oct(mode) in caplog.text, (
+            f"warning must name the octal mode, got: {caplog.text!r}"
+        )
+
+    @pytest.mark.parametrize("mode", [0o622, 0o660, 0o606, 0o666])
+    def test_group_or_other_WRITABLE_is_refused(
+        self, tmp_path: Path, mode: int
+    ) -> None:
+        """Group/other WRITE aborts startup — an integrity hole, not disclosure.
+
+        Panel finding 2026-09-06: the first implementation tested a single
+        ``& 0o077`` and merely warned, lumping three different things
+        together. Anyone who can WRITE this file chooses the token that
+        authorises remote command execution, then waits for a restart — which
+        is strictly worse than being able to read it. Refusing is free
+        compatibility-wise: Docker's 0444 and Kubernetes' 0644 carry no
+        group/other write bit, so the mounts this code bends to support are
+        unaffected.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(mode)
+
+        with pytest.raises(RuntimeError, match="writable beyond"):
+            server_module._read_token_file(str(p))
+
+    def test_execute_bit_alone_does_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An execute bit on a regular file discloses nothing.
+
+        The check is ``& 0o044``, not ``& 0o077``, precisely so this is
+        silent. Warning about it was noise.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(0o611)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.server"):
+            assert server_module._read_token_file(str(p)) == self._TOKEN
+
+        assert "readable beyond" not in caplog.text
+
+    def test_bounded_read_catches_a_file_that_grows_after_fstat(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cap must bind on bytes READ, not just on the ``fstat`` snapshot.
+
+        Panel finding: the pre-read ``st_size`` check is only a snapshot, so
+        an unbounded ``fh.read()`` would sail past the limit if the file grew
+        between ``fstat`` and ``read`` — the descriptor being the same object
+        removes pathname TOCTOU but not content-mutation TOCTOU. Simulated by
+        making ``fstat`` under-report, which is exactly what a growing file
+        looks like from the check's point of view.
+        """
+        p = tmp_path / "token"
+        p.write_bytes(b"y" * (server_module._MAX_TOKEN_FILE_BYTES + 10))
+        p.chmod(0o600)
+
+        real_fstat = os.fstat
+
+        def lying_fstat(fd: int) -> os.stat_result:
+            st = real_fstat(fd)
+            # Same mode/uid, but a size well under the cap.
+            fields = list(st)
+            fields[6] = 10
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(server_module.os, "fstat", lying_fstat)
+
+        with pytest.raises(RuntimeError, match="while being read"):
+            server_module._read_token_file(str(p))
+
+    def test_owner_is_this_process_does_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The ownership warning must not fire on the normal case.
+
+        A file owned by a third unprivileged user cannot be created without
+        root, so the positive case is not testable in CI; this pins the
+        negative so the check cannot degrade into warning on every startup.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(0o600)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.server"):
+            server_module._read_token_file(str(p))
+
+        assert "owned by uid" not in caplog.text
+
+    def test_foreign_owner_warns(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A file owned by neither this process nor root must WARN.
+
+        Panel finding 2026-09-06: only the negative was pinned, so deleting
+        the warning body -- or dropping ``0`` from ``(geteuid(), 0)``, which
+        would make every root-owned Kubernetes secret warn on each startup
+        -- stayed green. A third unprivileged uid cannot be created without
+        root, so ``st_uid`` is faked; that is the same technique the
+        grow-after-fstat test uses and it exercises the real branch.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(0o600)
+
+        real_fstat = os.fstat
+
+        def foreign_uid_fstat(fd: int) -> os.stat_result:
+            fields = list(real_fstat(fd))
+            fields[4] = 4242  # st_uid: neither us nor root
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(server_module.os, "fstat", foreign_uid_fstat)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.server"):
+            assert server_module._read_token_file(str(p)) == self._TOKEN
+
+        assert "owned by uid 4242" in caplog.text, (
+            f"foreign owner must warn, got: {caplog.text!r}"
+        )
+
+    def test_root_owned_file_does_not_warn(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A root-owned file must stay silent \u2014 that is the container case.
+
+        Docker and Kubernetes mount secrets root-owned while the process
+        runs unprivileged. If ``0`` were dropped from the accepted set, this
+        would warn on every startup of every containerised deployment, which
+        is precisely the noise the refuse/warn split exists to avoid.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(0o600)
+
+        real_fstat = os.fstat
+
+        def root_uid_fstat(fd: int) -> os.stat_result:
+            fields = list(real_fstat(fd))
+            fields[4] = 0  # st_uid: root
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(server_module.os, "fstat", root_uid_fstat)
+
+        with caplog.at_level("WARNING", logger="ssh_mcp.server"):
+            assert server_module._read_token_file(str(p)) == self._TOKEN
+
+        assert "owned by uid" not in caplog.text
+
+    def test_documented_cap_value_is_pinned(self) -> None:
+        """README, AGENTS.md and CHANGELOG all promise 64 KiB by name.
+
+        Every other test refers to the constant, so the constant could be
+        changed to 1000 or 1_000_000 without a single test failing while
+        three documents kept claiming 64 KiB. This pins the number itself so
+        the docs cannot silently become wrong.
+        """
+        assert server_module._MAX_TOKEN_FILE_BYTES == 65536
+
+    def test_kubernetes_symlink_chain_is_followed(self, tmp_path: Path) -> None:
+        """A Kubernetes-shaped symlink chain must resolve, not be refused.
+
+        kubelet's atomic writer projects each key as ``key`` ->
+        ``..data/key`` -> ``..<timestamp>/key`` so that updates are atomic.
+        ``paths.py::ensure_root`` uses O_NOFOLLOW; copying that here would
+        reject every Kubernetes secret mount, which is why this file
+        deliberately follows symlinks. This test is the guard against someone
+        "hardening" it by adding O_NOFOLLOW.
+        """
+        data_dir = tmp_path / "..2026_09_06_04_00_00.123456789"
+        data_dir.mkdir()
+        (data_dir / "token").write_text(self._TOKEN)
+        (tmp_path / "..data").symlink_to(data_dir)
+        (tmp_path / "token").symlink_to(tmp_path / "..data" / "token")
+
+        assert server_module._read_token_file(str(tmp_path / "token")) == self._TOKEN
+
+    def test_directory_is_refused(self, tmp_path: Path) -> None:
+        """A directory is unambiguous misconfiguration, not a token."""
+        with pytest.raises(RuntimeError, match="not a regular file"):
+            server_module._read_token_file(str(tmp_path))
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="fifos are POSIX-only")
+    def test_fifo_is_refused_and_does_not_hang(self, tmp_path: Path) -> None:
+        """A fifo must be refused rather than blocking startup forever.
+
+        This is what O_NONBLOCK buys: a plain O_RDONLY open on a writer-less
+        fifo blocks indefinitely, so the server would hang before binding
+        instead of failing loudly.
+
+        The SIGALRM deadline is the point of this test, not decoration.
+        Panel finding 2026-09-06: without it, deleting O_NONBLOCK does not
+        turn this test RED -- it HANGS the whole suite, and `ci.yml` sets no
+        `timeout-minutes`, so the runner would sit at GitHub's 360-minute
+        default. A mutation that hangs CI is strictly worse than one that
+        fails it, so the failure mode is forced to be a fast, legible error.
+        Chosen over adding a `pytest-timeout` dependency for one test.
+        """
+        fifo = tmp_path / "fifo"
+        os.mkfifo(fifo)
+
+        def _deadline(signum: int, frame: object) -> None:
+            raise TimeoutError(
+                "_read_token_file blocked opening a writer-less fifo — "
+                "O_NONBLOCK was lost"
+            )
+
+        previous = signal.signal(signal.SIGALRM, _deadline)
+        signal.setitimer(signal.ITIMER_REAL, 5.0)
+        try:
+            with pytest.raises(RuntimeError, match="not a regular file"):
+                server_module._read_token_file(str(fifo))
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+
+    def test_oversized_file_is_refused(self, tmp_path: Path) -> None:
+        """A file over the cap is the wrong path, not a secret."""
+        p = tmp_path / "token"
+        p.write_bytes(b"x" * (server_module._MAX_TOKEN_FILE_BYTES + 1))
+
+        with pytest.raises(RuntimeError, match="over the .*-byte limit"):
+            server_module._read_token_file(str(p))
+
+    def test_file_at_the_size_limit_is_accepted(self, tmp_path: Path) -> None:
+        """The cap is inclusive — the boundary must not be off by one."""
+        p = tmp_path / "token"
+        p.write_bytes(b"x" * server_module._MAX_TOKEN_FILE_BYTES)
+
+        got = server_module._read_token_file(str(p))
+        assert len(got) == server_module._MAX_TOKEN_FILE_BYTES
+
+    def test_utf8_bom_is_stripped_from_the_token(self, tmp_path: Path) -> None:
+        """A UTF-8 BOM must not become part of the token.
+
+        Windows Notepad and PowerShell's ``Out-File`` write a BOM by
+        default. ``str.isspace()`` is False for U+FEFF, so ``.strip()``
+        leaves it attached: the operator sees the right token in the file,
+        the server counts the BOM toward the 16-character minimum, and every
+        client gets 401 forever. Decoding as ``utf-8-sig`` removes it, and
+        is a superset -- BOM-less UTF-8 decodes unchanged, which the sibling
+        tests all rely on.
+        """
+        p = tmp_path / "token"
+        p.write_bytes(b"\xef\xbb\xbf" + b"bom-prefixed-token-1234")
+        p.chmod(0o600)
+
+        assert server_module._read_token_file(str(p)) == "bom-prefixed-token-1234"
+
+    def test_size_cap_is_measured_in_bytes_not_characters(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cap must bind on BYTES, which multi-byte text distinguishes.
+
+        Panel finding 2026-09-06: the first implementation read through a
+        ``TextIOWrapper``, whose ``read(n)`` counts decoded CHARACTERS. A
+        file of 65,536 multi-byte characters is 131,072+ bytes and was
+        ACCEPTED, while README, AGENTS.md and CHANGELOG all promise a
+        64 KiB *byte* limit. ``fstat`` is faked to under-report so the
+        pre-read snapshot cannot short-circuit the check under test -- that
+        is exactly the grow-after-fstat race the second cap exists for.
+        """
+        p = tmp_path / "token"
+        # 2 bytes per char in UTF-8, so under the cap in chars, over in bytes.
+        p.write_bytes("é".encode() * (server_module._MAX_TOKEN_FILE_BYTES // 2 + 1))
+        p.chmod(0o600)
+
+        real_fstat = os.fstat
+
+        def lying_fstat(fd: int) -> os.stat_result:
+            fields = list(real_fstat(fd))
+            fields[6] = 10  # st_size well under the cap
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(server_module.os, "fstat", lying_fstat)
+
+        with pytest.raises(RuntimeError, match="while being read"):
+            server_module._read_token_file(str(p))
+
+    def test_posix_only_apis_are_guarded_for_windows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The token file must still be readable where POSIX APIs are absent.
+
+        0.7.0 read this with ``Path.read_text()``, which works on Windows.
+        0.8.0 introduced three POSIX-only dependencies and a validator caught
+        each: ``os.O_NONBLOCK`` and ``os.geteuid`` do not exist there
+        (``AttributeError`` is neither ``OSError`` nor ``UnicodeDecodeError``,
+        so it would escape both handlers as a raw traceback), and CPython
+        SYNTHESISES ``st_mode`` as ``0o666`` for any non-read-only file, so
+        the ``& 0o022`` refusal would reject EVERY Windows token file and
+        advise ``chmod go-w``.
+
+        Windows cannot be run in this CI matrix (ubuntu-only), so the three
+        conditions are simulated together: the constant and the function are
+        removed from the module's view of ``os``, and ``os.name`` is set to
+        ``"nt"``. A 0666 file must then be read WITHOUT raising.
+        """
+        p = tmp_path / "token"
+        p.write_text("windows-token-1234567")
+        p.chmod(0o666)  # would be refused on POSIX
+
+        monkeypatch.delattr(server_module.os, "O_NONBLOCK", raising=False)
+        monkeypatch.delattr(server_module.os, "geteuid", raising=False)
+        monkeypatch.setattr(server_module.os, "name", "nt")
+
+        assert server_module._read_token_file(str(p)) == "windows-token-1234567"
+
+    def test_empty_file_yields_empty_string(self, tmp_path: Path) -> None:
+        """An empty file is not this function's job to reject.
+
+        ``_read_token_file`` reports what the file contains; deciding that
+        "configured but empty" is fatal belongs to ``_run_http``, which is
+        where the env-var-vs-file precedence is known. The sibling test
+        ``test_empty_token_file_is_refused_by_run_http`` pins that refusal.
+        Keeping the split means this helper stays a pure reader.
+        """
+        p = tmp_path / "token"
+        p.write_text("")
+        p.chmod(0o600)
+
+        assert server_module._read_token_file(str(p)) == ""
+
+    def test_non_utf8_file_is_refused_with_a_runtime_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Invalid UTF-8 must surface as RuntimeError, not a raw traceback.
+
+        ``UnicodeDecodeError`` is a ``ValueError``, NOT an ``OSError``, so the
+        ``except OSError`` arm does not catch it and it escaped as an
+        unhandled traceback at startup until this was fixed. The old
+        ``Path.read_text()`` had the same hole, so this is not a regression --
+        but the helper documents that it raises ``RuntimeError``, and a
+        binary file is exactly the wrong-path case an operator needs told
+        about in words.
+        """
+        p = tmp_path / "token"
+        p.write_bytes(b"\xff\xfe\x00not-text")
+        p.chmod(0o600)
+
+        with pytest.raises(RuntimeError, match="not valid UTF-8"):
+            server_module._read_token_file(str(p))
+
+    @pytest.mark.skipif(
+        not os.path.isdir("/dev/fd"), reason="/dev/fd is POSIX-specific"
+    )
+    def test_no_file_descriptor_is_leaked_on_any_path(self, tmp_path: Path) -> None:
+        """Every exit path must close the descriptor exactly once.
+
+        The helper hands the fd to ``os.fdopen`` on success and sets a ``-1``
+        sentinel so ``finally`` does not double-close, while the four refusal
+        paths raise BEFORE ``fdopen`` and rely on ``finally``. That is easy to
+        get subtly wrong, and a leak in a long-lived server is a real
+        resource bug -- the repo has a prior incident where accumulated
+        connections exhausted the container's 1024 fd limit (see the
+        ``SSH_MCP_HTTP_KEEPALIVE_TIMEOUT`` note in README).
+
+        Counting ``/dev/fd`` is POSIX-specific, which is acceptable here:
+        the sibling fifo test already requires ``os.mkfifo``.
+        """
+        ok = tmp_path / "ok"
+        ok.write_text("token-1234567890abcdef")
+        ok.chmod(0o600)
+        big = tmp_path / "big"
+        big.write_bytes(b"x" * (server_module._MAX_TOKEN_FILE_BYTES + 1))
+        binary = tmp_path / "bin"
+        binary.write_bytes(b"\xff\xfe\x00")
+        binary.chmod(0o600)
+
+        targets = [ok, big, tmp_path, tmp_path / "missing", binary]
+
+        def _open_fd_count() -> int:
+            return len(os.listdir("/dev/fd"))
+
+        before = _open_fd_count()
+        for _ in range(50):
+            for t in targets:
+                try:
+                    server_module._read_token_file(str(t))
+                except RuntimeError:
+                    pass
+        after = _open_fd_count()
+
+        assert after <= before, (
+            f"descriptor leak: {before} open fds before, {after} after "
+            f"250 calls across {len(targets)} paths"
+        )
+
+    def test_io_error_after_open_becomes_a_runtime_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An OSError raised while READING must also be wrapped.
+
+        The open-fails case is covered by ``TestTokenFile
+        ::test_token_file_missing_raises``, but the ``except OSError`` arm
+        also has to catch a failure from the READ -- e.g. EIO on a failing
+        disk, or a procfs pseudo-file that stats as a regular file and then
+        refuses to be read (a validator demonstrated exactly that with
+        ``/proc/self/mem``). Without this the operator would get a raw
+        OSError traceback naming neither the env var nor the path.
+
+        The failure is injected at ``read`` rather than at ``fdopen``
+        because that is the real uncovered branch, and because a fake that
+        makes ``fdopen`` itself raise gets the ownership handoff wrong: the
+        helper only sets its ``fd = -1`` sentinel once ``fdopen`` has
+        returned, so a fake that closes the descriptor and then raises makes
+        the ``finally`` double-close and fail with EBADF -- an artefact of
+        the fake, not a defect in the code under test.
+        """
+        p = tmp_path / "token"
+        p.write_text(self._TOKEN)
+        p.chmod(0o600)
+
+        real_fdopen = os.fdopen
+
+        class _UnreadableFile:
+            def __init__(self, wrapped: object) -> None:
+                self._wrapped = wrapped
+
+            def __enter__(self) -> _UnreadableFile:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                self._wrapped.close()  # type: ignore[attr-defined]
+
+            def read(self, *_a: object) -> str:
+                raise OSError(5, "Input/output error")
+
+        def unreadable_fdopen(fd: int, *a: object, **kw: object) -> _UnreadableFile:
+            return _UnreadableFile(real_fdopen(fd, *a, **kw))  # type: ignore[arg-type]
+
+        monkeypatch.setattr(server_module.os, "fdopen", unreadable_fdopen)
+
+        with pytest.raises(RuntimeError, match="could not be read"):
+            server_module._read_token_file(str(p))
+
+    @pytest.mark.parametrize("content", ["", "   \n\t "])
+    def test_empty_token_file_is_refused_by_run_http(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str
+    ) -> None:
+        """A configured-but-empty token file must ABORT, not disable auth.
+
+        Behaviour change in 0.8.0, and the reason is worth stating: until
+        now an empty (or whitespace-only) token file flowed through
+        ``token = raw_token or None``, so the bearer middleware was never
+        attached at all. On a loopback bind that means the RCE-capable MCP
+        endpoint served with NO authentication -- while the operator, who
+        had gone to the trouble of mounting a secret file, believed it was
+        protected. "Configured but empty" is not "not configured".
+
+        This mirrors the treatment ``SSH_MCP_HTTP_ALLOWED_HOSTS`` has always
+        had (set-but-whitespace is refused rather than silently read as "no
+        extra hosts"), so it is the repo's existing rule applied
+        consistently rather than a new policy.
+
+        An earlier revision of this test asserted the OPPOSITE -- that the
+        empty file yielded ``token=None`` -- because it was written to pin
+        the pre-existing behaviour. A validator pointed out that the
+        behaviour being pinned was itself the defect.
+        """
+        token_path = tmp_path / "token"
+        token_path.write_text(content)
+        token_path.chmod(0o600)
+
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN_FILE", str(token_path))
+
+        with pytest.raises(RuntimeError, match="empty or contains only whitespace"):
+            _run_http()
+
+    def test_whitespace_only_env_token_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same rule applies to the env var, not just the file.
+
+        A non-empty value that strips to nothing is a broken substitution --
+        `SSH_MCP_HTTP_TOKEN="${SECRET}"` with ``SECRET`` unset -- and would
+        otherwise silently disable authentication. A literal empty string is
+        still treated as unset, matching every other ``SSH_MCP_HTTP_*``
+        variable, which the sibling assertion below pins.
+        """
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN_FILE", raising=False)
+        monkeypatch.setenv("SSH_MCP_HTTP_TOKEN", "   ")
+
+        with pytest.raises(RuntimeError, match="only whitespace"):
+            _run_http()
+
+    def test_unset_token_still_allows_unauthenticated_loopback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not configuring a token at all is still the documented dev mode.
+
+        The refusals above must not leak into the "no token source
+        configured" case, which `AGENTS.md` documents as allowed on a
+        loopback bind for the single-user workstation model. Without this,
+        the two tests above would happily pass while having broken every
+        local dev setup.
+        """
+        monkeypatch.setenv("SSH_MCP_HTTP_HOST", "127.0.0.1")
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN", raising=False)
+        monkeypatch.delenv("SSH_MCP_HTTP_TOKEN_FILE", raising=False)
+
+        captured: list[str | None] = []
+
+        def fake_build(token, **_kwargs):  # type: ignore[no-untyped-def]
+            captured.append(token)
+            return _make_dummy_asgi_app()
+
+        with patch("ssh_mcp.server._build_http_app", side_effect=fake_build):
+            with patch("uvicorn.run"):
+                _run_http()
+
+        assert captured == [None], (
+            f"unset token must still yield token=None, got {captured!r}"
         )

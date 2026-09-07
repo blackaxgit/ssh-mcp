@@ -20,11 +20,11 @@ from ssh_mcp.config import ServerRegistry
 from ssh_mcp.models import ExecResult, Settings
 from ssh_mcp.paths import PathConfinementError
 from ssh_mcp.ssh import (
-    SSHManager,
     _DANGEROUS_PATTERNS,
     _LONG_FLAG_KEYWORDS,
     _REDACTION_PLACEHOLDER,
     _SENSITIVE_PATHS,
+    SSHManager,
     _is_dangerous_command,
     _make_connection_id,
     _redact_secrets,
@@ -32,7 +32,6 @@ from ssh_mcp.ssh import (
     _unlink_beneath,
     _validate_remote_path,
 )
-
 
 # ---------------------------------------------------------------------------
 # Dangerous command detection
@@ -3903,9 +3902,9 @@ groups = ["test"]
         file is replaced with unrelated content between creation and
         cleanup. If ``created_ino`` were ever lost, the cleanup would
         delete the REPLACEMENT instead of refusing. It must survive."""
-        import asyncssh
         from unittest.mock import AsyncMock, MagicMock, patch
 
+        import asyncssh
         from asyncssh.constants import FILEXFER_TYPE_REGULAR
 
         root = tmp_path / "transfers"

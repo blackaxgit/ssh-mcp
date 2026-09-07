@@ -107,7 +107,7 @@ def _check_stdio() -> tuple[bool, str]:
         from ssh_mcp.config import ServerRegistry
 
         ServerRegistry(config_path)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - any config-parse failure must become a health verdict, not a traceback out of the container HEALTHCHECK
         return False, f"config parse failed: {type(e).__name__}"
 
     return True, "stdio healthy"
@@ -169,7 +169,7 @@ def _check_http() -> tuple[bool, str]:
         return False, f"http {e.code}"
     except urllib.error.URLError as e:
         return False, f"connect failed: {type(e.reason).__name__}"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - an unknown probe failure is 'unhealthy', not a crash of the healthcheck itself
         return False, f"unexpected: {type(e).__name__}"
 
 

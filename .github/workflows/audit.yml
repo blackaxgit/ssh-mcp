@@ -50,6 +50,7 @@ jobs:
   audit:
     name: Scheduled dependency audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
 
