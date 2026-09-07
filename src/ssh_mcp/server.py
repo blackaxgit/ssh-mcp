@@ -970,8 +970,19 @@ def _build_transport_security(
                     "instead (e.g. 'api.internal.example.com:*')."
                 )
 
-    # Also add the actual bind host if it's not already covered
-    if host not in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:
+    # Also add the actual bind host if it's not already covered.
+    #
+    # The `# nosec B104` is LOAD-BEARING despite what bandit says about it.
+    # Bandit prints "nosec encountered (B104), but no failed test on file
+    # server.py" three times per run, which reads exactly like a redundant
+    # suppression -- and 0.7.0 briefly deleted it on that basis. CI went
+    # red: bandit raises B104 (hardcoded_bind_all_interfaces) on the
+    # "0.0.0.0" literal in this set and exits 1. The literal is a
+    # comparison EXCLUDING 0.0.0.0 from the allow-list, i.e. the opposite
+    # of binding to it, so the finding is a false positive and the
+    # suppression is correct. Do not remove it; that misleading warning is
+    # a bandit quirk, not a signal.
+    if host not in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:  # nosec B104
         base_hosts.append(f"{host}:*")
 
     default_origins = [
