@@ -283,7 +283,6 @@ def _cleanup_connections() -> None:
     backup that fires only if the lifespan didn't run (e.g. stdio mode
     or abnormal exit).
     """
-    global _ssh
     if _ssh is None:
         return
     try:
@@ -369,9 +368,7 @@ def _mcp_tool(func: F) -> F:
             with _span(f"mcp.tool.{tool_name}", **{"mcp.tool.name": tool_name}):
                 await _init()
                 return await func(*args, **kwargs)
-        except ToolError:
-            raise
-        except asyncio.CancelledError:
+        except (ToolError, asyncio.CancelledError):
             raise
         except Exception as e:
             # Redact BOTH the message and the traceback. `exc_info=True`
@@ -414,7 +411,6 @@ async def list_servers(group: str | None = None) -> str:
     registry = _get_registry()
 
     if group is not None:
-        # Filter by group
         try:
             servers = registry.servers_in_group(group)
         except KeyError as e:
@@ -424,7 +420,6 @@ async def list_servers(group: str | None = None) -> str:
         if not servers:
             return f"No servers found in group '{group}'"
     else:
-        # Show all servers
         servers = registry.all_servers()
         filter_label = ""
 
@@ -443,11 +438,9 @@ async def list_groups() -> str:
 
     groups = registry.all_groups()
 
-    # Count servers per group
-    server_counts = {}
-    for group in groups:
-        count = len(registry.servers_in_group(group.name))
-        server_counts[group.name] = count
+    server_counts = {
+        group.name: len(registry.servers_in_group(group.name)) for group in groups
+    }
 
     return format_group_table(groups, server_counts)
 
@@ -716,8 +709,6 @@ def _build_http_app(
 
     Returns a ``Starlette`` instance ready to hand to ``uvicorn.run``.
     """
-    from contextlib import asynccontextmanager
-
     from starlette.applications import Starlette
     from starlette.routing import Mount
 
@@ -762,7 +753,7 @@ def _build_http_app(
             "in server.py._build_http_app or pin a known-good mcp."
         ) from exc
 
-    @asynccontextmanager
+    @contextlib.asynccontextmanager
     async def _lifespan(_app: Starlette) -> AsyncGenerator[None]:
         # Step 1: start the MCPServer session manager's task group via the
         # public session_manager.run() API (see note above).
@@ -772,7 +763,6 @@ def _build_http_app(
             finally:
                 # Step 2: drain SSH BEFORE exiting the inner lifespan
                 # so close_all() can still dispatch on a live event loop.
-                global _ssh
                 if _ssh is not None:
                     logger.info("Draining SSH connections on HTTP shutdown")
                     try:
@@ -1537,8 +1527,6 @@ def main() -> None:
 
         run_healthcheck()  # exits 0 or 1
         return  # unreachable but keeps mypy happy
-
-    from ssh_mcp import __version__
 
     transport = os.environ.get("SSH_MCP_TRANSPORT", "stdio").strip().lower()
 

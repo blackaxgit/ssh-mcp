@@ -198,7 +198,7 @@ constraint-dependencies = [
 # fires on a `# noqa: F401` that is perfectly legitimate under this config,
 # purely because `--isolated` re-derives which rules are on. Under the real
 # select it fires on exactly two directives — the `# noqa: S310` pair in
-# healthcheck.py:152,162 — which are inert only because `S` is not selected.
+# healthcheck.py::_check_http — which are inert only because `S` is not selected.
 # They document a deliberate `urllib.request` decision, so enabling RUF100
 # would force deleting intent-documenting comments to satisfy a linter. No
 # safety is bought; leave it off.

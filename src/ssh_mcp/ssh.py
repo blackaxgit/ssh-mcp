@@ -1612,12 +1612,11 @@ class SSHManager:
             # Use server-specific timeout if configured
             effective_timeout = server.timeout or timeout
 
-            # Prepend working directory if specified
+            # Prepend working_dir if given, else the server's default_dir
             effective_command = command
-            if working_dir:
-                effective_command = f"cd {shlex.quote(working_dir)} && {command}"
-            elif server.default_dir:
-                effective_command = f"cd {shlex.quote(server.default_dir)} && {command}"
+            cd_dir = working_dir or server.default_dir
+            if cd_dir:
+                effective_command = f"cd {shlex.quote(cd_dir)} && {command}"
 
             # Get or create connection
             conn = await self._get_connection(server_name)
@@ -1924,10 +1923,8 @@ class SSHManager:
             # of the configured limit. Behaviour change, stated plainly:
             # independent execute_on_group() calls now serialise against
             # each other for their share of the shared pool.
-            semaphore = self._group_semaphore
-
             async def execute_with_semaphore(server: ServerConfig) -> ExecResult:
-                async with semaphore:
+                async with self._group_semaphore:
                     return await self.execute(
                         server.name,
                         command,
@@ -2509,7 +2506,6 @@ class SSHManager:
                         async with sftp.open(remote_path, "rb") as remote_file:
                             with os.fdopen(local_fd, "wb", closefd=True) as local_file:
                                 local_fd = None  # ownership transferred
-                                offset = 0
                                 while True:
                                     # asyncssh's SFTPClientFile.read() is
                                     # annotated `-> AnyStr` without the
@@ -2521,11 +2517,13 @@ class SSHManager:
                                     # of a blanket ignore; encoding=None
                                     # (set automatically by the 'b' in
                                     # "rb") guarantees bytes at runtime.
-                                    data: bytes = await remote_file.read(block, offset)
+                                    #
+                                    # `written` doubles as the remote read
+                                    # offset: both advance by len(data).
+                                    data: bytes = await remote_file.read(block, written)
                                     if not data:
                                         break
                                     await asyncio.to_thread(local_file.write, data)
-                                    offset += len(data)
                                     written += len(data)
 
                         duration_ms = int((time.monotonic() - start_time) * 1000)
@@ -2792,11 +2790,10 @@ class SSHManager:
 
         # Create connection
         try:
-            conn = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 asyncssh.connect(host, **connect_params),
                 timeout=self.settings.command_timeout,
             )
-            return conn
         # `except asyncssh.PermissionDenied` MUST precede
         # `except asyncssh.DisconnectError`: PermissionDenied is a
         # SUBCLASS of DisconnectError (verified against asyncssh 2.24.0 —
@@ -2882,11 +2879,11 @@ class SSHManager:
                 idle_threshold = self.settings.connection_idle_timeout
 
                 # Find idle connections
-                to_evict = []
-                for server_name, last_used in self._last_used.items():
-                    idle_time = now - last_used
-                    if idle_time > idle_threshold:
-                        to_evict.append((server_name, idle_time))
+                to_evict = [
+                    name
+                    for name, last_used in self._last_used.items()
+                    if now - last_used > idle_threshold
+                ]
 
                 logger.info(
                     "Connection pool: %d active, %d locks",
@@ -2895,7 +2892,7 @@ class SSHManager:
                 )
 
                 # Evict idle connections
-                for server_name, idle_time in to_evict:
+                for server_name in to_evict:
                     # Get lock for this server (if it exists)
                     lock = self._locks.get(server_name)
                     if lock is None:
