@@ -7,11 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-> **The next release is 0.9.0, not 0.8.2:** the `groups` fix under Fixed makes two configurations that started on 0.8.1 refuse to start, and by the rule recorded under 0.8.1 below that takes the minor.
+## [0.9.0] - 2026-09-30
+
+> **Why 0.9.0 and not 0.8.2:** the `groups` fix under Fixed makes two configurations that started on 0.8.1 refuse to start, a string `groups` and an inline-table one, which is the test 0.8.0 recorded for taking the minor. The fix for both is a list: `groups = ["web"]`.
 
 ### Security
 
 **PyJWT is held at 2.14.0 or later, clearing ten advisories that turned the `pip-audit` gate red on `main`.** 2.13.0, locked transitively through `mcp`, carries CVE-2026-101917, CVE-2026-102265 to CVE-2026-102269 and CVE-2026-102271 to CVE-2026-102274: four algorithm-confusion variants, an empty-HMAC-key bypass, lenient Base64URL signature decoding, a followed JWKS redirect, and three denial-of-service paths in JWKS fetching and token/JWKS parsing. None is reachable here: the only `import jwt` in mcp 2.2.0 is `mcp/client/auth/extensions/client_credentials.py`, an OAuth *client* extension ssh-mcp never imports; its HTTP transport authenticates with its own bearer-token middleware.
+
+**urllib3 is locked at 2.8.0, clearing CVE-2026-97687, CVE-2026-97688 and CVE-2026-97689, which turned the `pip-audit` gate red on `main` after #68 merged.** urllib3 is a development-only dependency here, pulled in through `pip-audit` -> `requests`. The wheel does not depend on it, and the container image installs with `--no-dev`, so neither shipped artifact carried the vulnerable version. The floor is still declared, as a `[tool.uv]` constraint, because this project's rule is that every security floor lives in `pyproject.toml` whether or not a runtime path reaches it; `pip`'s dev-only floor is the precedent.
 
 ### Changed
 

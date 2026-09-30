@@ -179,6 +179,12 @@ constraint-dependencies = [
     # keeps the lockfile/container image clear and a future `uv lock` from
     # regressing.
     "pyjwt>=2.14.0",
+    # CVE-2026-97687, CVE-2026-97688, CVE-2026-97689 — three urllib3
+    # advisories fixed in 2.8.0. Transitive and dev-only: pip-audit -> requests
+    # -> urllib3, so neither the wheel nor the `--no-dev` container image
+    # carries it; the floor keeps a future `uv lock` from regressing the dev
+    # environment that CI's audit job runs in.
+    "urllib3>=2.8.0",
 ]
 
 [tool.ruff.lint]
