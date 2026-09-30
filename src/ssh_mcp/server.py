@@ -711,7 +711,7 @@ def _build_http_app(
     so a default here would make that fail-open path reachable by
     omission. Note there is deliberately no ``host`` parameter: the SDK
     consults ``host`` only to auto-enable loopback protection when
-    ``transport_security is None`` (mcp/server/lowlevel/server.py:735),
+    ``transport_security is None`` (mcp/server/lowlevel/server.py:742 in mcp 2.2.0),
     which this signature forbids, so forwarding it had no effect.
 
     Returns a ``Starlette`` instance ready to hand to ``uvicorn.run``.
@@ -731,8 +731,8 @@ def _build_http_app(
     # (Starlette itself went 0.52.1 -> 1.3.1 during this release cycle,
     # unconstrained by this project). `streamable_http_app()` above wires
     # its own inner Starlette app with `lifespan=lambda app:
-    # self.session_manager.run()` (mcp/server/lowlevel/server.py:828) — calling
-    # `lifespan_ctx(inner_app)` therefore did nothing but reach `.run()`
+    # self.session_manager.run()` (mcp/server/lowlevel/server.py:840 in mcp 2.2.0) —
+    # calling `lifespan_ctx(inner_app)` therefore did nothing but reach `.run()`
     # through a private indirection. `MCPServer.session_manager` is the
     # SDK-documented public accessor for the exact same object, and
     # `.run()` takes no arguments, so we call it directly from OUR outer
@@ -987,7 +987,7 @@ def _build_transport_security(
         # and three docs sites advertised it, but the SDK never
         # implemented suffix matching: mcp 2.1.1's
         # TransportSecurityMiddleware._validate_host
-        # (mcp/server/transport_security.py:50-69) does an exact-set
+        # (mcp/server/transport_security.py:50-70) does an exact-set
         # lookup and then ONE trailing ":*" port-wildcard pass, and there
         # is no "*." handling anywhere in the SDK. A "*." entry was
         # therefore matched LITERALLY, so a real Host header such as
@@ -1030,7 +1030,7 @@ def _build_transport_security(
     # but we always pass this explicitly (D7) rather than relying on
     # either default: passing any transport_security object at all
     # suppresses the SDK's loopback-only auto-enable
-    # (mcp/server/lowlevel/server.py:735), so the value has to be stated
+    # (mcp/server/lowlevel/server.py:742 in mcp 2.2.0), so the value has to be stated
     # here.
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,

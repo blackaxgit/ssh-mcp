@@ -168,6 +168,17 @@ constraint-dependencies = [
     # not exploitable here; the floor keeps a future `uv lock` from
     # regressing below the fix.
     "cryptography>=50.0.1",
+    # CVE-2026-101917, CVE-2026-102265..102269, CVE-2026-102271..102274 —
+    # ten PyJWT advisories fixed in 2.14.0: four algorithm-confusion
+    # variants, an empty-HMAC-key bypass, lenient Base64URL signature
+    # decoding, a followed JWKS redirect, and three denial-of-service paths
+    # in JWKS fetching and token/JWKS parsing.
+    # Transitive: mcp requires pyjwt[crypto]. The only importer in mcp 2.2.0
+    # is mcp/client/auth/extensions/client_credentials.py, an OAuth client
+    # extension ssh-mcp never imports, so none is reachable here; the floor
+    # keeps the lockfile/container image clear and a future `uv lock` from
+    # regressing.
+    "pyjwt>=2.14.0",
 ]
 
 [tool.ruff.lint]
