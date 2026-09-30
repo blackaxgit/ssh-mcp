@@ -33,32 +33,24 @@ def format_server_table(servers: list[ServerConfig], filter_label: str = "") -> 
     if not servers:
         return "No servers found."
 
-    # Calculate column widths
     max_name = max(len("SERVER"), max(len(s.name) for s in servers))
-    max_groups = max(
-        len("GROUPS"), max(len(", ".join(s.groups)) if s.groups else 0 for s in servers)
-    )
+    max_groups = max(len("GROUPS"), max(len(", ".join(s.groups)) for s in servers))
 
-    # Build header
     lines = [
         f"{'SERVER':<{max_name}}  {'GROUPS':<{max_groups}}  DESCRIPTION",
     ]
 
-    # Build rows
     for server in servers:
-        groups_str = ", ".join(server.groups) if server.groups else ""
+        groups_str = ", ".join(server.groups)
         lines.append(
             f"{server.name:<{max_name}}  {groups_str:<{max_groups}}  {server.description}"
         )
 
-    # Build footer
     lines.append("")
     count = len(servers)
     plural = "server" if count == 1 else "servers"
-    if filter_label:
-        lines.append(f"Total: {count} {plural} ({filter_label})")
-    else:
-        lines.append(f"Total: {count} {plural}")
+    suffix = f" ({filter_label})" if filter_label else ""
+    lines.append(f"Total: {count} {plural}{suffix}")
 
     return "\n".join(lines)
 
@@ -84,18 +76,15 @@ def format_group_table(groups: list[GroupConfig], server_counts: dict[str, int])
     if not groups:
         return "No groups found."
 
-    # Calculate column widths
     max_name = max(len("GROUP"), max(len(g.name) for g in groups))
     max_count = max(
         len("SERVERS"), max(len(str(server_counts.get(g.name, 0))) for g in groups)
     )
 
-    # Build header
     lines = [
         f"{'GROUP':<{max_name}}  {'SERVERS':<{max_count}}  DESCRIPTION",
     ]
 
-    # Build rows
     for group in groups:
         count = server_counts.get(group.name, 0)
         lines.append(
@@ -158,11 +147,9 @@ def format_exec_result(result: ExecResult) -> str:
     """
     lines = [f"[{result.server}] $ {result.command}"]
 
-    # Add stdout if present
     if result.stdout:
         lines.append(result.stdout)
 
-    # Add stderr if present
     if result.stderr:
         lines.append("")
         lines.append("STDERR:")
@@ -243,21 +230,13 @@ def format_group_results(results: list[ExecResult], group_name: str) -> str:
         "",
     ]
 
-    # Track success/failure counts
     succeeded = 0
-    failed = 0
-
-    # Format each result
     for result in results:
         if result.error:
-            failed += 1
             lines.append(f"[{result.server}] ERROR: {result.error}")
         else:
-            is_success = result.exit_code == 0
-            if is_success:
+            if result.exit_code == 0:
                 succeeded += 1
-            else:
-                failed += 1
 
             exit_code = result.exit_code if result.exit_code is not None else "unknown"
             lines.append(
@@ -272,7 +251,7 @@ def format_group_results(results: list[ExecResult], group_name: str) -> str:
 
         lines.append("")
 
-    # Add summary
+    failed = len(results) - succeeded
     lines.append(f"Summary: {succeeded} succeeded, {failed} failed")
 
     return "\n".join(lines)

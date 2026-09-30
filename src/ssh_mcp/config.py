@@ -161,8 +161,7 @@ class ServerRegistry:
         Raises:
             KeyError: If group name not found
         """
-        # Validate group exists first
-        self.get_group(group_name)
+        self.get_group(group_name)  # raises KeyError for an undefined group
         return [
             server for server in self._servers.values() if group_name in server.groups
         ]
@@ -235,47 +234,37 @@ class ServerRegistry:
             valid = ", ".join(_valid_keys(Settings))
             raise ConfigError(f"{detail}. Valid keys: {valid}") from e
 
-        # Warn if known_hosts verification is disabled
         if not self._settings.known_hosts:
             logger.warning(
                 "known_hosts verification disabled - connections vulnerable to MITM attacks"
             )
 
-        # Load groups
-        if "groups" in config_data:
-            for group_name, group_data in config_data["groups"].items():
-                try:
-                    self._groups[group_name] = GroupConfig(
-                        name=group_name,
-                        **dict(group_data),
-                    )
-                except ValidationError as e:
-                    detail = _format_validation_error("groups", group_name, e)
-                    valid = ", ".join(
-                        k for k in _valid_keys(GroupConfig) if k != "name"
-                    )
-                    raise ConfigError(f"{detail}. Valid keys: {valid}") from e
+        for group_name, group_data in config_data.get("groups", {}).items():
+            try:
+                self._groups[group_name] = GroupConfig(
+                    name=group_name,
+                    **dict(group_data),
+                )
+            except ValidationError as e:
+                detail = _format_validation_error("groups", group_name, e)
+                valid = ", ".join(k for k in _valid_keys(GroupConfig) if k != "name")
+                raise ConfigError(f"{detail}. Valid keys: {valid}") from e
 
-        # Load servers
-        if "servers" in config_data:
-            for server_name, server_data in config_data["servers"].items():
-                # Convert groups list to tuple before Pydantic sees it
-                data: dict[str, Any] = dict(server_data)
-                if "groups" in data:
-                    data["groups"] = tuple(data["groups"])
-                try:
-                    self._servers[server_name] = ServerConfig(
-                        name=server_name,
-                        **data,
-                    )
-                except ValidationError as e:
-                    detail = _format_validation_error("servers", server_name, e)
-                    valid = ", ".join(
-                        k for k in _valid_keys(ServerConfig) if k != "name"
-                    )
-                    raise ConfigError(f"{detail}. Valid keys: {valid}") from e
+        for server_name, server_data in config_data.get("servers", {}).items():
+            # Convert groups list to tuple before Pydantic sees it
+            data: dict[str, Any] = dict(server_data)
+            if "groups" in data:
+                data["groups"] = tuple(data["groups"])
+            try:
+                self._servers[server_name] = ServerConfig(
+                    name=server_name,
+                    **data,
+                )
+            except ValidationError as e:
+                detail = _format_validation_error("servers", server_name, e)
+                valid = ", ".join(k for k in _valid_keys(ServerConfig) if k != "name")
+                raise ConfigError(f"{detail}. Valid keys: {valid}") from e
 
-        # Validate configuration
         self._validate()
 
     def _validate(self) -> None:
@@ -289,9 +278,6 @@ class ServerRegistry:
             ValueError: If a circular jump host chain is detected. This is the
                 only fatal check here, so it aborts ``__init__``.
         """
-        server_names = set(self._servers.keys())
-        group_names = set(self._groups.keys())
-
         for server_name, server in self._servers.items():
             # A server should reference at least one group (advisory only)
             if not server.groups:
@@ -299,7 +285,7 @@ class ServerRegistry:
 
             # A group referenced by a server should be defined (advisory only)
             for group in server.groups:
-                if group not in group_names:
+                if group not in self._groups:
                     logger.warning(
                         "Server '%s' references undefined group '%s'",
                         server_name,
@@ -307,11 +293,11 @@ class ServerRegistry:
                     )
 
             # Server names should not collide with group names (advisory only)
-            if server_name in group_names:
+            if server_name in self._groups:
                 logger.warning("Server name '%s' collides with group name", server_name)
 
             # jump_host should reference another defined server (advisory only)
-            if server.jump_host and server.jump_host not in server_names:
+            if server.jump_host and server.jump_host not in self._servers:
                 logger.warning(
                     "Server '%s' references undefined jump_host '%s'",
                     server_name,
@@ -320,20 +306,13 @@ class ServerRegistry:
 
         # Detect circular jump host chains
         for server_name, server in self._servers.items():
-            if server.jump_host:
-                visited = {server_name}
-                current = server.jump_host
-                path = [server_name, current]
-
-                while current in self._servers:
-                    if current in visited:
-                        cycle_path = " -> ".join(path)
-                        raise ValueError(f"Circular jump host chain: {cycle_path}")
-
-                    visited.add(current)
-                    next_jump = self._servers[current].jump_host
-                    if next_jump:
-                        path.append(next_jump)
-                        current = next_jump
-                    else:
-                        break
+            visited = {server_name}
+            path = [server_name]
+            current = server.jump_host
+            while current and current in self._servers:
+                path.append(current)
+                if current in visited:
+                    cycle_path = " -> ".join(path)
+                    raise ValueError(f"Circular jump host chain: {cycle_path}")
+                visited.add(current)
+                current = self._servers[current].jump_host

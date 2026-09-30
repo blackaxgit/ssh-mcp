@@ -83,11 +83,6 @@ def _check_stdio() -> tuple[bool, str]:
     Returns (ok, diagnostic).
     """
     try:
-        import ssh_mcp  # noqa: F401
-    except ImportError as e:
-        return False, f"import failed: {e}"
-
-    try:
         from ssh_mcp.server import _get_config_path
     except ImportError as e:
         return False, f"import failed: {e}"
@@ -164,9 +159,7 @@ def _check_http() -> tuple[bool, str]:
     except urllib.error.HTTPError as e:
         # Any non-5xx status means the server is alive but the request was rejected
         # (wrong auth, wrong protocol version, etc.) — still healthy.
-        if e.code < 500:
-            return True, f"http {e.code}"
-        return False, f"http {e.code}"
+        return e.code < 500, f"http {e.code}"
     except urllib.error.URLError as e:
         return False, f"connect failed: {type(e.reason).__name__}"
     except Exception as e:  # noqa: BLE001 - an unknown probe failure is 'unhealthy', not a crash of the healthcheck itself
