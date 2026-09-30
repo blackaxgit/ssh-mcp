@@ -398,6 +398,39 @@ groups = ["prod"]
             ServerRegistry(str(f))
         assert "command_timeout" in str(exc_info.value)
 
+    @pytest.mark.parametrize("groups_value", ['"web"', "5", "{ web = 1 }"])
+    def test_non_list_groups_rejected_not_coerced(
+        self, tmp_path: Path, groups_value: str
+    ) -> None:
+        """A non-list `groups` must raise ConfigError, not be coerced.
+
+        The loader used to call tuple() on the raw value before Pydantic saw
+        it. `groups = "web"` loaded as ('w', 'e', 'b') with three
+        undefined-group warnings, and the server silently dropped out of
+        group `web`; `groups = 5` escaped as a raw TypeError; and
+        `groups = { web = 1 }` loaded as ('web',) by iterating the table's
+        keys.
+        """
+        config_content = f"""
+[groups]
+web = {{ description = "Web" }}
+
+[servers.a]
+hostname = "h"
+user = "u"
+description = "d"
+groups = {groups_value}
+"""
+        f = tmp_path / "non-list-groups.toml"
+        f.write_text(config_content)
+        with pytest.raises(ConfigError) as exc_info:
+            ServerRegistry(str(f))
+        # Every [servers] ConfigError ends with "Valid keys: ..., groups, ...",
+        # so a bare "groups" substring can never fail; the quoted form with a
+        # colon appears only when `groups` itself is the rejected field.
+        assert "'groups':" in str(exc_info.value)
+        assert 'groups = ["web"]' in str(exc_info.value)
+
     def test_config_error_is_valueerror_subclass(self) -> None:
         """ConfigError must remain a ValueError subclass for backward compat."""
         assert issubclass(ConfigError, ValueError)

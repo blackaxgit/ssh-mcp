@@ -722,7 +722,7 @@ def _build_http_app(
     # (Starlette itself went 0.52.1 -> 1.3.1 during this release cycle,
     # unconstrained by this project). `streamable_http_app()` above wires
     # its own inner Starlette app with `lifespan=lambda app:
-    # self.session_manager.run()` (mcp/server/lowlevel/server.py:840 in mcp 2.2.0) —
+    # session_manager.run()` (mcp/server/lowlevel/server.py:840 in mcp 2.2.0) —
     # calling `lifespan_ctx(inner_app)` therefore did nothing but reach `.run()`
     # through a private indirection. `MCPServer.session_manager` is the
     # SDK-documented public accessor for the exact same object, and
@@ -748,7 +748,7 @@ def _build_http_app(
             "streamable_http_app() — this used to also populate "
             "Starlette's private router.lifespan_context, which "
             "ssh-mcp no longer depends on. The MCP SDK may have changed "
-            "its internal wiring (as of mcp 2.1.1 it lives in "
+            "its internal wiring (as of mcp 2.2.0 it lives in "
             "mcp/server/lowlevel/server.py); update the lifespan wiring "
             "in server.py._build_http_app or pin a known-good mcp."
         ) from exc
@@ -975,7 +975,7 @@ def _build_transport_security(
         # two independent validators plus a direct read of the installed
         # SDK). Until 0.7.0 this gate permitted "*.internal.example.com"
         # and three docs sites advertised it, but the SDK never
-        # implemented suffix matching: mcp 2.1.1's
+        # implemented suffix matching: mcp 2.2.0's
         # TransportSecurityMiddleware._validate_host
         # (mcp/server/transport_security.py:50-70) does an exact-set
         # lookup and then ONE trailing ":*" port-wildcard pass, and there
