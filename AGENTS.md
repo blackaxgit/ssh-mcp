@@ -12,7 +12,7 @@ Command sources: `.github/workflows/ci.yml` (the gates), `.github/workflows/rele
 - **Type:** app — published as a PyPI wheel (`uvx blc-ssh-mcp`) *and* a container image (`ghcr.io/blackaxgit/ssh-mcp`). **The PyPI distribution is `blc-ssh-mcp`, not `ssh-mcp`** — that name belongs to an unrelated project this repo has never owned; see the comment above `name` in `pyproject.toml`. The import package is still `ssh_mcp` and the image is still `.../ssh-mcp`.
 - **Stacks:** Python 3.11-3.14, `uv` + hatchling, asyncssh, MCP SDK, Starlette/uvicorn (HTTP transport only)
 - **Deploy targets:** N/A — this is a tool operators run themselves, not a hosted service
-- **Version:** `src/ssh_mcp/__init__.py` is the single source (hatchling reads it). Currently `0.8.1`. `0.7.0` shipped 2026-09-06 (the MCP SDK v2 migration) and is the first release published under a reviewer-gated `pypi` environment; `0.6.0`, `0.6.1` and `0.6.2` all shipped 2026-07-26. `CHANGELOG.md` `[Unreleased]` is where post-0.8.0 work accrues.
+- **Version:** `src/ssh_mcp/__init__.py` is the single source (hatchling reads it). Currently `0.9.0`. `0.7.0` shipped 2026-09-06 (the MCP SDK v2 migration) and is the first release published under a reviewer-gated `pypi` environment; `0.6.0`, `0.6.1` and `0.6.2` all shipped 2026-07-26. `CHANGELOG.md` `[Unreleased]` is where post-0.9.0 work accrues.
 
 **What this tool does matters for how you treat it.** Every tool call runs a shell command or transfers a file on a remote host. A bug here is not a crashed request; it is an unintended command on someone's infrastructure, or a write to the operator's own machine.
 
@@ -20,7 +20,7 @@ Command sources: `.github/workflows/ci.yml` (the gates), `.github/workflows/rele
 
 ```bash
 uv sync --locked --extra dev        # setup. --locked is required; see Gotchas
-uv run pytest                       # full suite (853 tests, seconds)
+uv run pytest                       # full suite (855 tests, seconds)
 uv run pytest tests/test_ssh.py::TestRedactSecrets -v          # one class
 uv run pytest 'tests/test_ssh.py::TestRedactSecrets::<test_name>' -v   # one test
 uv run pytest -k "confinement" -v                              # by keyword

@@ -99,6 +99,12 @@ SECURITY_FLOORS: dict[str, tuple[str, str]] = {
         "mcp.client.auth.extensions.client_credentials, the only importer, "
         "so none is reachable here.",
     ),
+    "urllib3": (
+        "2.8.0",
+        "CVE-2026-97687, CVE-2026-97688 and CVE-2026-97689, all fixed in 2.8.0. "
+        "Transitive and dev/CI-only (pip-audit -> requests -> urllib3); absent "
+        "from the wheel's dependencies and from the --no-dev container image.",
+    ),
 }
 
 # Packages that ssh-mcp imports directly and must therefore constrain in the
