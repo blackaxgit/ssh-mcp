@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+**PyJWT is held at 2.14.0 or later, clearing ten advisories that turned the `pip-audit` gate red on `main`.** 2.13.0, locked transitively through `mcp`, carries CVE-2026-101917, CVE-2026-102265 to CVE-2026-102269 and CVE-2026-102271 to CVE-2026-102274: four algorithm-confusion variants, an empty-HMAC-key bypass, lenient Base64URL signature decoding, a followed JWKS redirect, and three denial-of-service paths in JWKS fetching and token/JWKS parsing. None is reachable here: the only `import jwt` in mcp 2.2.0 is `mcp/client/auth/extensions/client_credentials.py`, an OAuth *client* extension ssh-mcp never imports; its HTTP transport authenticates with its own bearer-token middleware.
+
+### Changed
+
+**Stateful HTTP sessions now expire after 30 idle minutes, and at most 10,000 are held at once.** Both limits are mcp 2.2.0 defaults (#64), which the lockfile and container image now ship, and they apply only to stateful sessions on the legacy (2025-11-25 and earlier) protocol. A session with no request in flight and no open GET stream is closed after 1800 s; its next request gets `404` `Session not found`, which a client that does not re-initialize surfaces as an error. An open GET stream prevents expiry but still counts toward the cap, and a session opened beyond the cap gets `503`. Stateless mode (`SSH_MCP_HTTP_STATELESS=true`) avoids both limits. ssh-mcp deliberately exposes no knob for either: both bound server-side memory on an endpoint that executes shell commands. The declared floor stays `mcp>=2.1.1`, so an existing environment that already has 2.1.1 keeps the old unbounded behaviour until it upgrades.
+
 ## [0.8.1] - 2026-09-07
 
 > **Why 0.8.1 and not 0.9.0:** nothing here changes a configuration that started successfully on 0.8.0 into one that refuses to start, which is the test 0.8.0 itself recorded for taking the minor. The one behaviour an operator could notice is that four more command shapes are now blocked by the dangerous-command tripwire — and that list has always been documented as advisory and subject to widening, `force=true` still bypasses it, and no *configuration* becomes invalid. Everything else is a hang becoming an error, a log line becoming honest, an image gaining an architecture, and prose corrections.

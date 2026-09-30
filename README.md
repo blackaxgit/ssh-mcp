@@ -223,7 +223,7 @@ Authorization: Bearer <TOKEN>
 Host: ssh-mcp.internal
 ```
 
-For stateful sessions (default), MCPServer maintains per-client context across requests. For stateless deployments behind a load balancer, set `SSH_MCP_HTTP_STATELESS=true` — each request is handled independently with no server-side session.
+For stateful sessions (default), MCPServer maintains per-client context across requests. Since mcp 2.2.0, stateful sessions on the legacy (2025-11-25 and earlier) protocol are limited: one with no request in flight and no open GET stream is closed after 30 minutes (its next request gets `404` and must initialize again), and at most 10,000 are held at once (`503` beyond that; an open GET stream still counts). Stateless mode avoids both limits. For stateless deployments behind a load balancer, set `SSH_MCP_HTTP_STATELESS=true` — each request is handled independently with no server-side session.
 
 ### Healthcheck
 
