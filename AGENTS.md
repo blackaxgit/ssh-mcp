@@ -20,7 +20,7 @@ Command sources: `.github/workflows/ci.yml` (the gates), `.github/workflows/rele
 
 ```bash
 uv sync --locked --extra dev        # setup. --locked is required; see Gotchas
-uv run pytest                       # full suite (850 tests, seconds)
+uv run pytest                       # full suite (853 tests, seconds)
 uv run pytest tests/test_ssh.py::TestRedactSecrets -v          # one class
 uv run pytest 'tests/test_ssh.py::TestRedactSecrets::<test_name>' -v   # one test
 uv run pytest -k "confinement" -v                              # by keyword

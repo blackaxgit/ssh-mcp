@@ -182,6 +182,16 @@ class ServerConfig:
     default_dir: str | None = None
     timeout: int | None = Field(default=None, ge=1, le=3600)
 
+    @field_validator("groups", mode="before")
+    @classmethod
+    def _require_group_list(cls, value: object) -> object:
+        # TOML has no tuple type, so Pydantic's own "Input should be a valid
+        # tuple" gives a servers.toml author nothing to act on. Name the shape
+        # the file needs instead.
+        if not isinstance(value, (list, tuple)):
+            raise ValueError('must be a list of group names, e.g. groups = ["web"]')
+        return value
+
     @field_validator("identity_file")
     @classmethod
     def _expand_identity_file(cls, value: str | None) -> str | None:

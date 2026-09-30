@@ -12,7 +12,6 @@ import logging
 import os
 import tomllib
 from pathlib import Path
-from typing import Any
 
 from pydantic import ValidationError
 
@@ -251,14 +250,10 @@ class ServerRegistry:
                 raise ConfigError(f"{detail}. Valid keys: {valid}") from e
 
         for server_name, server_data in config_data.get("servers", {}).items():
-            # Convert groups list to tuple before Pydantic sees it
-            data: dict[str, Any] = dict(server_data)
-            if "groups" in data:
-                data["groups"] = tuple(data["groups"])
             try:
                 self._servers[server_name] = ServerConfig(
                     name=server_name,
-                    **data,
+                    **dict(server_data),
                 )
             except ValidationError as e:
                 detail = _format_validation_error("servers", server_name, e)

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **The next release is 0.9.0, not 0.8.2:** the `groups` fix under Fixed makes two configurations that started on 0.8.1 refuse to start, and by the rule recorded under 0.8.1 below that takes the minor.
+
 ### Security
 
 **PyJWT is held at 2.14.0 or later, clearing ten advisories that turned the `pip-audit` gate red on `main`.** 2.13.0, locked transitively through `mcp`, carries CVE-2026-101917, CVE-2026-102265 to CVE-2026-102269 and CVE-2026-102271 to CVE-2026-102274: four algorithm-confusion variants, an empty-HMAC-key bypass, lenient Base64URL signature decoding, a followed JWKS redirect, and three denial-of-service paths in JWKS fetching and token/JWKS parsing. None is reachable here: the only `import jwt` in mcp 2.2.0 is `mcp/client/auth/extensions/client_credentials.py`, an OAuth *client* extension ssh-mcp never imports; its HTTP transport authenticates with its own bearer-token middleware.
@@ -14,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 **Stateful HTTP sessions now expire after 30 idle minutes, and at most 10,000 are held at once.** Both limits are mcp 2.2.0 defaults (#64), which the lockfile and container image now ship, and they apply only to stateful sessions on the legacy (2025-11-25 and earlier) protocol. A session with no request in flight and no open GET stream is closed after 1800 s; its next request gets `404` `Session not found`, which a client that does not re-initialize surfaces as an error. An open GET stream prevents expiry but still counts toward the cap, and a session opened beyond the cap gets `503`. Stateless mode (`SSH_MCP_HTTP_STATELESS=true`) avoids both limits. ssh-mcp deliberately exposes no knob for either: both bound server-side memory on an endpoint that executes shell commands. The declared floor stays `mcp>=2.1.1`, so an existing environment that already has 2.1.1 keeps the old unbounded behaviour until it upgrades.
+
+### Fixed
+
+**A non-list `groups` is now rejected at load instead of being coerced.** `groups = "web"` used to load as `('w', 'e', 'b')`: the config started with three undefined-group warnings and the server dropped out of group `web`, so `execute_on_group` skipped it. The loader's `tuple()` pre-conversion is gone, so Pydantic validates the raw value and still converts a TOML list to a tuple; `groups = 5` is now a `ConfigError` instead of a raw `TypeError`. **Two shapes that used to start now refuse to start:** a string `groups`, and an inline table (`groups = { web = 1 }`, which used to load as `('web',)`). The stdio `ssh-mcp healthcheck` reports the same configs `UNHEALTHY`, so a container healthcheck in the default stdio mode that passed will now fail. The fix for both is a list: `groups = ["web"]`, which the refusal message now names.
 
 ## [0.8.1] - 2026-09-07
 
