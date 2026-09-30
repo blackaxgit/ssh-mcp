@@ -88,6 +88,17 @@ SECURITY_FLOORS: dict[str, tuple[str, str]] = {
         "(deprecated websocket_server). None reachable from ssh-mcp's SDK "
         "usage; 1.28.1 is the max first-patched version across the three.",
     ),
+    "pyjwt": (
+        "2.14.0",
+        "CVE-2026-101917, CVE-2026-102265 to CVE-2026-102269 and "
+        "CVE-2026-102271 to CVE-2026-102274 — four algorithm-confusion variants, "
+        "an empty-HMAC-key bypass, lenient Base64URL signature decoding, "
+        "a followed JWKS redirect, and three denial-of-service paths in JWKS "
+        "fetching and token/JWKS parsing; all fixed in 2.14.0. Transitive via mcp; "
+        "ssh-mcp never imports "
+        "mcp.client.auth.extensions.client_credentials, the only importer, "
+        "so none is reachable here.",
+    ),
 }
 
 # Packages that ssh-mcp imports directly and must therefore constrain in the
