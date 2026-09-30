@@ -110,7 +110,7 @@ dev = [
     # rules, so `uvx ruff check` began failing CI on commits it had passed a
     # week earlier. A CI gate must be a function of the commit under review,
     # not of what the tool happens to ship today. Bump these deliberately.
-    "ruff==0.16.6",
+    "ruff==0.16.9",
     "bandit==1.9.4",
     # Used by tests/test_ci_lint_determinism.py to parse the workflow files.
     # bandit already pulls PyYAML in transitively; declared explicitly here so
