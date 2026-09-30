@@ -1612,9 +1612,10 @@ class SSHManager:
             # Use server-specific timeout if configured
             effective_timeout = server.timeout or timeout
 
-            # Prepend working directory if specified
+            # Prepend working_dir if given, else the server's default_dir
             effective_command = command
-            if cd_dir := working_dir or server.default_dir:
+            cd_dir = working_dir or server.default_dir
+            if cd_dir:
                 effective_command = f"cd {shlex.quote(cd_dir)} && {command}"
 
             # Get or create connection
@@ -2516,6 +2517,9 @@ class SSHManager:
                                     # of a blanket ignore; encoding=None
                                     # (set automatically by the 'b' in
                                     # "rb") guarantees bytes at runtime.
+                                    #
+                                    # `written` doubles as the remote read
+                                    # offset: both advance by len(data).
                                     data: bytes = await remote_file.read(block, written)
                                     if not data:
                                         break

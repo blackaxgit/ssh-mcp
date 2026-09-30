@@ -251,6 +251,7 @@ def format_group_results(results: list[ExecResult], group_name: str) -> str:
 
         lines.append("")
 
+    # Anything not counted as succeeded failed: an error, a non-zero or unknown exit.
     failed = len(results) - succeeded
     lines.append(f"Summary: {succeeded} succeeded, {failed} failed")
 
