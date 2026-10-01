@@ -2,23 +2,14 @@
 
 ## Supported Versions
 
-| Version            | Supported |
-|--------------------|-----------|
-| 0.6.x (unreleased) | Yes       |
-| ≤ 0.5.6            | No        |
+| Version | Supported |
+|---------|-----------|
+| 0.9.x   | Yes       |
+| ≤ 0.8.x | No        |
 
-Older versions are not supported. Please upgrade to the latest 0.6.x release before reporting an issue.
+Only the latest minor release receives security fixes. Upgrade to the latest 0.9.x release — `uvx blc-ssh-mcp`, `pip install -U blc-ssh-mcp`, or `ghcr.io/blackaxgit/ssh-mcp:0.9` — and reproduce on it before reporting. The PyPI distribution is **`blc-ssh-mcp`**; the `ssh-mcp` project on PyPI is unrelated to this repository.
 
-**0.6.0 is not released yet.** The latest tag and `__version__` are still 0.5.6,
-so there is currently no released version carrying the fix below — build from
-`main` or wait for the 0.6.0 release.
-
-**0.6.0 contains security fixes. Versions ≤ 0.5.6 are affected by a local-path
-confinement flaw in the SFTP tools that allows an MCP client to write to
-arbitrary paths on the machine running ssh-mcp, including files that lead to
-code execution there.** See the `[Unreleased]` section of the CHANGELOG, which
-ships as 0.6.0. Upgrade rather than patching in place; the fix changes the
-`upload_file`/`download_file` path contract.
+**Versions ≤ 0.5.6 are affected by a local-path confinement flaw** in the SFTP tools that lets an MCP client write to arbitrary paths on the machine running ssh-mcp, including files that lead to code execution there. It was fixed in 0.6.0, which changed the `upload_file`/`download_file` path contract (see [SFTP File Transfers](#sftp-file-transfers) and the 0.6.0 CHANGELOG entry). Upgrade rather than patching in place.
 
 ## Reporting a Vulnerability
 
@@ -133,7 +124,7 @@ The streamable HTTP transport is the highest-risk deployment surface: reaching t
 - The default bind, `127.0.0.1:8000`, is **unauthenticated by design** — it matches the single-user stdio deployment model. This is intentional and not a vulnerability report.
 - Bearer auth is configured via `SSH_MCP_HTTP_TOKEN` or `SSH_MCP_HTTP_TOKEN_FILE`. Tokens must be at least 16 characters and are compared in constant time. Prefer the file form, keep it `0600`, and rotate by restarting with a new value — there is no online rotation.
 - Binding a non-localhost address without a token **aborts startup**. Setting `SSH_MCP_HTTP_AUTH=none` on such a bind additionally requires the literal acknowledgement `SSH_MCP_HTTP_NETWORK_NO_AUTH=I_ACCEPT_RCE_RISK`.
-- DNS-rebinding protection is always enabled, and wildcard entries in `SSH_MCP_HTTP_ALLOWED_HOSTS` are rejected rather than silently disabling it.
+- DNS-rebinding protection is always enabled. Host wildcards in `SSH_MCP_HTTP_ALLOWED_HOSTS` (`*`, `*:*`, `*.*`, `*.example.com`) **abort startup** rather than silently weakening or breaking it; only a trailing `:*` port wildcard (`api.internal.example.com:*`) is accepted.
 
 If you expose ssh-mcp beyond loopback, terminate TLS and authenticate at a reverse proxy; the bearer token is a single shared secret, not a user model.
 
