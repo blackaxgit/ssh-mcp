@@ -5,7 +5,7 @@
 # Stage 1: Builder - compile dependencies with uv
 
 # python:3.14-slim-trixie
-FROM python:3.14-slim-trixie@sha256:51dafde81dbdb6ebde285137a295cf18a47ca95234fe388a343719cb97305b3d AS builder
+FROM python:3.14-slim-trixie@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS builder
 
 # Copy uv from official distribution image (not using as base to keep image small)
 # ghcr.io/astral-sh/uv:0.12.10
@@ -46,7 +46,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Stage 2: Runtime - minimal production image
 
 # python:3.14-slim-trixie
-FROM python:3.14-slim-trixie@sha256:51dafde81dbdb6ebde285137a295cf18a47ca95234fe388a343719cb97305b3d
+FROM python:3.14-slim-trixie@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
 
 # Create non-root user for security (uid 1000 standard)
 RUN useradd --uid 1000 --create-home --shell /sbin/nologin sshmcp
