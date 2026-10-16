@@ -2,7 +2,7 @@
 
 ## Development Setup
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/getting-started/installation/). CI tests against 3.11, 3.12, 3.13 and 3.14.
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/getting-started/installation/). CI tests against 3.11, 3.12, 3.13, 3.14 and 3.15.
 
 ```bash
 git clone https://github.com/blackaxgit/ssh-mcp.git
