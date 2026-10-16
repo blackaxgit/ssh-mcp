@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-16
+
+> **Why 0.9.1 and not 0.10.0:** nothing here makes a configuration that started on 0.9.0 refuse to start, which is the test 0.8.0 recorded for taking the minor. Python 3.15 support adds an interpreter without dropping one, and the `pip-api` bump is dev-only.
+
 ### Added
 
 **Python 3.15 is supported and tested.** CI and the release gate now run the test suite on 3.15 alongside 3.11-3.14, and the wheel carries the 3.15 classifier. No code change was needed. The pinned `uv` moves from 0.12.10 to 0.13.1 in every workflow and the Dockerfile, because 0.12.10 only knows CPython 3.15.0rc2 — a 3.15 leg on it would have tested a release candidate while reporting 3.15. 0.13.1 rather than 0.13.0 because 0.13.0 regressed on extracting source distributions that contain hard links, and the 3.15 leg builds PyYAML from its sdist (6.0.3 ships no cp315 wheel). The container image stays on Python 3.14.
