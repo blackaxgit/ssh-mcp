@@ -1,15 +1,15 @@
 # Multi-stage build for Python MCP server with uv package manager
 # Base: python:3.14-slim-trixie (Debian 13, 2026 standard)
 # 3.14 is a deliberate image target; the package itself supports >=3.11 and CI
-# runs the 3.11-3.14 matrix (pyproject.toml, .github/workflows/ci.yml).
+# runs the 3.11-3.15 matrix (pyproject.toml, .github/workflows/ci.yml).
 # Stage 1: Builder - compile dependencies with uv
 
 # python:3.14-slim-trixie
 FROM python:3.14-slim-trixie@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS builder
 
 # Copy uv from official distribution image (not using as base to keep image small)
-# ghcr.io/astral-sh/uv:0.12.10
-COPY --from=ghcr.io/astral-sh/uv:0.12.10@sha256:2bb3ebca0a796a155094a27773d290c4b074572e6107f171d88d086682fd2500 /uv /usr/local/bin/uv
+# ghcr.io/astral-sh/uv:0.13.1
+COPY --from=ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336 /uv /usr/local/bin/uv
 
 # UV_COMPILE_BYTECODE=1 precompiles .pyc for faster cold start.
 # UV_LINK_MODE=copy copies out of the uv cache instead of hardlinking — the

@@ -10,7 +10,7 @@ Command sources: `.github/workflows/ci.yml` (the gates), `.github/workflows/rele
 - **Purpose:** SSH MCP server that lets AI assistants execute commands on remote servers.
 - **Owner:** TODO: team/maintainer
 - **Type:** app — published as a PyPI wheel (`uvx blc-ssh-mcp`) *and* a container image (`ghcr.io/blackaxgit/ssh-mcp`). **The PyPI distribution is `blc-ssh-mcp`, not `ssh-mcp`** — that name belongs to an unrelated project this repo has never owned; see the comment above `name` in `pyproject.toml`. The import package is still `ssh_mcp` and the image is still `.../ssh-mcp`.
-- **Stacks:** Python 3.11-3.14, `uv` + hatchling, asyncssh, MCP SDK, Starlette/uvicorn (HTTP transport only)
+- **Stacks:** Python 3.11-3.15, `uv` + hatchling, asyncssh, MCP SDK, Starlette/uvicorn (HTTP transport only)
 - **Deploy targets:** N/A — this is a tool operators run themselves, not a hosted service
 - **Version:** `src/ssh_mcp/__init__.py` is the single source (hatchling reads it). Currently `0.9.0`. `0.7.0` shipped 2026-09-06 (the MCP SDK v2 migration) and is the first release published under a reviewer-gated `pypi` environment; `0.6.0`, `0.6.1` and `0.6.2` all shipped 2026-07-26. `CHANGELOG.md` `[Unreleased]` is where post-0.9.0 work accrues.
 
@@ -122,7 +122,7 @@ The full state matrix is documented on `ExecResult` in `models.py`. Do not "norm
 
 | Workflow | Trigger | Jobs |
 |---|---|---|
-| `ci.yml` | push/PR to `main`, tags `v*` | `test` (3.11-3.14), `lint`, `audit`, `docker` (`needs: [test, lint, audit]`) |
+| `ci.yml` | push/PR to `main`, tags `v*` | `test` (3.11-3.15), `lint`, `audit`, `docker` (`needs: [test, lint, audit]`) |
 | `audit.yml` | daily cron + manual | `pip-audit` against `main`, so a new advisory surfaces on its own schedule instead of reddening an unrelated PR |
 | `release.yml` | tag `v*` | re-runs test/lint/audit → `build` (asserts tag == packaged version, emits CycloneDX SBOM) → `publish-pypi` → `github-release` |
 
@@ -130,7 +130,7 @@ The full state matrix is documented on `ExecResult` in `models.py`. Do not "norm
 
 **The image is multi-arch (`linux/amd64,linux/arm64`) as of 0.8.1, and that makes the Trivy gate arity load-bearing.** A multi-arch push produces an *index*, and Trivy resolves an index to the runner's own platform, so **one** scan step gates amd64 and publishes arm64 uninspected — with a green gate. There is therefore one scan step per platform, selected via `TRIVY_PLATFORM` (trivy-action v0.36.0 exposes no `platform` input but passes environment through). For the same reason the digest-verification step **derives** its expected manifest set from the scanned reference instead of comparing against `steps.build.outputs.digest`, which is now an index digest whose children are what `imagetools create` copies into the tag — hardcoding it would fail every publish run, the same shape as the 2026-07-26 incident one level down. `test_published_image_is_multi_arch_and_every_platform_is_scanned` asserts platforms-built equals platforms-scanned.
 
-**The PR path builds amd64 only, so arm64 build breakage surfaces on `main`, not on the PR.** `load: true` cannot load a multi-platform result, so the PR build stays single-platform for fast feedback and Trivy has a local image to scan. The consequence is asymmetric and deliberate: a Dockerfile change that breaks the arm64 leg passes review and turns `main` red. That is loud and publishes nothing — the digest push happens in the same failed step — but it does mean an arch-sensitive change should be built locally first (`docker buildx build --platform linux/arm64 .`), which is how 0.8.1's arm64 leg was verified before merge. Both pinned bases were checked to be multi-arch indexes at the same time (`python:3.14-slim-trixie` and `ghcr.io/astral-sh/uv:0.12.10`); pinning a *single-platform* digest there is the failure this would otherwise find late.
+**The PR path builds amd64 only, so arm64 build breakage surfaces on `main`, not on the PR.** `load: true` cannot load a multi-platform result, so the PR build stays single-platform for fast feedback and Trivy has a local image to scan. The consequence is asymmetric and deliberate: a Dockerfile change that breaks the arm64 leg passes review and turns `main` red. That is loud and publishes nothing — the digest push happens in the same failed step — but it does mean an arch-sensitive change should be built locally first (`docker buildx build --platform linux/arm64 .`), which is how 0.8.1's arm64 leg was verified before merge. Both pinned bases were checked to be multi-arch indexes at the same time (`python:3.14-slim-trixie` and `ghcr.io/astral-sh/uv:0.13.1`); pinning a *single-platform* digest there is the failure this would otherwise find late.
 
 All third-party actions are pinned to a full commit SHA with a `# vX` comment, and `astral-sh/setup-uv` additionally pins a `version:` so `uv` itself cannot float. Keep both — an unpinned tool is how this repo previously had CI go red on commits that had passed days earlier. Never replace a SHA with a tag reference. None of this is prose-only convention: `tests/test_ci_lint_determinism.py` asserts it, so a workflow edit that drops a pin fails the suite.
 
