@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 **Python 3.15 is supported and tested.** CI and the release gate now run the test suite on 3.15 alongside 3.11-3.14, and the wheel carries the 3.15 classifier. No code change was needed. The pinned `uv` moves from 0.12.10 to 0.13.1 in every workflow and the Dockerfile, because 0.12.10 only knows CPython 3.15.0rc2 — a 3.15 leg on it would have tested a release candidate while reporting 3.15. 0.13.1 rather than 0.13.0 because 0.13.0 regressed on extracting source distributions that contain hard links, and the 3.15 leg builds PyYAML from its sdist (6.0.3 ships no cp315 wheel). The container image stays on Python 3.14.
 
+### Fixed
+
+**`uv run pip-audit` works on Python 3.15.** `pip-api` is locked at 0.0.35 instead of 0.0.34, whose vendored pyparsing imports `sre_constants`, a module 3.15 removed, so the audit gate crashed before scanning in a 3.15 dev environment. Since uv 0.13 made 3.15 its default download, a fresh `uv sync` can create exactly that environment. CI was not affected because its audit job runs on 3.13. The change is dev-only: `pip-api` comes in through `pip-audit`, and neither the wheel nor the image ships it.
+
 ## [0.9.0] - 2026-09-30
 
 > **Why 0.9.0 and not 0.8.2:** the `groups` fix under Fixed makes two configurations that started on 0.8.1 refuse to start, a string `groups` and an inline-table one, which is the test 0.8.0 recorded for taking the minor. The fix for both is a list: `groups = ["web"]`.
