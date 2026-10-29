@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+**filelock 4.2.4, certifi 2026.10.23 and msgpack 1.2.4 are locked, and `[tool.uv]` constraints hold them at 4.2.1, 2026.10.19 and 1.2.3 or later, clearing the advisories that turned the `pip-audit` gate red on `main` (scheduled audit since 2026-10-21).** All three are development-only (`pip-audit` -> `cachecontrol` / `requests`) and absent from the wheel and the image's application virtualenv, so none matters to users: pip-audit's cache never takes a filelock lock, msgpack decodes only pip-audit's own cache, and certifi's emSign root, whose intermediate CA keys were compromised, is trusted only by pip-audit's own HTTPS queries. Supersedes Dependabot #79, which only moved the lockfile and predates the msgpack advisory.
+
+**The container base image digest is refreshed to CPython 3.14.10.** The previous base's bundled pip 26.2.1 vendored certifi 2026.6.17 (GHSA-6q48-6c7w-9gw2, CRITICAL), which failed the Trivy gate; pip 26.2.2 vendors 2026.10.19. The image never runs pip, but it shipped the bundle.
+
 ## [0.9.1] - 2026-10-16
 
 > **Why 0.9.1 and not 0.10.0:** nothing here makes a configuration that started on 0.9.0 refuse to start, which is the test 0.8.0 recorded for taking the minor. Python 3.15 support adds an interpreter without dropping one. The runtime dependency upgrades under Changed are lockfile-only: no declared floor in `pyproject.toml` moved, so a `pip install` of 0.9.0 could already resolve every one of them, and the full suite passes on the locked set.
