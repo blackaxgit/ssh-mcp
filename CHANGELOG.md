@@ -7,11 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-29
+
+> **Why 0.9.2 and not 0.10.0:** nothing here makes a configuration that started on 0.9.1 refuse to start. The only runtime change is a lockfile-only `pydantic` patch; no declared floor in `pyproject.toml`'s `dependencies` moved.
+
 ### Security
 
 **filelock 4.2.4, certifi 2026.10.23 and msgpack 1.2.4 are locked, and `[tool.uv]` constraints hold them at 4.2.1, 2026.10.19 and 1.2.3 or later, clearing the advisories that turned the `pip-audit` gate red on `main` (scheduled audit since 2026-10-21).** All three are development-only (`pip-audit` -> `cachecontrol` / `requests`) and absent from the wheel and the image's application virtualenv, so none matters to users: pip-audit's cache never takes a filelock lock, msgpack decodes only pip-audit's own cache, and certifi's emSign root, whose intermediate CA keys were compromised, is trusted only by pip-audit's own HTTPS queries. Supersedes Dependabot #79, which only moved the lockfile and predates the msgpack advisory.
 
 **The container base image digest is refreshed to CPython 3.14.10.** The previous base's bundled pip 26.2.1 vendored certifi 2026.6.17 (GHSA-6q48-6c7w-9gw2, CRITICAL), which failed the Trivy gate; pip 26.2.2 vendors 2026.10.19. The image never runs pip, but it shipped the bundle.
+
+### Changed
+
+**Locked dependency upgrades (#78, #83).** Runtime: `pydantic` 2.14.0 → 2.14.1 (`pydantic-core` 2.50.0 → 2.50.1). This is what the container image and `uv sync --locked` install. Dev-only: `ruff` 0.17.0 → 0.17.2 (exact pin in the `dev` extra), `hypothesis` 6.168.5 → 6.170.11, `pytest-asyncio` 1.4.0 → 1.4.1, `pip` 26.2.1 → 26.2.2.
+
+**CI pins (#80).** `astral-sh/setup-uv` 10.3.0 → 10.3.2, `docker/login-action` 4.6.0 → 4.7.0 and `pypa/gh-action-pypi-publish` 1.14.2 → 1.14.3, each still pinned to a commit SHA. The `uv` version the workflows install stays 0.13.1.
 
 ## [0.9.1] - 2026-10-16
 
