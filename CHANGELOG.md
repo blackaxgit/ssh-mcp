@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.2] - 2026-10-29
 
-> **Why 0.9.2 and not 0.10.0:** nothing here makes a configuration that started on 0.9.1 refuse to start. The only runtime change is a lockfile-only `pydantic` patch; no declared floor in `pyproject.toml`'s `dependencies` moved.
+> **Why 0.9.2 and not 0.10.0:** nothing here makes a configuration that started on 0.9.1 refuse to start. The only runtime dependency change is a lockfile-only `pydantic` patch; no declared floor in `pyproject.toml`'s `dependencies` moved.
 
 ### Security
 
