@@ -105,6 +105,33 @@ SECURITY_FLOORS: dict[str, tuple[str, str]] = {
         "Transitive and dev/CI-only (pip-audit -> requests -> urllib3); absent "
         "from the wheel's dependencies and from the --no-dev container image.",
     ),
+    "filelock": (
+        "4.2.1",
+        "GHSA-v4x8-3wr5-3wq8, GHSA-567q-5qvw-pf92, GHSA-9vhv-jxww-xfm5 and the "
+        "other CVE-2026-1129xx filelock advisories, all cleared by 4.2.1. "
+        "Transitive and dev/CI-only (pip-audit -> cachecontrol -> filelock); "
+        "absent from the wheel's dependencies and from the --no-dev container "
+        "image. Not reachable: pip-audit's cache overrides cachecontrol's "
+        "locked write, so no lock is ever taken.",
+    ),
+    "certifi": (
+        "2026.10.19",
+        "PYSEC-2026-4320 / GHSA-6q48-6c7w-9gw2 (critical): an emSign root whose "
+        "intermediate CA keys were compromised. Fixed in 2026.10.18 and "
+        "2026.10.19; the floor takes .19. Transitive and dev/CI-only "
+        "(pip-audit -> requests -> certifi); absent from the wheel's "
+        "dependencies and from the --no-dev container image. Only pip-audit's "
+        "own HTTPS queries are exposed.",
+    ),
+    "msgpack": (
+        "1.2.3",
+        "CVE-2026-114613 / GHSA-j586-36cw-2gc2: the C extension leaks a "
+        "decoded map value when strict_map_key rejects a key, growing memory "
+        "without bound; fixed in 1.2.3. Transitive and dev/CI-only "
+        "(pip-audit -> cachecontrol -> msgpack); absent from the wheel's "
+        "dependencies and from the --no-dev container image. Not reachable: "
+        "only pip-audit's own cache entries are decoded.",
+    ),
 }
 
 # Packages that ssh-mcp imports directly and must therefore constrain in the

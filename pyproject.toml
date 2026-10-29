@@ -186,6 +186,25 @@ constraint-dependencies = [
     # carries it; the floor keeps a future `uv lock` from regressing the dev
     # environment that CI's audit job runs in.
     "urllib3>=2.8.0",
+    # GHSA-v4x8-3wr5-3wq8, GHSA-567q-5qvw-pf92, GHSA-9vhv-jxww-xfm5 and the other
+    # CVE-2026-1129xx filelock advisories, all cleared by 4.2.1. Transitive and
+    # dev-only: pip-audit[filecache] -> cachecontrol -> filelock, so neither the
+    # wheel nor the `--no-dev` image carries it, and pip-audit's cache overrides
+    # cachecontrol's locked write, so no lock is ever taken. The floor keeps a
+    # future `uv lock` from regressing.
+    "filelock>=4.2.1",
+    # PYSEC-2026-4320 / GHSA-6q48-6c7w-9gw2 (critical) — certifi trusted an emSign
+    # root whose intermediate CA keys were compromised. 2026.10.18 removed every
+    # emSign root and 2026.10.19 restored the unaffected ones; the floor takes .19.
+    # Transitive and dev-only: pip-audit -> requests -> certifi, so only
+    # pip-audit's own HTTPS queries are exposed. The floor keeps a future
+    # `uv lock` from regressing.
+    "certifi>=2026.10.19",
+    # CVE-2026-114613 / GHSA-j586-36cw-2gc2 (high) — the C extension leaks memory
+    # when `strict_map_key` rejects a key; fixed in 1.2.3. Transitive and dev-only:
+    # pip-audit -> cachecontrol -> msgpack, decoding only pip-audit's own cache.
+    # The floor keeps a future `uv lock` from regressing.
+    "msgpack>=1.2.3",
 ]
 
 [tool.ruff.lint]
